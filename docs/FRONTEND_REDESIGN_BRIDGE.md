@@ -91,6 +91,34 @@ Recommended regions:
 
 The current UI already has most of these pieces, but they are visually scattered and inconsistent. The redesign should unify them rather than add more panels.
 
+## Reference Direction: Open Design
+
+[`nexu-io/open-design`](https://github.com/nexu-io/open-design) is a strong reference because it frames the product as a quiet local studio rather than a busy chatbot. Useful patterns to adapt:
+
+1. One-window studio metaphor.
+   Use window tabs, a thin left rail, and a calm central workspace. Orynn should feel like a Windows control studio, not a pile of cards.
+
+2. Centered command surface for idle state.
+   Open Design's home screen makes the prompt the obvious first action, with mode chips underneath and recent projects below. Orynn can mirror this with task modes like Chat, Windows, Code, Browser, and Resume.
+
+3. Artifact/editor split for active work.
+   Studio mode uses a left conversation/source rail and a main preview/editor area. Orynn can use that pattern for live task work: left timeline/chat, center verified result or app context, right Windows inspector.
+
+4. Calm density.
+   Mostly neutral surfaces, restrained borders, small icons, and intentional whitespace. Orynn should use this restraint while preserving more operational density for tool traces.
+
+5. Mode chips, not giant controls.
+   Prototype, live artifact, slide deck, image, video, etc. map cleanly to Orynn's Computer, Browser, Code, Research, Automate, and Voice modes.
+
+6. Recent work as cards.
+   Recent projects are small, visual, and resumable. Orynn's task history should become compact resumable task/project cards rather than a plain log list.
+
+Things not to copy directly:
+
+- Open Design is artifact-generation-first. Orynn is live-control-first, so approvals, permissions, control layer, and recovery state need stronger visibility.
+- Open Design can hide execution detail. Orynn must expose enough trace to trust Windows control.
+- Open Design uses light studio calm by default. Orynn should support that, but keep a dark professional mode for long desktop sessions.
+
 ## Components To Design First
 
 Design these before touching code:
