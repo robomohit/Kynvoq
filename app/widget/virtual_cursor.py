@@ -21,16 +21,17 @@ from __future__ import annotations
 import math
 import re
 
-from PySide6.QtCore import (Qt, QPoint, QRect, QRectF, QTimer,
+from PySide6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QTimer,
                              QPropertyAnimation, QEasingCurve, Property,
                              QObject)
 from PySide6.QtGui import (QColor, QPainter, QPen, QBrush, QPainterPath,
-                           QFont, QGuiApplication)
+                           QFont, QGuiApplication, QCursor)
 from PySide6.QtWidgets import QWidget
 
 
 # Tunable look
 RIPPLE_COLOR = QColor(91, 224, 208)        # accent teal
+COMPANION_BLUE = QColor(0x33, 0x80, 0xFF)  # Clicky-style status bubble
 CURSOR_COLOR = QColor(20, 24, 32, 235)     # near-black
 CURSOR_OUTLINE = QColor(255, 255, 255, 240)
 LABEL_BG = QColor(20, 24, 32, 220)
@@ -122,6 +123,13 @@ class VirtualCursorOverlay(QWidget):
     TRAIL_STRIDE_MS = 30      # how often to record a trail point
     GLOW_RADIUS = 26          # soft accent halo radius around the cursor
     CLICK_PULSE_MS = 320      # cursor scale pulse duration on click
+    COMPANION_OFFSET_X = 35   # Clicky: buddyX = cursorX + 35
+    COMPANION_OFFSET_Y = 25
+    COMPANION_STIFFNESS = 0.28
+    COMPANION_DAMPING = 0.62
+    COMPANION_SNAP_DISTANCE = 900
+    # Companion follow/bubble behavior adapted from
+    # Bitshank-2338/clicky-windows ui/overlay.py, MIT License.
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)
@@ -171,6 +179,13 @@ class VirtualCursorOverlay(QWidget):
         self._action_label_set_ms = 0
         self._ACTION_LABEL_FADE_MS = 200
         self._ACTION_LABEL_HOLD_MS = 1100  # show for 1.1s after last update
+        self._companion_enabled = False
+        self._companion_label = ""
+        self._companion_label_set_ms = 0
+        self._companion_display_pos = self._companion_cursor_target()
+        self._companion_vel = QPointF(0, 0)
+        self._companion_bubble_alpha = 1.0
+        self._companion_bubble_scale = 1.0
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -183,6 +198,7 @@ class VirtualCursorOverlay(QWidget):
         self._ripples.append(_Ripple(x, y))
         self._click_pulse_start_ms = self._now_ms()
         self._set_action_label(label)
+        self.set_companion_label(label)
         self._bump_cursor_visibility()
         self._ensure_visible()
 
@@ -192,8 +208,10 @@ class VirtualCursorOverlay(QWidget):
         self._carets.append(_Caret(x, y, text))
         if text:
             self._set_action_label(f"Typing “{text[:24]}”")
+            self.set_companion_label(f"Typing {text[:32]}")
         else:
             self._set_action_label("Typing")
+            self.set_companion_label("Typing")
         self._bump_cursor_visibility()
         self._ensure_visible()
 
@@ -206,7 +224,7 @@ class VirtualCursorOverlay(QWidget):
         x, y, w, h = self._to_local_rect(x, y, w, h)
         self._spotlights = [s for s in self._spotlights if s.progress() < 0.7]
         self._spotlights.append(_Spotlight(x, y, w, h, label, kind))
-        self._bump_cursor_visibility()
+        self.set_companion_label(label or f"UIA {kind}")
         self._ensure_visible()
 
     def show_app_focus(self, x: int, y: int, w: int, h: int,
@@ -220,7 +238,8 @@ class VirtualCursorOverlay(QWidget):
             self._app_glow = _AppGlow(x, y, w, h, label, now)
         else:
             self._app_glow.rearm(x, y, w, h, label, now)
-        self._bump_cursor_visibility()
+        if label:
+            self.set_companion_label(label)
         self._ensure_visible()
 
     def keep_app_glow_alive(self) -> None:
@@ -248,8 +267,37 @@ class VirtualCursorOverlay(QWidget):
             x, y = self._to_local_point(x, y)
             self._move_cursor_to(x, y)
         self._set_action_label(label)
+        self.set_companion_label(label)
         self._bump_cursor_visibility()
         self._ensure_visible()
+
+    def set_companion_enabled(self, enabled: bool,
+                              label: str = "Ready") -> None:
+        """Turn the idle companion cursor on/off without ever taking input."""
+        self._companion_enabled = bool(enabled)
+        if label:
+            self.set_companion_label(label)
+        if self._companion_enabled:
+            self._companion_display_pos = self._companion_cursor_target()
+            self._companion_vel = QPointF(0, 0)
+            self._ensure_visible()
+        else:
+            self.update()
+
+    def set_companion_label(self, label: str) -> None:
+        """Update the compact bubble that follows the real pointer."""
+        text = (label or "").strip()
+        if len(text) > 56:
+            text = text[:53].rstrip() + "..."
+        if text != self._companion_label:
+            self._companion_label = text
+            self._companion_label_set_ms = self._now_ms()
+            self._companion_bubble_alpha = 0.0
+            self._companion_bubble_scale = 0.5
+        if self._companion_enabled:
+            if not self.isVisible():
+                self._ensure_visible()
+            self.update()
 
     # Internal: set the floating action label that follows the cursor.
     def _set_action_label(self, label: str) -> None:
@@ -289,6 +337,13 @@ class VirtualCursorOverlay(QWidget):
     def _to_local_point(self, x: int, y: int) -> tuple[int, int]:
         self._sync_virtual_geometry()
         return int(x) - self._origin_x, int(y) - self._origin_y
+
+    def _companion_cursor_target(self) -> QPointF:
+        qp = QCursor.pos()
+        return QPointF(
+            qp.x() + self.COMPANION_OFFSET_X - self._origin_x,
+            qp.y() + self.COMPANION_OFFSET_Y - self._origin_y,
+        )
 
     def _to_local_rect(self, x: int, y: int, w: int, h: int) -> tuple[int, int, int, int]:
         lx, ly = self._to_local_point(x, y)
@@ -387,6 +442,43 @@ class VirtualCursorOverlay(QWidget):
         if self._app_glow is not None and not self._app_glow.alive(now_ms):
             self._app_glow = None
 
+        companion_alive = self._companion_enabled
+        if companion_alive:
+            try:
+                target = self._companion_cursor_target()
+                dx = target.x() - self._companion_display_pos.x()
+                dy = target.y() - self._companion_display_pos.y()
+                dist = math.hypot(dx, dy)
+                if dist > self.COMPANION_SNAP_DISTANCE:
+                    self._companion_display_pos = QPointF(
+                        target.x(), target.y())
+                    self._companion_vel = QPointF(0, 0)
+                else:
+                    stiffness, damping = (
+                        self.COMPANION_STIFFNESS,
+                        self.COMPANION_DAMPING,
+                    )
+                    ax = dx * stiffness
+                    ay = dy * stiffness
+                    self._companion_vel = QPointF(
+                        self._companion_vel.x() * damping + ax,
+                        self._companion_vel.y() * damping + ay,
+                    )
+                    self._companion_display_pos = QPointF(
+                        self._companion_display_pos.x()
+                        + self._companion_vel.x(),
+                        self._companion_display_pos.y()
+                        + self._companion_vel.y(),
+                    )
+                self._companion_bubble_alpha = min(
+                    1.0, self._companion_bubble_alpha + 0.05)
+                self._companion_bubble_scale += (
+                    1.0 - self._companion_bubble_scale) * 0.15
+                if not self.isVisible():
+                    self._ensure_visible()
+            except Exception:
+                companion_alive = False
+
         # Hide if everything is done — also wait for the action label
         # fade to finish so the user gets to read what just happened.
         label_alive = (self._action_label_text and
@@ -399,7 +491,8 @@ class VirtualCursorOverlay(QWidget):
                     and not self._trail
                     and not label_alive
                     and now_ms >= self._cursor_visible_until
-                    and self._anim_t >= 1.0)
+                    and self._anim_t >= 1.0
+                    and not companion_alive)
         if all_done and self.isVisible():
             self.hide()
             self._action_label_text = ""
@@ -476,7 +569,10 @@ class VirtualCursorOverlay(QWidget):
 
         # 4. Cursor + soft accent glow halo
         now = self._now_ms()
-        if now < self._cursor_visible_until and self._cursor_x >= 0:
+        action_visible = (now < self._cursor_visible_until
+                          and self._cursor_x >= 0
+                          and not self._spotlights)
+        if action_visible:
             # Glow halo behind the cursor — radial gradient, accent color
             cx, cy = self._cursor_x, self._cursor_y
             grad = QRadialGradient(cx, cy + 4, self.GLOW_RADIUS)
@@ -495,6 +591,13 @@ class VirtualCursorOverlay(QWidget):
 
             # Action label pill — fades in/out under the cursor
             self._paint_action_label(p, cx, cy, now)
+        elif self._companion_enabled and self._companion_display_pos.x() >= 0:
+            has_target_overlay = bool(self._spotlights or self._ripples
+                                      or self._carets)
+            if not has_target_overlay:
+                cx = self._companion_display_pos.x()
+                cy = self._companion_display_pos.y()
+                self._paint_companion_bubble(p, cx, cy, now)
 
         p.end()
 
@@ -628,6 +731,44 @@ class VirtualCursorOverlay(QWidget):
         p.setPen(QPen(QColor(240, 242, 248, int(245 * alpha_mul))))
         p.drawText(QRect(x + pad_x + 10, y, w - pad_x * 2 - 10, h),
                    Qt.AlignVCenter | Qt.AlignLeft, text)
+
+    def _paint_companion_bubble(self, p: QPainter, cx: float, cy: float,
+                                now_ms: int) -> None:
+        text = self._companion_label or "Orynn ready"
+        if text == "Ready":
+            text = "Orynn ready"
+        p.setFont(QFont("Segoe UI", 9, QFont.Medium))
+        fm = p.fontMetrics()
+        pad_x, pad_y = 8, 4
+        tw = fm.horizontalAdvance(text) + pad_x * 2
+        th = fm.height() + pad_y * 2
+
+        box_x = cx + 10
+        box_y = cy + 18 - th / 2
+
+        scale = max(0.01, self._companion_bubble_scale)
+        p.save()
+        p.translate(box_x, box_y + th / 2)
+        p.scale(scale, scale)
+        p.translate(-box_x, -(box_y + th / 2))
+
+        alpha = int(255 * self._companion_bubble_alpha)
+        bg = QColor(COMPANION_BLUE)
+        bg.setAlpha(alpha)
+        glow = QColor(COMPANION_BLUE)
+        glow.setAlpha(int(90 * self._companion_bubble_alpha))
+
+        p.setBrush(QBrush(glow))
+        p.setPen(Qt.NoPen)
+        p.drawRoundedRect(QRectF(box_x - 4, box_y - 4, tw + 8, th + 8),
+                          9, 9)
+
+        p.setBrush(QBrush(bg))
+        p.drawRoundedRect(QRectF(box_x, box_y, tw, th), 6, 6)
+
+        p.setPen(QPen(QColor(255, 255, 255, alpha), 1))
+        p.drawText(QRectF(box_x, box_y, tw, th), Qt.AlignCenter, text)
+        p.restore()
 
     def _paint_action_label(self, p: QPainter, cx: int, cy: int,
                             now_ms: int) -> None:

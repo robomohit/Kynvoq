@@ -8,6 +8,7 @@ This is the practical handoff between a visual redesign and the code that alread
 |---|---|---|
 | Full dashboard | `static/index.html`, `static/app.js`, `static/style.css`, `static/dynamic.css`, `static/liquid-glass.css` | Main chat/workbench, task history, tool stream, settings, approvals, readiness, model controls. |
 | Native floating capsule | `app/widget/qt_shell.py`, `app/widget/capsule_widgets.py` | Always-on-top Windows capsule, native widgets, task ticker, approvals/permissions, compact result cards. |
+| Cursor companion overlay | `app/widget/virtual_cursor.py` | Click-through pointer-follow status textbox, exact UIA/action feedback, and desktop-control status cues. |
 | Backend stream/API | `app/main.py`, `app/log_emitter.py`, `app/agent.py` | Task creation, SSE log stream, approvals, permissions, readiness, trust report, task logs. |
 | Frontend regression tests | `tests/test_ui_static_hardening.py` | Static guards for important UI contracts and CSS/JS hooks. |
 
@@ -25,7 +26,7 @@ Do not treat the redesign as a new app. Treat it as a new skin and layout system
    Dashboard calls `/api/approvals` and `/api/permissions`. Capsule emits native approval/permission widgets and also posts to those endpoints.
 
 4. Desktop-control visual state must stay visible.
-   The UI needs to show current control layer, target app/window, phase, and whether the agent is waiting, acting, recovering, done, or blocked.
+   The UI and cursor companion need to show current control layer, target app/window, phase, and whether the agent is waiting, acting, recovering, done, or blocked.
 
 5. Historical replay must still render.
    `loadTaskLog` replays prior task logs through `processTaskEvent`. New UI components must support both live and replayed events.
@@ -99,7 +100,7 @@ The current UI already has most of these pieces, but they are visually scattered
    Use window tabs, a thin left rail, and a calm central workspace. Orynn should feel like a Windows control studio, not a pile of cards.
 
 2. Centered command surface for idle state.
-   Open Design's home screen makes the prompt the obvious first action, with mode chips underneath and recent projects below. Orynn can mirror this with task modes like Chat, Windows, Code, Browser, and Resume.
+   Open Design's home screen makes the prompt the obvious first action. Orynn should mirror the calm command surface, but not expose manual Chat/Windows/Code/Browser modes; the backend unified tool surface lets the model choose tools dynamically.
 
 3. Artifact/editor split for active work.
    Studio mode uses a left conversation/source rail and a main preview/editor area. Orynn can use that pattern for live task work: left timeline/chat, center verified result or app context, right Windows inspector.
@@ -107,8 +108,8 @@ The current UI already has most of these pieces, but they are visually scattered
 4. Calm density.
    Mostly neutral surfaces, restrained borders, small icons, and intentional whitespace. Orynn should use this restraint while preserving more operational density for tool traces.
 
-5. Mode chips, not giant controls.
-   Prototype, live artifact, slide deck, image, video, etc. map cleanly to Orynn's Computer, Browser, Code, Research, Automate, and Voice modes.
+5. Capability hints, not mode pickers.
+   Keep visible controls limited to message, voice/read toggles, send/stop, and explicit trust prompts. Runtime/tool choice belongs in the stream, status, or details only after the task needs it.
 
 6. Recent work as cards.
    Recent projects are small, visual, and resumable. Orynn's task history should become compact resumable task/project cards rather than a plain log list.

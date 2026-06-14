@@ -660,6 +660,8 @@ _ICONS = {
     "send": '<path d="M12 19V5"/><path d="M5 12l7-7 7 7"/>',
     "close": '<path d="M6 6l12 12"/><path d="M18 6L6 18"/>',
     "plus": '<line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/>',
+    "collapse": '<polyline points="6 15 12 9 18 15"/>',
+    "expand": '<polyline points="6 9 12 15 18 9"/>',
     # Capability row icons (thin monochrome strokes)
     "apps":     '<rect x="3" y="3" width="7" height="7" rx="1.2"/><rect x="14" y="3" width="7" height="7" rx="1.2"/><rect x="3" y="14" width="7" height="7" rx="1.2"/><rect x="14" y="14" width="7" height="7" rx="1.2"/>',
     "folder":   '<path d="M3 7.5a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2V17a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
@@ -1934,12 +1936,14 @@ def main(port: int = 8000) -> int:
             self._last_action_phrase = ""
             self._last_control_layer = ""
             self._last_control_reason = ""
+            self._top_widget_collapsed = False
 
             # Virtual cursor overlay — frameless click-through window that
             # paints a smooth animated cursor + ripple wherever the agent
             # clicks or types. Gives the user a visible "what just happened"
             # cue during agent desktop control.
             self._vcursor = VirtualCursorOverlay()
+            self._vcursor.set_companion_enabled(True, "Orynn ready")
 
             # DWM glass is applied in _apply_pill_glass() — scoped to the
             # pill region so no rectangular halo leaks out. Do NOT call
@@ -1960,23 +1964,88 @@ def main(port: int = 8000) -> int:
                                      18 + SHADOW_PAD, 16 + SHADOW_PAD)
             outer.setSpacing(12)
 
+            self.top_widget = QFrame()
+            self.top_widget.setObjectName("top_widget")
+            self.top_widget.setFixedHeight(42)
+            self.top_widget.setCursor(Qt.PointingHandCursor)
+            self.top_widget.setStyleSheet(
+                "#top_widget{"
+                "  background: rgba(16,19,26,238);"
+                "  border: 1px solid rgba(255,255,255,58);"
+                "  border-radius: 16px;"
+                "}"
+            )
+            mini = QHBoxLayout(self.top_widget)
+            mini.setContentsMargins(12, 0, 6, 0)
+            mini.setSpacing(8)
+            self.top_widget_dot = QLabel("")
+            self.top_widget_dot.setFixedSize(8, 8)
+            self.top_widget_dot.setStyleSheet(
+                "QLabel{background:%s; border-radius:4px;}" % ACCENT)
+            mini.addWidget(self.top_widget_dot)
+            self.top_widget_title = _plain_label("Orynn")
+            self.top_widget_title.setFont(QFont("Segoe UI Variable Text", 10,
+                                                QFont.Bold))
+            self.top_widget_title.setStyleSheet(
+                "color: rgba(246,248,252,245); background: transparent;")
+            mini.addWidget(self.top_widget_title)
+            self.top_widget_status = _plain_label("ready")
+            self.top_widget_status.setFont(QFont("Segoe UI Variable Text", 9,
+                                                 QFont.Medium))
+            self.top_widget_status.setStyleSheet(
+                "color: rgba(210,218,232,205); background: transparent;")
+            mini.addWidget(self.top_widget_status, 1)
+            self.top_widget_mic = QPushButton()
+            self.top_widget_mic.setIcon(_icon("mic", 15, "#EAF0F7", 1.9))
+            self.top_widget_mic.setIconSize(QSize(15, 15))
+            self.top_widget_mic.setCheckable(True)
+            self.top_widget_mic.setFixedSize(30, 30)
+            self.top_widget_mic.setCursor(Qt.PointingHandCursor)
+            self.top_widget_mic.setToolTip("Listen now")
+            self.top_widget_mic.setStyleSheet(
+                "QPushButton{background:rgba(255,255,255,18);"
+                "border:1px solid rgba(255,255,255,44);border-radius:15px;}"
+                "QPushButton:hover{background:rgba(255,255,255,34);}"
+                "QPushButton:checked{background:rgba(229,72,77,185);"
+                "border-color:rgba(255,210,210,120);}"
+            )
+            self.top_widget_mic.clicked.connect(self._toggle_mic)
+            mini.addWidget(self.top_widget_mic)
+            self.top_widget_expand = QPushButton()
+            self.top_widget_expand.setIcon(_icon("expand", 14, "#EAF0F7", 2.2))
+            self.top_widget_expand.setIconSize(QSize(14, 14))
+            self.top_widget_expand.setFixedSize(30, 30)
+            self.top_widget_expand.setCursor(Qt.PointingHandCursor)
+            self.top_widget_expand.setToolTip("Expand Orynn")
+            self.top_widget_expand.setStyleSheet(
+                "QPushButton{background:transparent;border:1px solid transparent;"
+                "border-radius:15px;}"
+                "QPushButton:hover{background:rgba(255,255,255,34);"
+                "border-color:rgba(255,255,255,54);}"
+            )
+            self.top_widget_expand.clicked.connect(
+                lambda _c=False: self._set_top_widget_collapsed(False))
+            mini.addWidget(self.top_widget_expand)
+            self.top_widget.hide()
+            outer.addWidget(self.top_widget)
+
             # =========================================================
             # ROW 1 — raised input pill (lighter glass within the panel)
             # =========================================================
             top_row = QHBoxLayout()
             top_row.setSpacing(10)
 
-            input_pill = QFrame()
-            input_pill.setObjectName("input_pill")
-            input_pill.setFixedHeight(54)
-            input_pill.setStyleSheet(
+            self.input_pill = QFrame()
+            self.input_pill.setObjectName("input_pill")
+            self.input_pill.setFixedHeight(54)
+            self.input_pill.setStyleSheet(
                 "#input_pill {"
                 "  background: rgba(255,255,255,200);"
                 "  border: 1px solid rgba(20,24,32,40);"
                 "  border-radius: 27px;"
                 "}"
             )
-            pill_row = QHBoxLayout(input_pill)
+            pill_row = QHBoxLayout(self.input_pill)
             pill_row.setContentsMargins(18, 0, 8, 0)
             pill_row.setSpacing(12)
 
@@ -2077,7 +2146,22 @@ def main(port: int = 8000) -> int:
                 "}" % ACCENT
             )
             pill_row.addWidget(self.send)
-            top_row.addWidget(input_pill, 1)
+            top_row.addWidget(self.input_pill, 1)
+            self.collapse_btn = QPushButton()
+            self.collapse_btn.setIcon(_icon("collapse", 13, "#F0F2F8", 2.2))
+            self.collapse_btn.setIconSize(QSize(13, 13))
+            self.collapse_btn.setFixedSize(28, 28)
+            self.collapse_btn.setCursor(Qt.PointingHandCursor)
+            self.collapse_btn.setToolTip("Collapse to top widget")
+            self.collapse_btn.clicked.connect(
+                lambda _c=False: self._set_top_widget_collapsed(True))
+            self.collapse_btn.setStyleSheet(
+                "QPushButton{background:transparent;border:1px solid transparent;"
+                "border-radius:14px;}"
+                "QPushButton:hover{background:rgba(255,255,255,32);"
+                "border-color:rgba(255,255,255,60);}"
+            )
+            top_row.addWidget(self.collapse_btn)
 
             # Close lives outside the pill — tiny floating circle.
             self.close_btn = QPushButton()
@@ -2493,6 +2577,11 @@ def main(port: int = 8000) -> int:
             self.sse.widgetRequested.connect(self._spawn_widget)
             self.sse.start()
 
+            start_collapsed = (
+                os.getenv("ORYNN_START_COLLAPSED", "1").lower()
+                not in {"0", "false", "no"}
+            )
+            self._set_top_widget_collapsed(start_collapsed, animate=False)
             self.adjustSize()
 
         # --- Apps panel: horizontal cards of open windows w/ live thumbnails ---
@@ -2856,6 +2945,7 @@ def main(port: int = 8000) -> int:
                 if _voice and not _voice.tts_available():
                     self.statusChanged_local("Voice output unavailable on this PC")
                 self.statusChanged_local("Voice on — click the mic and talk")
+                self._vcursor.set_companion_label("Voice ready")
             else:
                 self.voice_btn.setIcon(_icon("soundoff", 16, "#1A1D24", 1.8))
                 try:
@@ -2863,27 +2953,33 @@ def main(port: int = 8000) -> int:
                         _voice.stop_speaking()
                 except Exception:
                     pass
+                self._vcursor.set_companion_label("Ready")
 
         def _toggle_mic(self) -> None:
             """Click to start/stop a single dictation capture."""
             if self._listening:
                 # let the in-flight recognition finish on its own; just un-check
                 self.mic_btn.setChecked(False)
+                self.top_widget_mic.setChecked(False)
                 return
             try:
                 from . import voice as _voice
             except Exception:
                 self.statusChanged_local("Voice not available")
                 self.mic_btn.setChecked(False)
+                self.top_widget_mic.setChecked(False)
                 return
             if not _voice.stt_available():
                 self.statusChanged_local("Speech recognition unavailable on this PC")
                 self.mic_btn.setChecked(False)
+                self.top_widget_mic.setChecked(False)
                 return
             self._listening = True
             self.mic_btn.setChecked(True)
+            self.top_widget_mic.setChecked(True)
             self.status.setText("Listening…")
             self.status.show()
+            self._set_capsule_state("listening", "Listening")
 
             def _run():
                 text = ""
@@ -2899,12 +2995,15 @@ def main(port: int = 8000) -> int:
         def _on_transcript(self, text: str) -> None:
             self._listening = False
             self.mic_btn.setChecked(False)
+            self.top_widget_mic.setChecked(False)
             self.status.hide()
             text = (text or "").strip()
             if not text:
+                self._vcursor.set_companion_label("No speech heard")
                 self.statusChanged_local(
                     "Didn't catch that — check your mic is on")
                 return
+            self._vcursor.set_companion_label("Heard voice")
             if self._setup_mode:
                 self.input.setText(text)
                 return
@@ -3301,6 +3400,122 @@ def main(port: int = 8000) -> int:
                 return "Attached context"
             return "Ready"
 
+        def _top_widget_phrase(self, state: str = "", action: str = "") -> str:
+            phrase = (action or self._last_action_phrase or "").strip()
+            if phrase:
+                return phrase[:42]
+            if self._listening:
+                return "listening"
+            if self._busy:
+                return "working"
+            return {
+                "idle": "ready",
+                "focused": "ready",
+                "context_ready": "ready",
+                "submitting": "starting",
+                "planning": "thinking",
+                "acting": "working",
+                "waiting_approval": "needs approval",
+                "paused": "paused",
+                "done": "done",
+                "error": "needs retry",
+            }.get(state or self._capsule_state, "ready")
+
+        def _sync_top_widget_status(self, state: str = "",
+                                    action: str = "") -> None:
+            try:
+                _set_plain_text(self.top_widget_status,
+                                self._top_widget_phrase(state, action))
+                self.top_widget_mic.setChecked(bool(self._listening))
+                dot = "#E5484D" if self._listening else (
+                    ACCENT if self._busy else "#3380FF")
+                self.top_widget_dot.setStyleSheet(
+                    "QLabel{background:%s; border-radius:4px;}" % dot)
+            except Exception:
+                pass
+
+        def _dock_top_widget(self) -> None:
+            try:
+                geo = QApplication.primaryScreen().availableGeometry()
+                x = geo.center().x() - self.width() // 2
+                y = geo.top() + (8 if self._top_widget_collapsed else 70)
+                self.move(x, y)
+            except Exception:
+                pass
+
+        def _set_top_widget_collapsed(self, collapsed: bool,
+                                      animate: bool = True) -> None:
+            collapsed = bool(collapsed)
+            self._top_widget_collapsed = collapsed
+            self.top_widget.setVisible(collapsed)
+            full_visible = not collapsed
+            for widget in (
+                self.input_pill,
+                self.close_btn,
+                self.collapse_btn,
+                self.effort_chip,
+            ):
+                try:
+                    widget.setVisible(full_visible)
+                except Exception:
+                    pass
+            should_show_context = (
+                self._capsule_state != "idle"
+                or bool(self._last_action_phrase)
+            )
+            self.context_bar.setVisible(full_visible and should_show_context)
+            self.action_ticker.setVisible(full_visible and self._busy)
+            for panel in (self.apps_scroll, self.folder_panel,
+                          self.widget_scroll, self.reply):
+                try:
+                    panel.setVisible(False)
+                except Exception:
+                    pass
+            try:
+                for b in self.cap_buttons.values():
+                    b.setVisible(full_visible)
+                for b in self.recipe_buttons:
+                    b.setVisible(full_visible and not self._busy)
+            except Exception:
+                pass
+            target_w = (260 if collapsed else WIDTH) + 2 * SHADOW_PAD
+            self.setFixedWidth(target_w)
+            self.setMinimumHeight(42 if collapsed else 60)
+            self._sync_top_widget_status()
+            if collapsed:
+                for panel in (self.apps_scroll, self.folder_panel,
+                              self.widget_scroll, self.reply):
+                    try:
+                        panel.hide()
+                    except Exception:
+                        pass
+            else:
+                self.input.setFocus()
+                self._set_capsule_state(self._capsule_state,
+                                        self._last_action_phrase)
+            self._dock_top_widget()
+            if animate:
+                self._adjust()
+
+        def _companion_label_for_state(self, state: str,
+                                       action: str = "") -> str:
+            phrase = (action or self._last_action_phrase or "").strip()
+            if phrase:
+                return phrase[:56]
+            return {
+                "idle": "Ready",
+                "focused": "Ready",
+                "context_ready": "Context ready",
+                "listening": "Listening...",
+                "submitting": "Starting",
+                "planning": "Thinking",
+                "acting": "Working",
+                "waiting_approval": "Needs approval",
+                "paused": "Paused",
+                "done": "Done",
+                "error": "Needs retry",
+            }.get(state, "Ready")
+
         def _set_capsule_state(self, state: str, action: str = "") -> None:
             labels = {
                 "idle": "Idle",
@@ -3340,6 +3555,12 @@ def main(port: int = 8000) -> int:
             self.context_stop_btn.setVisible(active)
             if state in ("planning", "acting", "waiting_approval") and self._last_action_phrase:
                 self.status.setText(self._last_action_phrase[:90])
+            try:
+                self._vcursor.set_companion_label(
+                    self._companion_label_for_state(state, action))
+            except Exception:
+                pass
+            self._sync_top_widget_status(state, action)
             self._adjust()
 
         def _show_context_details(self) -> None:
@@ -3418,6 +3639,10 @@ def main(port: int = 8000) -> int:
                 if self._capsule_state not in ("done", "error"):
                     self._set_capsule_state("idle", "")
             self.update()
+            if getattr(self, "_top_widget_collapsed", False):
+                self._set_top_widget_collapsed(True, animate=False)
+            else:
+                self._sync_top_widget_status()
             QTimer.singleShot(0, self._adjust)
 
         # Status strings the backend emits that aren't useful for the user.
@@ -4367,15 +4592,18 @@ def main(port: int = 8000) -> int:
             self._intro.start()
 
             geo = app.primaryScreen().availableGeometry()
-            start_pos = QPoint(geo.center().x() - self.width() // 2, geo.top() + 50)
-            end_pos = QPoint(geo.center().x() - self.width() // 2, geo.top() + 70)
+            dock_y = geo.top() + (8 if self._top_widget_collapsed else 70)
+            start_pos = QPoint(geo.center().x() - self.width() // 2,
+                               max(geo.top(), dock_y - 20))
+            end_pos = QPoint(geo.center().x() - self.width() // 2, dock_y)
             self._slide = QPropertyAnimation(self, b"pos")
             self._slide.setDuration(380)
             self._slide.setStartValue(start_pos)
             self._slide.setEndValue(end_pos)
             self._slide.setEasingCurve(QEasingCurve.OutBack)
             self._slide.start()
-            self.input.setFocus()
+            if not self._top_widget_collapsed:
+                self.input.setFocus()
 
         def _fade_hide(self) -> None:
             """Smoothly fade the capsule out, then hide it (no graphics effect —
@@ -4418,20 +4646,35 @@ def main(port: int = 8000) -> int:
 
     class HotkeySignaler(QObject):
         toggle = Signal()
+        listen = Signal()
 
     win = Capsule()
 
     signaler = HotkeySignaler()
     def on_toggle():
-        if win.isVisible():
+        if win.isVisible() and getattr(win, "_top_widget_collapsed", False):
+            win._set_top_widget_collapsed(False)
+            win.activateWindow()
+            win.raise_()
+            win.input.setFocus()
+        elif win.isVisible():
             win._fade_hide()
         else:
             win.show()
             win.activateWindow()
             win.raise_()
-            win.input.setFocus()
+            if not getattr(win, "_top_widget_collapsed", False):
+                win.input.setFocus()
 
     signaler.toggle.connect(on_toggle)
+
+    def on_listen():
+        if not win.isVisible():
+            win.show()
+            win.raise_()
+        win._toggle_mic()
+
+    signaler.listen.connect(on_listen)
 
     def hotkey_callback():
         signaler.toggle.emit()
@@ -4443,6 +4686,8 @@ def main(port: int = 8000) -> int:
     def _explain_fire():
         # Auto-fill the input with the explain prompt and submit
         win.show(); win.activateWindow(); win.raise_()
+        if getattr(win, "_top_widget_collapsed", False):
+            win._set_top_widget_collapsed(False)
         win.input.setText(
             "Take a screenshot of the foreground window and explain what's "
             "visible. Identify the app, what the user is probably trying to "
@@ -4456,6 +4701,10 @@ def main(port: int = 8000) -> int:
         import keyboard
         keyboard.add_hotkey('ctrl+shift+space', hotkey_callback)
         print("[Desktop] Global hotkey Ctrl+Shift+Space registered.",
+              flush=True)
+        keyboard.add_hotkey('ctrl+shift+m',
+                            lambda: signaler.listen.emit())
+        print("[Desktop] Global listen hotkey Ctrl+Shift+M registered.",
               flush=True)
         # "Explain this screen" — Ctrl+Shift+E
         keyboard.add_hotkey('ctrl+shift+e',

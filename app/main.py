@@ -2039,6 +2039,19 @@ async def get_active_tasks():
     return {"tasks": active}
 
 
+@app.get("/api/overlay/events", dependencies=[Depends(verify_token)])
+async def get_overlay_events(since: int = 0, limit: int = 80):
+    """Recent task events across all tasks for the native mouse textbox."""
+    events = log_emitter.read_global(since=since, limit=limit)
+    cursor = log_emitter.global_cursor()
+    if events:
+        try:
+            cursor = max(int(ev.get("global_seq", -1)) + 1 for ev in events)
+        except Exception:
+            cursor = log_emitter.global_cursor()
+    return {"events": events, "cursor": cursor}
+
+
 @app.post("/api/tasks", dependencies=[Depends(verify_token)])
 async def create_task(body: TaskIn):
     _validate_task_id(body.task_id)
