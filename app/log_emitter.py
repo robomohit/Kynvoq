@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+from collections import deque
 from datetime import datetime, timezone
 from typing import Dict, List
 
@@ -14,6 +15,7 @@ _log = logging.getLogger("log_emitter")
 
 MAX_LOG_FILE_BYTES = 20 * 1024 * 1024
 MAX_TEXT_FIELD_CHARS = 4_000
+MAX_GLOBAL_EVENTS = 600
 TASK_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -23,6 +25,8 @@ class LogEmitter:
         self._queues: Dict[str, List[asyncio.Queue]] = {}
         self._seqs: Dict[str, int] = {}
         self._disk_logging_disabled: set[str] = set()
+        self._global_seq = 0
+        self._global_events: deque[dict] = deque(maxlen=MAX_GLOBAL_EVENTS)
         # Maps task_id -> list of byte offsets, one per event written to disk.
         # Used by read_log() to seek directly to a given event instead of scanning.
         self._offsets: Dict[str, List[int]] = {}
@@ -115,6 +119,31 @@ class LogEmitter:
     def task_ids(self) -> list[str]:
         return sorted(path.stem for path in self.log_dir.glob("*.jsonl"))
 
+    def global_cursor(self) -> int:
+        return self._global_seq
+
+    def read_global(self, since: int = 0, limit: int = 100) -> list[dict]:
+        """Return recent task events across all tasks for lightweight overlays.
+
+        Per-task SSE is still the source of truth for the dashboard. This feed is
+        intentionally bounded and sanitized so an always-on desktop overlay can
+        follow status without keeping huge screenshots or file contents in RAM.
+        """
+        try:
+            cursor = max(0, int(since or 0))
+        except Exception:
+            cursor = 0
+        try:
+            take = min(max(1, int(limit or 100)), MAX_GLOBAL_EVENTS)
+        except Exception:
+            take = 100
+        events = [
+            dict(ev)
+            for ev in self._global_events
+            if int(ev.get("global_seq", -1)) >= cursor
+        ]
+        return events[-take:]
+
     def _truncate_text(self, value: str) -> str:
         if len(value) <= MAX_TEXT_FIELD_CHARS:
             return value
@@ -139,6 +168,19 @@ class LogEmitter:
 
         return sanitized
 
+    def _sanitize_for_global_feed(self, event_type: str, payload: dict) -> dict:
+        sanitized = dict(payload)
+
+        if event_type == "screenshot" and isinstance(sanitized.get("data"), str):
+            sanitized["data"] = "[omitted from overlay feed]"
+            sanitized["data_omitted"] = True
+
+        for field in ("detail", "output", "content", "reason", "message", "text"):
+            if isinstance(sanitized.get(field), str):
+                sanitized[field] = self._truncate_text(sanitized[field])
+
+        return sanitized
+
     def emit(self, task_id: str, event_type: str, payload: dict):
         seq = self._seqs.get(task_id)
         if seq is None:
@@ -151,6 +193,10 @@ class LogEmitter:
             **payload,
         }
         self._seqs[task_id] = seq + 1
+        overlay_msg = self._sanitize_for_global_feed(event_type, msg)
+        overlay_msg["global_seq"] = self._global_seq
+        self._global_seq += 1
+        self._global_events.append(overlay_msg)
 
         # Push to live SSE subscribers FIRST (instant, in-memory) so the UI
         # sees the event without waiting for any disk work.

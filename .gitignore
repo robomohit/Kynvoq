@@ -65,6 +65,7 @@ form_profiles.json
 scheduled_recipes.json
 screen_watches.json
 trust_policies.json
+adaptive_windows_profiles.json
 
 # Local screenshot/debug artifacts - ignore ALL root-level images (real app
 # images live under static/). Keeps stray capture files out of the repo.

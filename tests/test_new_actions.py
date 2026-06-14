@@ -520,6 +520,7 @@ def test_focus_window_survives_foreground_lock(workspace, monkeypatch):
         EnumWindows=lambda cb, acc: cb(21, acc),
         IsWindowVisible=lambda hwnd: True,
         GetWindowText=lambda hwnd: "Calculator",
+        GetWindowRect=lambda hwnd: (100, 120, 500, 420),
         IsIconic=lambda hwnd: False,
         ShowWindow=lambda hwnd, flag: None,
         BringWindowToTop=lambda hwnd: None,
@@ -533,6 +534,7 @@ def test_focus_window_survives_foreground_lock(workspace, monkeypatch):
     monkeypatch.setitem(sys.modules, "win32gui", fake_win32gui)
     monkeypatch.setitem(sys.modules, "win32com", fake_win32com)
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
+    monkeypatch.setattr(tools_module, "win32gui", fake_win32gui)
     monkeypatch.setattr(tools_module, "win32process", None)
     monkeypatch.setattr("time.sleep", lambda *_: None)
 
@@ -564,6 +566,67 @@ def test_wait_for_window_returns_visible_match(workspace, monkeypatch):
     assert result.ok
     assert result.data == {"hwnd": 11, "pid": 4242, "title": "Untitled - Notepad"}
     assert t._isolated_hwnd == 11
+
+
+def test_wait_for_window_matches_process_when_title_differs(workspace, monkeypatch):
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+    foregrounded = []
+    pid_by_hwnd = {10: 1000, 11: 2000}
+    exe_by_pid = {
+        1000: r"C:\Users\mohit\AppData\Local\Discord\app-1.0.9240\Discord.exe",
+        2000: r"C:\Windows\System32\ApplicationFrameHost.exe",
+    }
+
+    fake_win32gui = types.SimpleNamespace(
+        EnumWindows=lambda callback, acc: [callback(10, acc), callback(11, acc)],
+        IsWindow=lambda hwnd: hwnd == 10,
+        IsWindowVisible=lambda hwnd: True,
+        GetWindowText=lambda hwnd: "general - server" if hwnd == 10 else "Settings",
+        GetWindowRect=lambda hwnd: (100, 120, 900, 720) if hwnd == 10 else (0, 0, 400, 400),
+        IsIconic=lambda hwnd: False,
+        BringWindowToTop=lambda hwnd: None,
+        SetForegroundWindow=lambda hwnd: foregrounded.append(hwnd),
+    )
+    fake_win32process = types.SimpleNamespace(
+        GetWindowThreadProcessId=lambda hwnd: (1, pid_by_hwnd[hwnd])
+    )
+
+    monkeypatch.setattr(tools_module, "win32gui", fake_win32gui)
+    monkeypatch.setattr(tools_module, "win32process", fake_win32process)
+    monkeypatch.setattr(tools_module, "_process_exe_for_pid", lambda pid: exe_by_pid.get(pid, ""))
+    monkeypatch.setattr(tools_module, "_is_hung_app_window", lambda hwnd: False)
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+
+    result = t.wait_for_window("Discord", timeout=0.2)
+
+    assert result.ok
+    assert result.data == {"hwnd": 10, "pid": 1000, "title": "general - server"}
+    assert t._isolated_hwnd == 10
+    assert foregrounded == [10]
+
+
+def test_resolve_isolated_hwnd_reuses_process_match(workspace, monkeypatch):
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+    t.set_isolated_hwnd(None, "Discord.exe")
+
+    fake_win32gui = types.SimpleNamespace(
+        EnumWindows=lambda callback, acc: callback(10, acc),
+        IsWindow=lambda hwnd: False,
+        IsWindowVisible=lambda hwnd: True,
+        GetWindowText=lambda hwnd: "general - server",
+        GetWindowRect=lambda hwnd: (100, 120, 900, 720),
+    )
+    fake_win32process = types.SimpleNamespace(GetWindowThreadProcessId=lambda hwnd: (1, 1000))
+
+    monkeypatch.setattr(tools_module, "win32gui", fake_win32gui)
+    monkeypatch.setattr(tools_module, "win32process", fake_win32process)
+    monkeypatch.setattr(
+        tools_module,
+        "_process_exe_for_pid",
+        lambda pid: r"C:\Users\mohit\AppData\Local\Discord\app-1.0.9240\Discord.exe",
+    )
+
+    assert t.resolve_isolated_hwnd() == 10
 
 
 def test_bash_gui_launch_waits_for_window_and_tracks_pid(workspace, monkeypatch):

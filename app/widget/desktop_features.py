@@ -29,61 +29,191 @@ except ImportError:  # pragma: no cover - exercised on non-Windows CI hosts.
     winreg = None
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# WINDOW-SNAP LAYOUTS
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def list_visible_windows() -> list[dict]:
-    """Return [{'hwnd', 'title', 'exe'}] of user-visible top-level windows."""
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    dwm = ctypes.windll.dwmapi
+_DWMWA_CLOAKED = 14
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
-    EnumWindowsProc = ctypes.WINFUNCTYPE(
-        ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+def _basename_lower(path: str) -> str:
+    return re.split(r"[\\/]", str(path or "").strip().strip('"'))[-1].lower()
+
+
+def _app_hint_parts(app_hint: str) -> list[str]:
+    """Comparable app tokens from a title, basename, or full .exe path."""
+    raw_hint = str(app_hint or "").strip().strip('"')
+    raw_base = re.split(r"[\\/]", raw_hint)[-1]
+    raw_stem = raw_base[:-4] if raw_base.lower().endswith(".exe") else os.path.splitext(raw_base)[0]
+    hint = raw_hint.lower()
+    base = raw_base.lower()
+    stem = raw_stem.lower()
+    parts: list[str] = []
+    camel_words = re.findall(
+        r"[A-Z]?[a-z]+|[A-Z]+(?=[A-Z]|$)|\d+",
+        raw_stem,
+    )
+    for value in (hint, base, stem, *(word.lower() for word in camel_words if len(word) >= 3)):
+        value = value.strip()
+        if value and value not in parts:
+            parts.append(value)
+    return parts
+
+
+def _app_hint_anchor_parts(app_hint: str) -> set[str]:
+    raw_hint = str(app_hint or "").strip().strip('"')
+    raw_base = re.split(r"[\\/]", raw_hint)[-1]
+    raw_stem = raw_base[:-4] if raw_base.lower().endswith(".exe") else os.path.splitext(raw_base)[0]
+    return {
+        value.strip().lower()
+        for value in (raw_hint, raw_base, raw_stem)
+        if value.strip()
+    }
+
+
+def _window_hint_score(window: dict, app_hint: str, foreground_hwnd: int = 0) -> int:
+    """Score whether a top-level window matches an app hint by title or exe.
+
+    UIA title matching is ideal, but games and Electron shells can expose blank
+    or dynamic titles. Process-basename matching gives the resolver a second
+    anchor before it escalates to OCR/visual control.
+    """
+    parts = _app_hint_parts(app_hint)
+    if not parts:
+        return 0
+    anchors = _app_hint_anchor_parts(app_hint)
+    hint_base = re.split(r"[\\/]", str(app_hint or "").strip().strip('"'))[-1].lower()
+    exe_hint = hint_base.endswith(".exe")
+    document_hint = bool(os.path.splitext(hint_base)[1]) and not exe_hint
+    title = str(window.get("title") or "").strip().lower()
+    title_cmp = title.lstrip("* \t")
+    exe_base = _basename_lower(str(window.get("exe") or ""))
+    exe_stem = exe_base[:-4] if exe_base.endswith(".exe") else os.path.splitext(exe_base)[0]
+    score = 0
+    for part in parts:
+        token_only = part not in anchors
+        if document_hint and token_only:
+            continue
+        token_title_score = 100 if (not token_only or exe_hint) else 25
+        token_prefix_score = 75 if (not token_only or exe_hint) else 25
+        token_contains_score = 45 if (not token_only or exe_hint) else 20
+        if title:
+            if title == part or title_cmp == part:
+                score = max(score, token_title_score)
+            elif title.startswith(part) or title_cmp.startswith(part):
+                score = max(score, token_prefix_score)
+            elif part in title or part in title_cmp:
+                score = max(score, token_contains_score)
+        if document_hint:
+            continue
+        if exe_base and exe_base == part:
+            score = max(score, 90)
+        if exe_stem:
+            if exe_stem == part:
+                score = max(score, 85)
+            elif len(part) >= 4 and part in exe_stem:
+                score = max(score, 60)
+            elif len(exe_stem) >= 4 and exe_stem in part:
+                score = max(score, 55)
+    if score <= 0:
+        return 0
+    try:
+        if foreground_hwnd and int(window.get("hwnd") or 0) == foreground_hwnd:
+            score += 35
+    except Exception:
+        pass
+    if "activate windows" in title:
+        score -= 200
+    return score
+
+
+def _visible_top_level_windows(*, include_untitled: bool = False) -> list[dict]:
+    """Visible Win32 top-level windows, including exe metadata when available."""
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        dwm = ctypes.windll.dwmapi
+        enum_proc = ctypes.WINFUNCTYPE(
+            ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    except Exception:
+        return []
 
     results: list[dict] = []
-    DWMWA_CLOAKED = 14
-    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-    SKIP = {"Program Manager", "Windows Input Experience",
-            "Microsoft Text Input Application", "Settings", "Search"}
 
     def cb(hwnd, _lp):
         try:
             if not user32.IsWindowVisible(hwnd):
                 return True
             cloaked = wintypes.DWORD(0)
-            dwm.DwmGetWindowAttribute(wintypes.HWND(hwnd), DWMWA_CLOAKED,
-                                      ctypes.byref(cloaked),
-                                      ctypes.sizeof(cloaked))
-            if cloaked.value:
+            try:
+                dwm.DwmGetWindowAttribute(
+                    wintypes.HWND(hwnd), _DWMWA_CLOAKED,
+                    ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                if cloaked.value:
+                    return True
+            except Exception:
+                pass
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return True
+            width = int(rect.right - rect.left)
+            height = int(rect.bottom - rect.top)
+            if width <= 0 or height <= 0:
                 return True
             length = user32.GetWindowTextLengthW(hwnd)
-            if length == 0:
-                return True
-            buf = ctypes.create_unicode_buffer(length + 2)
-            user32.GetWindowTextW(hwnd, buf, length + 2)
-            title = buf.value
-            if not title or title in SKIP:
+            title = ""
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 2)
+                user32.GetWindowTextW(hwnd, buf, length + 2)
+                title = buf.value
+            if not title and not include_untitled:
                 return True
             pid = wintypes.DWORD(0)
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             exe = ""
-            h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
-                                     False, pid.value)
+            h = kernel32.OpenProcess(
+                _PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
             if h:
-                ebuf = ctypes.create_unicode_buffer(1024)
-                size = wintypes.DWORD(1024)
-                kernel32.QueryFullProcessImageNameW(h, 0, ebuf,
-                                                    ctypes.byref(size))
-                exe = ebuf.value
-                kernel32.CloseHandle(h)
-            results.append({"hwnd": int(hwnd), "title": title, "exe": exe})
+                try:
+                    ebuf = ctypes.create_unicode_buffer(1024)
+                    size = wintypes.DWORD(1024)
+                    if kernel32.QueryFullProcessImageNameW(
+                            h, 0, ebuf, ctypes.byref(size)):
+                        exe = ebuf.value
+                finally:
+                    kernel32.CloseHandle(h)
+            cls = ctypes.create_unicode_buffer(256)
+            try:
+                user32.GetClassNameW(hwnd, cls, 256)
+            except Exception:
+                pass
+            results.append({
+                "hwnd": int(hwnd),
+                "title": title,
+                "exe": exe,
+                "pid": int(pid.value),
+                "class_name": cls.value,
+                "rect": (int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)),
+                "area": width * height,
+            })
         except Exception:
             pass
         return True
 
-    user32.EnumWindows(EnumWindowsProc(cb), 0)
+    user32.EnumWindows(enum_proc(cb), 0)
+    results.sort(key=lambda item: item.get("area", 0), reverse=True)
     return results
+
+
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# WINDOW-SNAP LAYOUTS
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def list_visible_windows() -> list[dict]:
+    """Return [{'hwnd', 'title', 'exe'}] of user-visible top-level windows."""
+    SKIP = {"Program Manager", "Windows Input Experience",
+            "Microsoft Text Input Application", "Settings", "Search"}
+    return [
+        {"hwnd": w["hwnd"], "title": w["title"], "exe": w["exe"]}
+        for w in _visible_top_level_windows(include_untitled=False)
+        if w.get("title") and w.get("title") not in SKIP
+    ]
 
 
 def foreground_window_info() -> dict:
@@ -526,7 +656,6 @@ def _uia_root_candidates(app_hint: str = "", fallback_foreground: bool = True) -
     import uiautomation as uia
     candidates: list[tuple[int, object]] = []
     if app_hint:
-        hint = app_hint.lower().strip()
         # Foreground window handle â€” when several windows of the same app are
         # open (e.g. 5 Notepads), prefer the one the user is actually looking at.
         fg_handle = 0
@@ -534,12 +663,26 @@ def _uia_root_candidates(app_hint: str = "", fallback_foreground: bool = True) -
             fg_handle = int(uia.GetForegroundControl().NativeWindowHandle or 0)
         except Exception:
             pass
+        seen_handles: set[int] = set()
         for top in uia.GetRootControl().GetChildren():
             try:
                 low = (top.Name or "").strip().lower()
-                if not low or hint not in low:
+                try:
+                    handle = int(top.NativeWindowHandle or 0)
+                except Exception:
+                    handle = 0
+                score = _window_hint_score(
+                    {
+                        "hwnd": handle,
+                        "title": low,
+                        "exe": "",
+                        "class_name": getattr(top, "ClassName", ""),
+                    },
+                    app_hint,
+                    fg_handle,
+                )
+                if score <= 0:
                     continue
-                score = 100 if low == hint else (60 if low.startswith(hint) else 30)
                 try:
                     if top.ControlTypeName == "WindowControl":
                         score += 20
@@ -547,19 +690,53 @@ def _uia_root_candidates(app_hint: str = "", fallback_foreground: bool = True) -
                     pass
                 if _has_real_content(top):
                     score += 45
-                try:
-                    handle = int(top.NativeWindowHandle or 0)
-                except Exception:
-                    handle = 0
-                if fg_handle and handle == fg_handle:  # the active window wins ties
-                    score += 40
                 if _window_cloaked(handle):     # suspended/zombie frame, never a target
                     score -= 150
-                if "activate windows" in low:   # the activation watermark, never a target
-                    score -= 200
                 candidates.append((score, top))
+                if handle:
+                    seen_handles.add(handle)
             except Exception:
                 continue
+        raw_windows = _visible_top_level_windows(include_untitled=True)
+        companion_titles: dict[str, int] = {}
+
+        def add_win32_candidate(win: dict, score: int) -> bool:
+            hwnd = int(win.get("hwnd") or 0)
+            if hwnd and hwnd in seen_handles:
+                return False
+            try:
+                top = uia.ControlFromHandle(hwnd)
+            except Exception:
+                return False
+            if top is None:
+                return False
+            try:
+                if top.ControlTypeName == "WindowControl":
+                    score += 20
+            except Exception:
+                pass
+            if _has_real_content(top):
+                score += 45
+            candidates.append((score, top))
+            if hwnd:
+                seen_handles.add(hwnd)
+            return True
+
+        for win in raw_windows:
+            score = _window_hint_score(win, app_hint, fg_handle)
+            if score <= 0:
+                continue
+            title = str(win.get("title") or "").strip().lower()
+            if title:
+                companion_titles[title] = max(companion_titles.get(title, 0), score)
+            add_win32_candidate(win, score)
+        for win in raw_windows:
+            title = str(win.get("title") or "").strip().lower()
+            if not title or title not in companion_titles:
+                continue
+            if _window_hint_score(win, app_hint, fg_handle) > 0:
+                continue
+            add_win32_candidate(win, max(1, companion_titles[title] - 5))
         candidates.sort(key=lambda x: -x[0])
     roots = [c for _, c in candidates]
     if not roots and fallback_foreground:
@@ -673,9 +850,42 @@ def find_ui_elements(query: str, app_hint: str = "",
         if not roots:
             roots = _uia_root_candidates("", fallback_foreground=True)
 
+        def control_info(ctrl, score: int) -> dict:
+            rect = ctrl.BoundingRectangle
+            has_rect = rect.right > rect.left and rect.bottom > rect.top
+            try:
+                offscreen = bool(ctrl.IsOffscreen)
+            except Exception:
+                offscreen = False
+            return {
+                "name": ctrl.Name or "",
+                "automation_id": ctrl.AutomationId or "",
+                "control_type": ctrl.ControlTypeName or "",
+                "left": rect.left if has_rect else 0,
+                "top": rect.top if has_rect else 0,
+                "x": (rect.left + rect.right) // 2 if has_rect else 0,
+                "y": (rect.top + rect.bottom) // 2 if has_rect else 0,
+                "width": max(0, rect.right - rect.left),
+                "height": max(0, rect.bottom - rect.top),
+                "score": score,
+                "offscreen": offscreen or not has_rect,
+            }
+
         def search(root) -> list[tuple[int, dict]]:
             candidates: list[tuple[int, dict]] = []
             perfect = [0]  # count of exact (score==100) hits found so far
+
+            q = (query or "").strip()
+            if q and not _is_chrome_control(q):
+                try:
+                    fast = root.Control(searchDepth=0xFFFFFFFF, Name=q)
+                    if fast.Exists(maxSearchSeconds=0, searchIntervalSeconds=0):
+                        item = control_info(fast, 100)
+                        if not item["offscreen"]:
+                            return [(100, item)]
+                        candidates.append((92, item))
+                except Exception:
+                    pass
 
             def walk(ctrl, depth=0):
                 if depth > _UIA_MAX_DEPTH or perfect[0] >= limit:
@@ -689,32 +899,15 @@ def find_ui_elements(query: str, app_hint: str = "",
                     # would match substring queries and steal the real target.
                     score = _score_match(query, name, aid, role) if depth > 0 else 0
                     if score > 0:
-                        rect = ctrl.BoundingRectangle
-                        has_rect = rect.right > rect.left and rect.bottom > rect.top
                         # Electron/Chromium controls (Discord servers/channels) often
                         # report a 0x0 rect and IsOffscreen even when they're visible
                         # and clickable via Invoke/Select patterns. Keep them â€” just
                         # rank them below on-screen matches so a visible duplicate
                         # wins ties. uia_click scrolls them into view before acting.
-                        try:
-                            offscreen = bool(ctrl.IsOffscreen)
-                        except Exception:
-                            offscreen = False
-                        eff = score - (8 if (offscreen or not has_rect) else 0)
-                        candidates.append((eff, {
-                            "name": name,
-                            "automation_id": aid,
-                            "control_type": role,
-                            "left": rect.left if has_rect else 0,
-                            "top": rect.top if has_rect else 0,
-                            "x": (rect.left + rect.right) // 2 if has_rect else 0,
-                            "y": (rect.top + rect.bottom) // 2 if has_rect else 0,
-                            "width": max(0, rect.right - rect.left),
-                            "height": max(0, rect.bottom - rect.top),
-                            "score": score,
-                            "offscreen": offscreen or not has_rect,
-                        }))
-                        if score >= 100 and has_rect and not offscreen:
+                        item = control_info(ctrl, score)
+                        eff = score - (8 if item["offscreen"] else 0)
+                        candidates.append((eff, item))
+                        if score >= 100 and not item["offscreen"]:
                             perfect[0] += 1
                     for child in ctrl.GetChildren():
                         if perfect[0] >= limit:
@@ -1103,34 +1296,11 @@ def _find_uia_control(query: str, app_hint: str = ""):
                       "error": "uiautomation not installed (pip install uiautomation)"}
     _ensure_uia_config(uia)
     try:
-        root = _uia_root(app_hint)
+        roots = _uia_root_candidates(app_hint)
+        if not roots:
+            roots = []
 
-        # â”€â”€ Fast path: native exact-name FindFirst (runs in UIA's C++ core,
-        # ~2x faster than the Python walk below). The walk also early-exits on
-        # the first exact (score-100) hit, so this returns the same control â€”
-        # just quicker. maxSearchSeconds=0 = a single immediate search, so a
-        # miss returns fast and falls through to the scored walk (which handles
-        # fuzzy / AutomationId / role matches). Skipped for chrome/titlebar
-        # names so we never grab the window's Close over a real "Close" button.
         q = (query or "").strip()
-        if root is not None and q and not _is_chrome_control(q):
-            try:
-                fast = root.Control(searchDepth=0xFFFFFFFF, Name=q)
-                if fast.Exists(maxSearchSeconds=0, searchIntervalSeconds=0):
-                    r = fast.BoundingRectangle
-                    has_rect = r.right > r.left and r.bottom > r.top
-                    return fast, {
-                        "name": fast.Name or "",
-                        "automation_id": fast.AutomationId or "",
-                        "control_type": fast.ControlTypeName or "",
-                        "x": (r.left + r.right) // 2 if has_rect else 0,
-                        "y": (r.top + r.bottom) // 2 if has_rect else 0,
-                        "score": 100,
-                        "offscreen": not has_rect,
-                    }
-            except Exception:
-                pass
-
         best = [0, None, None]  # score, ctrl, info (mutable for early-exit)
 
         def walk(ctrl, depth=0):
@@ -1171,7 +1341,35 @@ def _find_uia_control(query: str, app_hint: str = ""):
             except Exception:
                 pass
 
-        walk(root)
+        for root in roots[:3]:
+            if root is None:
+                continue
+            # Fast path: native exact-name FindFirst (runs in UIA's C++ core,
+            # ~2x faster than the Python walk below). maxSearchSeconds=0 = a
+            # single immediate search, so a miss returns fast and falls through
+            # to the scored walk. Try each ranked root because WinUI apps can
+            # expose a stale/tab-frame root before the live document root.
+            if q and not _is_chrome_control(q):
+                try:
+                    fast = root.Control(searchDepth=0xFFFFFFFF, Name=q)
+                    if fast.Exists(maxSearchSeconds=0, searchIntervalSeconds=0):
+                        r = fast.BoundingRectangle
+                        has_rect = r.right > r.left and r.bottom > r.top
+                        return fast, {
+                            "name": fast.Name or "",
+                            "automation_id": fast.AutomationId or "",
+                            "control_type": fast.ControlTypeName or "",
+                            "x": (r.left + r.right) // 2 if has_rect else 0,
+                            "y": (r.top + r.bottom) // 2 if has_rect else 0,
+                            "score": 100,
+                            "offscreen": not has_rect,
+                        }
+                except Exception:
+                    pass
+            walk(root)
+            if best[0] >= 100:
+                break
+
         if best[1] is None:
             return None, {"ok": False, "error": f"no UIA control matched '{query}'"}
         return best[1], best[2]
@@ -1218,7 +1416,11 @@ def app_window_rect(app_hint: str, *, fallback_foreground: bool = False) -> dict
         return {"left": 0, "top": 0, "width": 0, "height": 0}
     _ensure_uia_config(uia)
     try:
-        top = _uia_root(app_hint, fallback_foreground=fallback_foreground) if (app_hint or fallback_foreground) else None
+        top = (
+            _uia_root(app_hint, fallback_foreground=fallback_foreground)
+            if (app_hint or fallback_foreground)
+            else None
+        )
         if top is None:
             return {"left": 0, "top": 0, "width": 0, "height": 0}
         # Prefer DWM's visible bounds so the glow hugs the real window edge
@@ -1228,6 +1430,56 @@ def app_window_rect(app_hint: str, *, fallback_foreground: bool = False) -> dict
         if vis is not None:
             return vis
         return _onscreen_rect(top)
+    except Exception:
+        return {"left": 0, "top": 0, "width": 0, "height": 0}
+
+
+def _client_rect_for_hwnd(hwnd: int) -> Optional[dict]:
+    """Client/content area for a top-level HWND in screen coordinates."""
+    if not hwnd:
+        return None
+    try:
+        rect = wintypes.RECT()
+        if not ctypes.windll.user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        pt = wintypes.POINT(0, 0)
+        if not ctypes.windll.user32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(pt)):
+            return None
+        width = int(rect.right - rect.left)
+        height = int(rect.bottom - rect.top)
+        if width > 0 and height > 0:
+            return {
+                "left": int(pt.x),
+                "top": int(pt.y),
+                "width": width,
+                "height": height,
+            }
+    except Exception:
+        pass
+    return None
+
+
+def app_content_rect(app_hint: str, *, fallback_foreground: bool = False) -> dict:
+    """Client/content bounds for OCR/runtime probing.
+
+    Unlike app_window_rect, this excludes standard title bars and borders. That
+    matters for blank canvas/game surfaces: their title text should not make the
+    runtime classifier believe the rendered app content has OCR-readable text.
+    """
+    try:
+        import uiautomation as uia  # noqa: F401
+    except ImportError:
+        return {"left": 0, "top": 0, "width": 0, "height": 0}
+    _ensure_uia_config(uia)
+    try:
+        top = _uia_root(app_hint, fallback_foreground=fallback_foreground) if (app_hint or fallback_foreground) else None
+        if top is None:
+            return {"left": 0, "top": 0, "width": 0, "height": 0}
+        hwnd = int(getattr(top, "NativeWindowHandle", 0) or 0)
+        client = _client_rect_for_hwnd(hwnd)
+        if client is not None:
+            return client
+        return app_window_rect(app_hint, fallback_foreground=fallback_foreground)
     except Exception:
         return {"left": 0, "top": 0, "width": 0, "height": 0}
 
@@ -1409,7 +1661,11 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
     #    accept SetValue into the DOM while their app state stays empty (the
     #    Discord bug) â€” those fall through to the focus+paste tier below.
     #    submit needs a real Enter keystroke, so it can't ride this tier.
-    if not submit:
+    control_type = str(info.get("control_type") or "")
+    # Document-style editors (modern Notepad, rich text surfaces, some custom
+    # controls) can reflect SetValue through accessibility without updating the
+    # app's real document model. Use paste for those so save/submit paths see it.
+    if not submit and control_type != "DocumentControl":
         bg = _try_background_setvalue(ctrl, text, clear_first)
         if bg:
             return {"ok": True, "method": "setvalue-background",
@@ -1438,11 +1694,17 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
                 "found_at": info}
     try:
         time.sleep(0.08)  # let focus settle before sending keys
+        use_foreground_keys = control_type == "DocumentControl"
         # All keystrokes go through the control's own SendKeys (targeted
         # SendInput) â€” far more reliable than pyautogui's global hotkeys, which
         # drop/reorder chars and leak stray keys under rapid automation.
         if clear_first:
-            ctrl.SendKeys("{Ctrl}a{Delete}", waitTime=0)
+            if use_foreground_keys:
+                import pyautogui
+                pyautogui.hotkey("ctrl", "a")
+                pyautogui.press("delete")
+            else:
+                ctrl.SendKeys("{Ctrl}a{Delete}", waitTime=0)
             note_synthetic_input()
         # 2. Text entry via verified clipboard paste. Instant for any length AND
         #    fires the native paste/input events that React/Electron inputs
@@ -1469,7 +1731,11 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
                     pass
                 time.sleep(0.01)
             if pasted_ok:
-                ctrl.SendKeys("{Ctrl}v", waitTime=0)
+                if use_foreground_keys:
+                    import pyautogui
+                    pyautogui.hotkey("ctrl", "v")
+                else:
+                    ctrl.SendKeys("{Ctrl}v", waitTime=0)
                 note_synthetic_input()
                 time.sleep(0.1)   # let the paste fully consume the clipboard
                 if saved:         # restore prior clipboard, after paste is done
@@ -1489,7 +1755,11 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
         # 3. Optional submit (send / search) in the same focused control.
         if submit:
             time.sleep(0.04)
-            ctrl.SendKeys("{Enter}", waitTime=0)
+            if use_foreground_keys:
+                import pyautogui
+                pyautogui.press("enter")
+            else:
+                ctrl.SendKeys("{Enter}", waitTime=0)
             note_synthetic_input()
             method += "+enter"
         return {"ok": True, "method": method + politeness,

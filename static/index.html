@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Orynn · Stream</title>
+<title>Orynn - Chat</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='18' fill='%230A0F12'/%3E%3Crect x='14' y='15' width='36' height='27' rx='6' fill='none' stroke='%235BE0D0' stroke-width='5'/%3E%3Ccircle cx='32' cy='28.5' r='5' fill='%235BE0D0'/%3E%3Cpath d='M24 49h16M32 42v7' stroke='%235BE0D0' stroke-width='5' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -11,8 +11,9 @@
 <link rel="stylesheet" href="/static/style.css">
 <link rel="stylesheet" href="/static/liquid-glass.css">
 <link rel="stylesheet" href="/static/dynamic.css">
+<link rel="stylesheet" href="/static/workbench-v2.css">
 </head>
-<body data-glass="on">
+<body data-glass="on" data-ux="workbench-v2">
 <!-- Liquid Glass refraction filter (referenced by backdrop-filter: url(#lg-refract)) -->
 <svg aria-hidden="true" style="position:absolute;width:0;height:0;overflow:hidden" focusable="false">
   <defs>
@@ -48,10 +49,15 @@
 <div class="app-shell sb-on">
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-controls">
-      <button class="sidebar-button" id="new-session-btn" type="button">
-        <span>New session</span>
-        <span id="new-session-kbd">Ctrl+N</span>
-      </button>
+      <div class="sidebar-primary-row">
+        <button class="sidebar-button" id="new-session-btn" type="button">
+          <span>New session</span>
+          <span id="new-session-kbd">Ctrl+N</span>
+        </button>
+        <button class="sidebar-collapse-toggle" id="sidebar-collapse-toggle" type="button" aria-label="Collapse sidebar" aria-expanded="true" title="Collapse sidebar">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m15 18-6-6 6-6"/></svg>
+        </button>
+      </div>
 
       <button class="project-folder-trigger" id="project-folder-trigger" type="button" aria-label="Choose project folder">
         <span class="project-folder-icon" aria-hidden="true">
@@ -306,7 +312,7 @@
         <div class="topbar-title">
           <div class="topbar-row">
             <span class="topbar-dot" id="topbar-dot"></span>
-            <h2 id="task-title">Stream</h2>
+            <h2 id="task-title">New chat</h2>
             <span class="topbar-ctx" id="topbar-ctx"></span>
             <span class="topbar-control" id="topbar-control" hidden>
               <span class="topbar-control-dot" aria-hidden="true"></span>
@@ -342,26 +348,20 @@
       <div class="feed" id="feed">
         <section class="welcome" id="welcome">
           <div class="hello-eye">Orynn</div>
-          <h3>What can I help you with?</h3>
-          <p>Quick answers and real tasks — fast on free models. Try one:</p>
+          <h3>What should I take care of?</h3>
+          <p>Ready when you are.</p>
           <div class="example-grid">
-            <button class="example-btn" type="button" data-example="What's the weather in Tokyo right now?">
-              <div class="ex-body"><strong>Check the weather</strong><span>Live conditions + 3-day forecast for any place — instant, no setup.</span></div>
+            <button class="example-btn" type="button" data-example="Open Windows Settings, find what Windows version I am on, then paste it into Notepad.">
+              <div class="ex-body"><strong>Settings to Notepad</strong><span>Read Windows specs, paste them into Notepad, and verify the note.</span></div>
             </button>
-            <button class="example-btn" type="button" data-example="Give me a two-sentence summary of what quantum computing is.">
-              <div class="ex-body"><strong>Explain a topic</strong><span>A plain-language summary from Wikipedia in one call.</span></div>
+            <button class="example-btn" type="button" data-example="Summarize the current page in three bullets and include anything I should act on.">
+              <div class="ex-body"><strong>Summarize current page</strong><span>Use the active browser context when it helps.</span></div>
             </button>
-            <button class="example-btn" type="button" data-example="What are the top stories on Hacker News right now?">
-              <div class="ex-body"><strong>Trending in tech</strong><span>Top Hacker News stories, right now.</span></div>
+            <button class="example-btn" type="button" data-example="Run the relevant tests for this repo, explain any failure, and make the smallest safe fix.">
+              <div class="ex-body"><strong>Patch a failing test</strong><span>Inspect, run, edit, and verify in the workspace.</span></div>
             </button>
-            <button class="example-btn" type="button" data-example="How many stars does the GitHub repo facebook/react have, and list its recent open issues.">
-              <div class="ex-body"><strong>Check a GitHub repo</strong><span>Stars, language + open issues for any owner/name.</span></div>
-            </button>
-            <button class="example-btn" type="button" data-example="Open the Calculator app and multiply 1234 by 56, then tell me the result.">
-              <div class="ex-body"><strong>Run a desktop task</strong><span>Drives your real Windows apps by control name — no screenshots.</span></div>
-            </button>
-            <button class="example-btn" type="button" data-example="Write and run a Python script that prints the first 10 prime numbers.">
-              <div class="ex-body"><strong>Write &amp; run code</strong><span>Writes, runs, and checks code in your workspace.</span></div>
+            <button class="example-btn" type="button" data-example="Clean up my Downloads folder by grouping obvious files, but ask before moving anything.">
+              <div class="ex-body"><strong>Organize Downloads</strong><span>Plan first, ask before file moves, then verify.</span></div>
             </button>
           </div>
         </section>
@@ -377,7 +377,7 @@
             <div class="mini-chip"><kbd>⇧↵</kbd> newline</div>
             <div class="char-count" id="char-count"></div>
           </div>
-          <div class="composer-options" aria-label="Task options">
+          <div class="composer-options" aria-label="Task options" hidden aria-hidden="true">
             <label class="composer-toggle"><input type="checkbox" id="plan-first-toggle"><span>Plan first</span></label>
             <label class="composer-toggle"><input type="checkbox" id="notify-toggle"><span>Notify</span></label>
             <label class="composer-toggle"><input type="checkbox" id="checkpoint-toggle"><span>Checkpoint</span></label>
@@ -385,7 +385,7 @@
             <label class="composer-select-label"><span>Thinking</span><select id="thinking-budget"><option value="off">Off</option><option value="standard">Standard</option><option value="extended">Extended</option></select></label>
           </div>
           <div class="composer-actions">
-            <button class="composer-icon-btn" id="composer-options-toggle" type="button" aria-label="Task options" title="Task options (plan, access, thinking)" aria-expanded="false">
+            <button class="composer-icon-btn" id="composer-options-toggle" type="button" aria-label="Task options" title="Task options (plan, access, thinking)" aria-expanded="false" hidden aria-hidden="true">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><circle cx="9" cy="6" r="2"/><line x1="4" y1="12" x2="20" y2="12"/><circle cx="15" cy="12" r="2"/><line x1="4" y1="18" x2="20" y2="18"/><circle cx="9" cy="18" r="2"/></svg>
             </button>
             <button class="composer-icon-btn" id="read-aloud-toggle" type="button" aria-label="Read replies aloud" title="Read agent replies aloud">
@@ -402,6 +402,17 @@
       </div>
     </div>
   </main>
+
+  <!-- Task panel — the model's named tasks (todo_write) for long/multi-step
+       runs, docked on the right so the user watches progress without the feed
+       flooding. Hidden until the model creates tasks. -->
+  <aside class="task-panel" id="task-panel" hidden aria-label="Task progress">
+    <div class="task-panel-head">
+      <span class="task-panel-title">Tasks</span>
+      <span class="task-panel-count" id="task-panel-count"></span>
+    </div>
+    <ol class="task-list" id="task-list"></ol>
+  </aside>
 
   <footer class="statusbar" id="statusbar">
     <div class="sb-item sb-status sb-status-ready" id="sb-status">

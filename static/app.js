@@ -332,10 +332,30 @@
 
   const WELCOME_HTML = document.getElementById('welcome').outerHTML;
   const PROJECT_FOLDER_STORAGE_KEY = 'ai-computer.project-folder.v1';
+  const SIDEBAR_COLLAPSED_STORAGE_KEY = 'orynn.sidebar-collapsed.v1';
   const projectFolderState = {
     selectedPath: '',
     browsingPath: '',
     shortcuts: []
+  };
+
+  const storedSidebarCollapsed = () => {
+    try { return localStorage.getItem(SIDEBAR_COLLAPSED_STORAGE_KEY) === '1'; }
+    catch (_) { return false; }
+  };
+
+  const setSidebarCollapsed = (collapsed, { persist = true } = {}) => {
+    const next = !!collapsed;
+    document.body.classList.toggle('sidebar-collapsed', next);
+    const toggle = $('sidebar-collapse-toggle');
+    if (toggle) {
+      toggle.setAttribute('aria-expanded', next ? 'false' : 'true');
+      toggle.setAttribute('aria-label', next ? 'Expand sidebar' : 'Collapse sidebar');
+      toggle.title = next ? 'Expand sidebar' : 'Collapse sidebar';
+    }
+    if (!persist) return;
+    try { localStorage.setItem(SIDEBAR_COLLAPSED_STORAGE_KEY, next ? '1' : '0'); }
+    catch (_) {}
   };
 
   const pathLeaf = (value = '') => {
@@ -367,7 +387,7 @@
     const h = document.querySelector('#welcome h3');
     if (!h) return;
     const folder = projectFolderState.selectedPath;
-    h.textContent = folder ? `What should we build in ${pathLeaf(folder)}?` : 'What can I help you with?';
+    h.textContent = folder ? `What should we build in ${pathLeaf(folder)}?` : 'What should I take care of?';
   };
 
   const renderProjectFolderSummary = () => {
@@ -616,6 +636,44 @@
     if (w) w.remove();
     markFeedActive();
   };
+
+  // ── Task panel ── the model's own named task list (todo_write) rendered as a
+  // right-side progress dock for long/multi-step runs. Model-provided text →
+  // textContent only, never innerHTML.
+  const _TASK_ICONS = {
+    completed: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
+    in_progress: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="12" cy="12" r="9" opacity="0.25"/><path d="M12 3a9 9 0 0 1 9 9"/></svg>',
+    pending: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="8.5" opacity="0.5"/></svg>',
+  };
+  const renderTaskPanel = (items = []) => {
+    const panel = $('task-panel');
+    const list = $('task-list');
+    if (!panel || !list) return;
+    const tasks = Array.isArray(items) ? items.filter((t) => t && (t.content || t.activeForm)) : [];
+    if (!tasks.length) { panel.hidden = true; list.replaceChildren(); return; }
+    const frag = document.createDocumentFragment();
+    let doneCount = 0;
+    tasks.forEach((t) => {
+      const status = ['completed', 'in_progress', 'pending'].includes(t.status) ? t.status : 'pending';
+      if (status === 'completed') doneCount += 1;
+      const li = document.createElement('li');
+      li.className = `task-row task-${status}`;
+      const ico = document.createElement('span');
+      ico.className = 'task-ico';
+      ico.innerHTML = _TASK_ICONS[status];          // trusted inline SVG constant
+      const label = document.createElement('span');
+      label.className = 'task-label';
+      // show the present-tense activeForm while running, the plain content otherwise
+      label.textContent = String((status === 'in_progress' ? (t.activeForm || t.content) : t.content) || '');
+      li.append(ico, label);
+      frag.appendChild(li);
+    });
+    list.replaceChildren(frag);
+    const count = $('task-panel-count');
+    if (count) count.textContent = `${doneCount}/${tasks.length}`;
+    panel.hidden = false;
+  };
+  const resetTaskPanel = () => renderTaskPanel([]);
 
   const bindExamples = () => {
     document.querySelectorAll('.example-btn').forEach((btn) => {
@@ -1105,6 +1163,7 @@
     const dotCls = { queued: 'running', pending: 'running', running: 'running', paused: 'paused', complete: 'done', failed: 'failed', error: 'failed' };
     const dot = $('topbar-dot');
     if (dot) dot.className = 'topbar-dot' + (dotCls[key] ? ' ' + dotCls[key] : '');
+    updateCharCount();
   };
 
   const isDesktopMode = (mode = currentMode) => mode === 'computer' || mode === 'computer_isolated';
@@ -1413,7 +1472,7 @@
   };
 
   const setTaskTitle = (title, ctx = {}) => {
-    const idleName = projectFolderState.selectedPath ? pathLeaf(projectFolderState.selectedPath) : 'Stream';
+    const idleName = projectFolderState.selectedPath ? pathLeaf(projectFolderState.selectedPath) : 'New chat';
     const fullTitle = title || idleName;
     $('task-title').textContent = fullTitle;
     $('task-title').title = fullTitle;
@@ -1681,14 +1740,12 @@
     const queued = rawStatus === 'queued' || rawStatus === 'pending';
     const paused = !!record.paused || rawStatus === 'paused';
     isPaused = !queued && paused;
-    $('btn-pause').textContent = isPaused ? 'Resume' : 'Pause';
-    $('btn-pause').classList.toggle('hidden', queued);
-    $('btn-cancel').classList.remove('hidden');
+    $('btn-pause').classList.add('hidden');
+    $('btn-cancel').classList.add('hidden');
     $('btn-retry').classList.add('hidden');
     $('btn-control-report').classList.add('hidden');
     $('btn-copy-log').classList.add('hidden');
     $('btn-download-log').classList.add('hidden');
-    $('send').classList.add('hidden');
     setStatus(queued ? rawStatus : (isPaused ? 'paused' : 'running'));
     setDesktopSessionActive(!queued && isDesktopMode(meta.mode), meta.mode, meta.isolatedApp || '');
   };
@@ -1987,9 +2044,8 @@
       row.append(name, tag);
       body.appendChild(row);
     });
-    const expanded = n <= 5;                  // few files: show them; many: tuck away
-    body.hidden = !expanded;
-    wrap.classList.toggle('open', expanded);
+    body.hidden = true;
+    wrap.classList.remove('open');
     head.addEventListener('click', () => {
       body.hidden = !body.hidden;
       wrap.classList.toggle('open', !body.hidden);
@@ -2241,18 +2297,12 @@
 
   const appendPreviewBlock = (container, preview, className = 'detail-preview') => {
     if (!preview) return;
-    if (preview.length <= 360) {
-      const code = document.createElement('pre');
-      code.className = className;
-      code.textContent = preview;
-      container.appendChild(code);
-      return;
-    }
     const wrap = document.createElement('details');
     wrap.className = 'preview-wrap';
     const summary = document.createElement('summary');
     summary.className = 'preview-toggle';
-    summary.textContent = `Open preview · ${preview.length} chars`;
+    const lineCount = String(preview).split(/\r\n|\r|\n/).length;
+    summary.textContent = `Preview - ${lineCount} line${lineCount === 1 ? '' : 's'}, ${preview.length} chars`;
     const code = document.createElement('pre');
     code.className = className;
     code.textContent = preview;
@@ -2395,6 +2445,34 @@
     card.appendChild(bits.head);
     if (preview) appendPreviewBlock(card, preview, 'artifact-preview');
     return card;
+  };
+
+  const fileChangeStateFromAction = (action = '') => {
+    const text = String(action || '');
+    if (/delete|remove/i.test(text)) return 'deleted';
+    if (/create|new/i.test(text)) return 'new';
+    return 'edited';
+  };
+
+  const renderCompactFileChange = (event, preview = '') => {
+    const row = document.createElement('div');
+    row.className = 'compact-artifact-row';
+    const head = document.createElement('div');
+    head.className = 'compact-artifact-head';
+    head.innerHTML = '<svg class="compact-artifact-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 3v4a1 1 0 0 0 1 1h4"/><path d="M5 3h9l5 5v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/></svg>';
+    const title = document.createElement('span');
+    title.className = 'compact-artifact-title';
+    title.textContent = event.path || 'Updated file';
+    title.title = event.path || 'Updated file';
+    const tag = document.createElement('span');
+    tag.className = 'compact-artifact-tag';
+    tag.textContent = humanize(event.action || 'write_file');
+    head.append(title, tag);
+    row.appendChild(head);
+    if (preview) appendPreviewBlock(row, preview, 'artifact-preview');
+    getWorkBuffer().appendChild(row);
+    scrollFeed();
+    return row;
   };
 
   const makeEl = (tag, className = '', text = '') => {
@@ -2903,6 +2981,7 @@
     lastActiveCard = null; taskWorkers = new Set(); $('feed')?.classList.remove('multi-worker');
     stopReplyStream();
     resetLiveAssistant();
+    if (!keepFeed) resetTaskPanel();
 
     setStatus('ready');
     setMode('auto');
@@ -2927,16 +3006,20 @@
 
   const clearReconnectTimer = () => { if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; } };
 
-  const updateCharCount = () => {
+  function updateCharCount() {
     const count = $('input').value.length;
     $('char-count').textContent = count ? `${count} chars` : '';
     const send = $('send');
     if (send) {
       const hasText = !!$('input').value.trim();
-      send.disabled = !hasText || !!(task && sse);
-      send.classList.toggle('is-empty', !hasText);
+      const running = !!task && !isTerminalStatus(currentStatus);
+      send.disabled = running ? false : !hasText;
+      send.classList.toggle('is-empty', !running && !hasText);
+      send.classList.toggle('is-stop', running);
+      send.setAttribute('aria-label', running ? 'Stop task' : 'Send');
+      send.title = running ? 'Stop task' : 'Send';
     }
-  };
+  }
 
   const autoGrow = () => {
     const box = $('input');
@@ -2952,6 +3035,7 @@
     $('btn-copy-log').classList.remove('hidden');
     $('btn-download-log').classList.remove('hidden');
     $('send').classList.remove('hidden');
+    updateCharCount();
   };
 
   const statusPhase = (message = '') => {
@@ -2993,7 +3077,23 @@
     // glowing "Thinking…" indicator (heartbeats keep it alive). The user message,
     // the final answer, terminal states, and interactive prompts still render.
     if (_MIN_SUPPRESS.has(event.type)) {
-      if (event.type === 'action_start') _turnDidWork = true;
+      if (event.type === 'action_start') {
+        _turnDidWork = true;
+        lastActionId = event.action_id || lastActionId;
+      }
+      if (event.type === 'action_result' && event.ok) {
+        const actionType = String(event.action_type || '');
+        if (_actionTypeLabel(actionType) === 'file' && !/read_file|view_file/i.test(actionType)) {
+          const editedPath = _extractEditedPath(event.args_summary || '', actionType);
+          if (editedPath) noteEditedFile(editedPath, /delete/i.test(actionType) ? 'deleted' : /create/i.test(actionType) ? 'new' : 'edited');
+        }
+      }
+      if (event.type === 'file_change') {
+        const preview = truncate(event.content || '', 1200);
+        const state = fileChangeStateFromAction(event.action);
+        if (event.path) noteEditedFile(event.path, state);
+        renderCompactFileChange(event, preview);
+      }
       // Heartbeats are keep-alives, not progress — don't let them reset the
       // indicator to "Thinking" and clobber an active reassurance message (the
       // rate-limit "retrying…" notice or the stall-watchdog "still working").
@@ -3165,8 +3265,10 @@
     if (event.type === 'file_change') {
       const entry = lastActionId && actionCards[lastActionId] ? actionCards[lastActionId] : null;
       const preview = truncate(event.content || '', 1200);
+      const state = fileChangeStateFromAction(event.action);
+      if (event.path) noteEditedFile(event.path, state);
       if (entry) appendDetailRow(entry, 'File change', event.path || 'Updated file', humanize(event.action || 'write_file'), preview);
-      else renderStandaloneArtifact({ eyebrow: 'File change', title: event.path || 'Updated file', copy: humanize(event.action || 'write_file'), preview });
+      else renderCompactFileChange(event, preview);
       return;
     }
 
@@ -3217,6 +3319,7 @@
 
     if (event.type === 'screenshot') { renderScreenshot(event); return; }
     if (event.type === 'reflection') { renderReflection(event); return; }
+    if (event.type === 'todos') { renderTaskPanel(event.items || []); return; }
 
     if (event.type === 'token_usage' || event.type === 'budget') {
       if (Number.isFinite(event.percent)) setBudget(event.percent);
@@ -3438,6 +3541,7 @@
         // collapsed "Worked for X ›" toggle, leaving just the answer below.
         const _workElapsed = startTime ? (Date.now() - startTime) / 1000 : 0;
         collapseWorkIntoFold(_workElapsed);
+        renderFilesChanged();
         // Show the model's actual final reply as a primary assistant message.
         // Fall back to the generic note only when there's no real answer.
         const reply = cleanFinalReplyText(event.reason);
@@ -3568,9 +3672,8 @@
 
     setTaskTitle(goal, { mode: effectiveMode, model: displayModel, status: 'running' });
     setStatus('running');
-    $('btn-pause').classList.remove('hidden');
-    $('btn-cancel').classList.remove('hidden');
-    $('send').classList.add('hidden');
+    $('btn-pause').classList.add('hidden');
+    $('btn-cancel').classList.add('hidden');
 
     $('btn-retry').classList.add('hidden');
     $('btn-copy-log').classList.add('hidden');
@@ -3688,9 +3791,8 @@
       appendMessage(title, 'user');
       setTaskTitle(title, { mode: effectiveMode, model: displayModel, status: 'running' });
       setStatus('running');
-      $('btn-pause').classList.remove('hidden');
-      $('btn-cancel').classList.remove('hidden');
-      $('send').classList.add('hidden');
+      $('btn-pause').classList.add('hidden');
+      $('btn-cancel').classList.add('hidden');
 
       activeHistoryItem = addActiveHistoryItem(title);
       startTime = Date.now();
@@ -4291,6 +4393,7 @@
   /* ---------------- init ---------------- */
   const init = async () => {
     applyTweaks();
+    setSidebarCollapsed(storedSidebarCollapsed(), { persist: false });
     buildTweaks();
     syncTweaks();
     bindExamples();
@@ -4850,7 +4953,14 @@
   window.addEventListener('resize', () => { if (folderMenuOpen) positionFolderMenu(); });
 
   /* ---------------- event wiring ---------------- */
-  $('send').onclick = start;
+  const composerPrimaryAction = () => {
+    if (task && !isTerminalStatus(currentStatus)) {
+      cancelTask();
+      return;
+    }
+    start();
+  };
+  $('send').onclick = composerPrimaryAction;
   $('btn-cancel').onclick = () => { stopEverything(); cancelTask(); };
   $('btn-pause').onclick = togglePause;
   $('btn-retry').onclick = retryTask;
@@ -4858,6 +4968,9 @@
   $('btn-copy-log').onclick = copyCurrentLog;
   $('btn-download-log').onclick = downloadCurrentLog;
   $('new-session-btn').onclick = newSession;
+  $('sidebar-collapse-toggle')?.addEventListener('click', () => {
+    setSidebarCollapsed(!document.body.classList.contains('sidebar-collapsed'));
+  });
   // Platform-aware shortcut label: the handler accepts Ctrl and Cmd alike, but
   // showing ⌘ on Windows reads as broken. HTML defaults to Ctrl+N (Windows-first).
   if (/Mac|iP(hone|ad|od)/.test(navigator.platform || '')) {
@@ -4900,7 +5013,11 @@
 
   $('input').addEventListener('input', () => { autoGrow(); updateCharCount(); });
   $('input').addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); start(); }
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault();
+      if (task && !isTerminalStatus(currentStatus)) return;
+      start();
+    }
   });
 
   window.addEventListener('keydown', (event) => {
@@ -4995,8 +5112,7 @@
     }));
     cmds.push(
       { group: 'Task', label: 'Start task', hint: 'Ctrl+Enter', action: () => { const b = $('send'); if (b) b.click(); } },
-      { group: 'Task', label: 'Pause / resume', hint: '', action: () => { const b = $('btn-pause'); if (b) b.click(); } },
-      { group: 'Task', label: 'Cancel task', hint: 'esc', action: () => { const b = $('btn-cancel'); if (b) b.click(); } },
+      { group: 'Task', label: 'Stop task', hint: 'esc', action: () => { const b = $('send'); if (b && b.classList.contains('is-stop')) b.click(); } },
       { group: 'Project Folder', label: 'Choose project folder', hint: projectFolderState.selectedPath || 'Workspace', action: () => openFolderMenu() },
       { group: 'Project Folder', label: 'Clear project folder', hint: 'Dynamic access', action: () => { setProjectFolder('', { persist: true }); toast('Project folder cleared.', 'info', 1800); } },
       { group: 'View', label: 'Focus prompt', hint: 'Ctrl L', action: () => { const el = $('input'); if (el) el.focus(); } },

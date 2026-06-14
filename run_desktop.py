@@ -1,4 +1,5 @@
 import argparse
+import subprocess
 import threading
 import uvicorn
 import time
@@ -76,12 +77,50 @@ def _start_backend(preferred_port: int) -> int:
     sys.exit(1)
 
 
+def _start_textbox_overlay(port: int) -> subprocess.Popen | None:
+    cmd = [
+        sys.executable,
+        "-m",
+        "app.widget.textbox_overlay",
+        "--port",
+        str(port),
+    ]
+    creationflags = 0
+    if os.name == "nt":
+        creationflags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+    try:
+        return subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(__file__) or None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=creationflags,
+        )
+    except Exception as exc:
+        print(f"[Desktop] Textbox overlay failed to start: {exc}", file=sys.stderr)
+        return None
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Launch Orynn desktop shell.")
     parser.add_argument(
         "--dashboard",
         action="store_true",
-        help="Launch the full dashboard instead of the compact always-on-top sidekick.",
+        help="Launch the full dashboard. This is now the default.",
+    )
+    parser.add_argument(
+        "--capsule",
+        action="store_true",
+        help="Launch the legacy compact Qt capsule instead of the dashboard.",
+    )
+    parser.add_argument(
+        "--no-overlay",
+        action="store_true",
+        help="Do not start the mouse-following status textbox.",
     )
     return parser.parse_args()
 
@@ -92,8 +131,9 @@ if __name__ == "__main__":
     #    running (e.g. the capsule launched us to open a second native window).
     port = _start_backend(PORT)
 
-    if not args.dashboard:
-        # Floating Sidekick capsule
+    if args.capsule:
+        # Legacy floating Sidekick capsule. Kept as an explicit fallback while
+        # the default product shape is dashboard + mouse textbox.
         # Rendered by the Qt/QtWebEngine shell: a frameless, translucent,
         # always-on-top window with real per-pixel transparency + Windows
         # Acrylic, so the glass capsule genuinely blurs the desktop behind
@@ -101,6 +141,9 @@ if __name__ == "__main__":
         from app.widget.qt_shell import main as qt_widget_main
         print("[Desktop] Orynn Sidekick (Qt shell) is launching...")
         sys.exit(qt_widget_main(port))
+
+    if not args.no_overlay:
+        _start_textbox_overlay(port)
 
     # Full dashboard (pywebview)
     try:

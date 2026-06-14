@@ -5,6 +5,7 @@ import time
 import subprocess
 import os
 import base64
+import copy
 import io
 import shutil
 import re
@@ -30,10 +31,57 @@ try:
 except ImportError:
     win32gui = win32api = win32con = win32process = None  # type: ignore
 import ctypes
+from ctypes import wintypes
 import time
 import logging
 
 _log = logging.getLogger(__name__)
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ADAPTIVE_OBSERVE_CACHE_TTL_S = 4.0
+_UIA_FIND_CACHE_TTL_S = 2.0
+
+
+def _basename_lower(path: str) -> str:
+    return os.path.basename(str(path or "").strip().strip('"')).lower()
+
+
+def _process_exe_for_pid(pid: Optional[int]) -> str:
+    if not pid:
+        return ""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return ""
+        try:
+            ebuf = ctypes.create_unicode_buffer(1024)
+            size = wintypes.DWORD(1024)
+            if kernel32.QueryFullProcessImageNameW(handle, 0, ebuf, ctypes.byref(size)):
+                return ebuf.value
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return ""
+    return ""
+
+
+def _rect_overlap_ratio(base: dict[str, Any], other: dict[str, Any]) -> float:
+    try:
+        left = max(int(base.get("left") or 0), int(other.get("left") or 0))
+        top = max(int(base.get("top") or 0), int(other.get("top") or 0))
+        right = min(
+            int(base.get("left") or 0) + int(base.get("width") or 0),
+            int(other.get("left") or 0) + int(other.get("width") or 0),
+        )
+        bottom = min(
+            int(base.get("top") or 0) + int(base.get("height") or 0),
+            int(other.get("top") or 0) + int(other.get("height") or 0),
+        )
+        overlap = max(0, right - left) * max(0, bottom - top)
+        area = max(1, int(base.get("width") or 0) * int(base.get("height") or 0))
+        return overlap / area
+    except Exception:
+        return 0.0
 
 # Pre-click pointer overlay — off by default. Set ORYNN_POINTER_OVERLAY=1
 # to make desktop clicks "watchable": a ring flashes at the target before the
@@ -404,6 +452,8 @@ class ToolExecutor:
         self._isolated_app = None
         self._started_pids: set[int] = set()
         self._plugin_session_id = f"tools-{id(self)}"
+        self._adaptive_observe_cache: dict[str, dict[str, Any]] = {}
+        self._uia_find_cache: dict[str, dict[str, Any]] = {}
 
     @property
     def allowed_roots(self) -> tuple[Path, ...]:
@@ -444,21 +494,62 @@ class ToolExecutor:
         return self._isolated_hwnd
 
     def _get_hwnd_for_title(self, title: str):
-        """Find a window by title within the same process context if possible."""
+        """Find a window by title, app name, or executable hint."""
         if win32gui is None:
             return None
-        if not title: return None
-        def callback(hwnd, windows):
-            if win32gui.IsWindowVisible(hwnd) and title.lower() in win32gui.GetWindowText(hwnd).lower():
-                windows.append(hwnd)
-        windows = []
-        win32gui.EnumWindows(callback, windows)
-        return windows[0] if windows else None
+        if not title:
+            return None
+        matches = self._iter_matching_windows(title)
+        return int(matches[0]["hwnd"]) if matches else None
+
+    @staticmethod
+    def _window_match_score(window: dict[str, Any], app_hint: str) -> int:
+        raw_hint = str(app_hint or "").strip().strip('"')
+        if not raw_hint:
+            return 0
+        raw_base = re.split(r"[\\/]", raw_hint)[-1]
+        raw_stem = raw_base[:-4] if raw_base.lower().endswith(".exe") else os.path.splitext(raw_base)[0]
+        exe_hint = raw_base.lower().endswith(".exe")
+        document_hint = bool(os.path.splitext(raw_base)[1]) and not exe_hint
+        parts: list[str] = []
+        for value in (raw_hint.lower(), raw_base.lower(), raw_stem.lower()):
+            value = value.strip()
+            if value and value not in parts:
+                parts.append(value)
+
+        title = str(window.get("title") or "").strip().lower()
+        title_cmp = title.lstrip("* \t")
+        exe = str(window.get("exe") or "").strip().lower()
+        exe_base = _basename_lower(exe)
+        exe_stem = exe_base[:-4] if exe_base.endswith(".exe") else os.path.splitext(exe_base)[0]
+        score = 0
+        for part in parts:
+            if title:
+                if title == part or title_cmp == part:
+                    score = max(score, 100)
+                elif title.startswith(part) or title_cmp.startswith(part):
+                    score = max(score, 75)
+                elif part in title or part in title_cmp:
+                    score = max(score, 45)
+            if document_hint:
+                continue
+            if exe and exe == part:
+                score = max(score, 100)
+            if exe_base and exe_base == part:
+                score = max(score, 95)
+            if exe_stem:
+                if exe_stem == part:
+                    score = max(score, 90)
+                elif len(part) >= 4 and part in exe_stem:
+                    score = max(score, 60)
+                elif len(exe_stem) >= 4 and exe_stem in part:
+                    score = max(score, 55)
+        return score
 
     def _iter_matching_windows(self, title_substr: str) -> list[dict[str, Any]]:
         if win32gui is None:
             return []
-        needle = (title_substr or "").strip().lower()
+        hint = (title_substr or "").strip()
         matches: list[dict[str, Any]] = []
 
         def _callback(hwnd, windows):
@@ -466,8 +557,6 @@ class ToolExecutor:
                 if not win32gui.IsWindowVisible(hwnd):
                     return
                 title = win32gui.GetWindowText(hwnd) or ""
-                if needle and needle not in title.lower():
-                    return
                 left, top, right, bottom = win32gui.GetWindowRect(hwnd)
                 width = max(0, right - left)
                 height = max(0, bottom - top)
@@ -479,18 +568,24 @@ class ToolExecutor:
                         _, pid = win32process.GetWindowThreadProcessId(hwnd)
                     except Exception:
                         pid = None
+                exe = _process_exe_for_pid(pid)
+                score = self._window_match_score({"title": title, "exe": exe}, hint)
+                if score <= 0:
+                    return
                 windows.append({
                     "hwnd": hwnd,
                     "title": title,
+                    "exe": exe,
                     "pid": pid,
                     "rect": (left, top, right, bottom),
                     "area": width * height,
+                    "score": score,
                 })
             except Exception:
                 return
 
         win32gui.EnumWindows(_callback, matches)
-        matches.sort(key=lambda item: item["area"], reverse=True)
+        matches.sort(key=lambda item: (item["score"], item["area"]), reverse=True)
         return matches
 
     def _remember_started_pid(self, pid: Optional[int]) -> None:
@@ -499,6 +594,137 @@ class ToolExecutor:
                 self._started_pids.add(int(pid))
         except Exception:
             return
+
+    def _adaptive_observe_cache_key(self, app: str, cap: int) -> str:
+        return self._window_scoped_cache_key({"app": str(app or "").strip().casefold(), "cap": int(cap or 0)})
+
+    def _uia_find_cache_key(self, query: str, app: str, limit: int) -> str:
+        return self._window_scoped_cache_key(
+            {
+                "tool": "uia_find",
+                "query": str(query or "").strip().casefold(),
+                "app": str(app or "").strip().casefold(),
+                "limit": int(limit or 0),
+            }
+        )
+
+    def _window_scoped_cache_key(self, payload: dict[str, Any]) -> str:
+        fg_hwnd = 0
+        try:
+            if win32gui is not None:
+                fg_hwnd = int(win32gui.GetForegroundWindow() or 0)
+        except Exception:
+            fg_hwnd = 0
+        isolated = 0
+        try:
+            isolated = int(self.resolve_isolated_hwnd() or 0)
+        except Exception:
+            isolated = 0
+        scoped = dict(payload)
+        scoped["foreground_hwnd"] = fg_hwnd
+        scoped["isolated_hwnd"] = isolated
+        return json.dumps(
+            scoped,
+            sort_keys=True,
+        )
+
+    def _cached_adaptive_observe(self, key: str) -> Optional[ToolResult]:
+        cached = self._adaptive_observe_cache.get(key)
+        if not cached:
+            return None
+        now = time.time()
+        if now >= float(cached.get("expires_at") or 0):
+            self._adaptive_observe_cache.pop(key, None)
+            return None
+        data = copy.deepcopy(cached.get("data") or {})
+        data["cache"] = {
+            "hit": True,
+            "age_s": round(now - float(cached.get("created_at") or now), 3),
+            "ttl_s": _ADAPTIVE_OBSERVE_CACHE_TTL_S,
+        }
+        output = str(cached.get("output") or "")
+        return ToolResult(ok=True, output=output + "\nAdaptive observe cache hit.", data=data)
+
+    def _remember_adaptive_observe(self, key: str, result: ToolResult) -> None:
+        if not result.ok or not isinstance(result.data, dict):
+            return
+        now = time.time()
+        self._adaptive_observe_cache[key] = {
+            "created_at": now,
+            "expires_at": now + _ADAPTIVE_OBSERVE_CACHE_TTL_S,
+            "output": result.output,
+            "data": copy.deepcopy(result.data),
+        }
+
+    def _cached_uia_find(self, key: str) -> Optional[ToolResult]:
+        cached = self._uia_find_cache.get(key)
+        if not cached:
+            return None
+        now = time.time()
+        if now >= float(cached.get("expires_at") or 0):
+            self._uia_find_cache.pop(key, None)
+            return None
+        data = copy.deepcopy(cached.get("data") or {})
+        data["cache"] = {
+            "hit": True,
+            "age_s": round(now - float(cached.get("created_at") or now), 3),
+            "ttl_s": _UIA_FIND_CACHE_TTL_S,
+        }
+        return ToolResult(
+            ok=True,
+            output=str(cached.get("output") or "") + "\nUIA find cache hit.",
+            data=data,
+        )
+
+    def _remember_uia_find(self, key: str, result: ToolResult) -> None:
+        if not result.ok or not isinstance(result.data, dict):
+            return
+        now = time.time()
+        self._uia_find_cache[key] = {
+            "created_at": now,
+            "expires_at": now + _UIA_FIND_CACHE_TTL_S,
+            "output": result.output,
+            "data": copy.deepcopy(result.data),
+        }
+
+    def _clear_uia_find_cache(self) -> None:
+        self._uia_find_cache.clear()
+
+    def _activate_hwnd(self, hwnd: int) -> tuple[bool, str]:
+        """Best-effort foreground activation for real screen/OCR paths."""
+        if win32gui is None:
+            return False, ""
+        try:
+            actual_title = win32gui.GetWindowText(hwnd) or ""
+        except Exception:
+            actual_title = ""
+        try:
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+        except Exception:
+            pass
+        try:
+            import win32com.client  # type: ignore
+            if actual_title:
+                shell = win32com.client.Dispatch("WScript.Shell")
+                shell.AppActivate(actual_title)
+        except Exception:
+            pass
+        time.sleep(0.2)
+        try:
+            win32gui.BringWindowToTop(hwnd)
+        except Exception:
+            pass
+        foregrounded = False
+        try:
+            win32gui.SetForegroundWindow(hwnd)
+            foregrounded = True
+        except Exception:
+            try:
+                foregrounded = (win32gui.GetForegroundWindow() == hwnd)
+            except Exception:
+                foregrounded = False
+        return foregrounded, actual_title
 
     def _looks_like_gui_launch(self, command: str) -> bool:
         stripped = (command or "").strip().lower()
@@ -1116,61 +1342,21 @@ class ToolExecutor:
         return ""
 
     def focus_window(self, title: str) -> ToolResult:
-        """Bring the first visible window whose title contains `title` to the foreground."""
+        """Bring the first visible window matching a title/app/exe hint to the foreground."""
         try:
-            import win32gui, win32com.client  # type: ignore
-            found: list = []
-
-            def _enum(hwnd, _):
-                if win32gui.IsWindowVisible(hwnd) and title.lower() in win32gui.GetWindowText(hwnd).lower():
-                    found.append(hwnd)
-
-            win32gui.EnumWindows(_enum, None)
-            if not found:
-                return ToolResult(ok=False, output=f"No window with title containing '{title}' found.")
-            hwnd = found[0]
-            actual_title = win32gui.GetWindowText(hwnd)
-            import time
-            # Windows blocks SetForegroundWindow under foreground-lock and raises
-            # pywintypes.error(0, 'SetForegroundWindow'). That is NOT a real
+            if win32gui is None:
+                return ToolResult(ok=False, output="focus_window is only available on Windows.")
+            matches = self._iter_matching_windows(title)
+            if not matches:
+                return ToolResult(ok=False, output=f"No window matching '{title}' found.")
+            match = matches[0]
+            hwnd = int(match["hwnd"])
+            foregrounded, actual_title = self._activate_hwnd(hwnd)
+            actual_title = actual_title or match.get("title") or title
+            # SetForegroundWindow may report a foreground-lock
             # failure — the window is usually activated anyway, and our UIA tools
-            # target by window title regardless of foreground. So try several
-            # activation methods best-effort and only hard-fail if NONE plausibly
-            # worked. (Restoring a minimized window + AppActivate is what actually
-            # clears the lock in practice.)
-            try:
-                if win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
-            except Exception:
-                pass
-            try:
-                shell = win32com.client.Dispatch("WScript.Shell")
-                shell.AppActivate(actual_title)  # bypasses foreground-lock
-            except Exception:
-                pass
-            time.sleep(0.2)
-            try:
-                win32gui.BringWindowToTop(hwnd)
-            except Exception:
-                pass
-            foregrounded = False
-            try:
-                win32gui.SetForegroundWindow(hwnd)
-                foregrounded = True
-            except Exception:
-                # Verify whether it ended up foreground anyway (AppActivate often
-                # succeeds even when SetForegroundWindow is refused).
-                try:
-                    foregrounded = (win32gui.GetForegroundWindow() == hwnd)
-                except Exception:
-                    foregrounded = False
             self.set_isolated_hwnd(hwnd, actual_title)
-            if win32process is not None:
-                try:
-                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
-                    self._remember_started_pid(pid)
-                except Exception:
-                    pass
+            self._remember_started_pid(match.get("pid"))
             note = "" if foregrounded else " (activated; OS held foreground — UIA still targets it by title)"
             return ToolResult(ok=True, output=(
                 f"Focused window: '{actual_title}'{note}"
@@ -1191,14 +1377,16 @@ class ToolExecutor:
             if matches:
                 match = matches[0]
                 hwnd = int(match["hwnd"])
-                actual_title = match["title"] or needle
+                foregrounded, activated_title = self._activate_hwnd(hwnd)
+                actual_title = activated_title or match["title"] or needle
                 pid = match.get("pid")
                 self.set_isolated_hwnd(hwnd, actual_title)
                 self._remember_started_pid(pid)
                 time.sleep(max(0.0, float(paint_seconds)))
+                note = "" if foregrounded else " (matched; OS held foreground)"
                 return ToolResult(
                     ok=True,
-                    output=(f"Window ready: '{actual_title}' (pid {pid or '?'})"
+                    output=(f"Window ready: '{actual_title}' (pid {pid or '?'}){note}"
                             + self._control_menu_suffix(actual_title)),
                     data={"hwnd": hwnd, "pid": pid, "title": actual_title},
                 )
@@ -2543,9 +2731,60 @@ class ToolExecutor:
             pass
         return None
 
+    def _adaptive_recovery_suffix(
+        self,
+        *,
+        action_type: str,
+        query: str,
+        app: str,
+        data: dict,
+        output: str,
+    ) -> str:
+        try:
+            from .adaptive_windows import analyze_windows_failure, format_recovery_plan
+            analysis = analyze_windows_failure(
+                action=action_type,
+                query=query,
+                app=app,
+                result=data,
+                output=output,
+            )
+            data["adaptive"] = analysis.to_dict()
+            return "\n" + format_recovery_plan(analysis)
+        except Exception:
+            return ""
+
+    def _remember_adaptive_success(
+        self,
+        app: str,
+        *,
+        failure_class: str,
+        resolver_id: str,
+        detail: str = "",
+    ) -> None:
+        try:
+            from .adaptive_windows import remember_resolver_outcome
+            remember_resolver_outcome(
+                app,
+                failure_class,
+                resolver_id,
+                True,
+                detail=detail,
+            )
+        except Exception:
+            pass
+
     def uia_find(self, query: str, app: str = "", limit: int = 5):
         from .widget.desktop_features import find_ui_elements
-        res = find_ui_elements(query, app, limit)
+        try:
+            limit_i = max(1, int(limit or 5))
+        except Exception:
+            limit_i = 5
+        cache_key = self._uia_find_cache_key(query, app, limit_i)
+        cached = self._cached_uia_find(cache_key)
+        if cached is not None:
+            return cached
+        res = find_ui_elements(query, app, limit_i)
         if not res.get("ok"):
             # OCR fallback: the control isn't in the accessibility tree, but is
             # its TEXT visible on screen? Report its pixel location + layer.
@@ -2567,7 +2806,15 @@ class ToolExecutor:
                 control_reason="no accessible control and OCR found no match",
             )
             suffix = self._electron_unlock_hint(app, data)
-            return ToolResult(ok=False, output=res.get("error", "no match") + suffix, data=data)
+            output = res.get("error", "no match") + suffix
+            output += self._adaptive_recovery_suffix(
+                action_type="uia_find",
+                query=query,
+                app=app,
+                data=data,
+                output=output,
+            )
+            return ToolResult(ok=False, output=output, data=data)
         lines = [f"{i+1}. {c.get('name') or c.get('automation_id') or '(unnamed)'} "
                  f"[{c.get('control_type')}] @ ({c['x']},{c['y']}) score={c.get('score')}"
                  for i, c in enumerate(res.get("items", []))]
@@ -2595,7 +2842,195 @@ class ToolExecutor:
             rect=rect,
             app_rect=app_rect,
         )
-        return ToolResult(ok=True, output="UIA matches:\n" + "\n".join(lines) + tok + self._app_rect_token(app, app_rect), data=data)
+        result = ToolResult(
+            ok=True,
+            output="UIA matches:\n" + "\n".join(lines) + tok + self._app_rect_token(app, app_rect),
+            data=data,
+        )
+        self._remember_uia_find(cache_key, result)
+        return result
+
+    def adaptive_observe(self, app: str = "", cap: int = 90):
+        try:
+            from .adaptive_windows import (
+                analyze_windows_failure,
+                build_affordance_graph,
+                classify_surface_runtime,
+                format_affordance_graph,
+                format_recovery_plan,
+                format_runtime_plan,
+                meaningful_runtime_control_count,
+            )
+            from .widget.desktop_features import (
+                app_content_rect,
+                electron_hint_for_app,
+                foreground_window_info,
+                ocr_available,
+                survey_app_controls,
+                win_ocr_words,
+            )
+        except Exception as exc:
+            return ToolResult(ok=False, output=f"adaptive_observe unavailable: {exc}")
+
+        app_hint = (app or self._isolated_app or "").strip()
+        try:
+            cap_i = max(20, min(240, int(cap or 90)))
+        except Exception:
+            cap_i = 90
+        cache_key = self._adaptive_observe_cache_key(app_hint, cap_i)
+        cached = self._cached_adaptive_observe(cache_key)
+        if cached is not None:
+            return cached
+
+        def _survey_once(fallback_foreground: bool = False) -> Dict[str, Any]:
+            try:
+                return survey_app_controls(
+                    app_hint,
+                    cap=cap_i,
+                    max_names=60,
+                    fallback_foreground=fallback_foreground,
+                )
+            except Exception as exc:
+                return {"count": 0, "controls": [], "error": str(exc)}
+
+        survey = _survey_once(fallback_foreground=not bool(app_hint))
+        recovery_attempts: list[dict[str, Any]] = []
+        recovered_by = ""
+        if app_hint and not (survey.get("controls") or []):
+            wait_result = self.wait_for_window(app_hint, timeout=1.6, paint_seconds=0.25)
+            recovery_attempts.append({
+                "step": "wait_for_window",
+                "ok": bool(wait_result.ok),
+            })
+            if wait_result.ok:
+                focus_result = self.focus_window(app_hint)
+                recovery_attempts.append({
+                    "step": "focus_window",
+                    "ok": bool(focus_result.ok),
+                })
+                time.sleep(0.2)
+                retry = _survey_once(fallback_foreground=False)
+                retry_controls = retry.get("controls") or []
+                recovery_attempts.append({
+                    "step": "resurvey_after_focus",
+                    "ok": bool(retry_controls),
+                    "count": int(retry.get("count") or 0),
+                    "named_control_count": len(retry_controls),
+                })
+                if len(retry_controls) > len(survey.get("controls") or []):
+                    survey = retry
+                    recovered_by = "focus_wait_resurvey"
+
+        fg = {}
+        if not app_hint:
+            try:
+                fg = foreground_window_info()
+            except Exception:
+                fg = {}
+        observed_app = app_hint or str(fg.get("title") or "foreground")
+        graph = build_affordance_graph(
+            app=observed_app,
+            controls=survey.get("controls") or [],
+            count=int(survey.get("count") or 0),
+            source="uia",
+        )
+        app_rect = self._app_rect_payload(observed_app)
+        try:
+            electron_hint = electron_hint_for_app(observed_app)
+        except Exception:
+            electron_hint = None
+        try:
+            ocr_ready = bool(ocr_available())
+        except Exception:
+            ocr_ready = False
+        visual_word_count = None
+        meaningful_named = meaningful_runtime_control_count(
+            survey.get("controls") or [],
+            graph["named_control_count"],
+        )
+        if meaningful_named == 0 and app_rect and ocr_ready:
+            try:
+                target_hwnd = None
+                try:
+                    target_hwnd = self.resolve_isolated_hwnd() or self._get_hwnd_for_title(observed_app)
+                    if target_hwnd:
+                        self._activate_hwnd(int(target_hwnd))
+                except Exception:
+                    pass
+                ocr_rect = app_content_rect(observed_app)
+                if not int(ocr_rect.get("width") or 0):
+                    ocr_rect = app_rect
+                ocr_occluded = False
+                try:
+                    fg_info = foreground_window_info()
+                    fg_hwnd = int((fg_info or {}).get("hwnd") or 0)
+                    fg_rect = (fg_info or {}).get("rect") or {}
+                    if target_hwnd and fg_hwnd and fg_hwnd != int(target_hwnd):
+                        ocr_occluded = _rect_overlap_ratio(ocr_rect, fg_rect) >= 0.25
+                except Exception:
+                    ocr_occluded = False
+                if ocr_occluded:
+                    graph["ocr_probe_occluded"] = True
+                    visual_word_count = 0
+                else:
+                    words = win_ocr_words(
+                        int(ocr_rect["left"]),
+                        int(ocr_rect["top"]),
+                        int(ocr_rect["width"]),
+                        int(ocr_rect["height"]),
+                    )
+                    visual_word_count = len(words or [])
+            except Exception:
+                visual_word_count = None
+        runtime_plan = classify_surface_runtime(
+            app=observed_app,
+            graph=graph,
+            app_rect=app_rect,
+            electron_hint=electron_hint,
+            ocr_available=ocr_ready,
+            visual_word_count=visual_word_count,
+        )
+        data = {
+            "ok": True,
+            "graph": graph,
+            "runtime": runtime_plan.to_dict(),
+            "overlay": _overlay_payload(
+                "app_focus" if app_rect else "status",
+                "adaptive_observe",
+                "inspect",
+                f"Mapped {graph['named_control_count']} controls",
+                app_rect=app_rect,
+                phase="done",
+                control_layer="Adaptive UIA map",
+                control_reason="one-pass UIA survey grouped into affordances",
+            ),
+        }
+        if fg:
+            data["foreground"] = fg
+        if recovery_attempts:
+            data["recovery_attempts"] = recovery_attempts
+        if recovered_by:
+            data["recovered_by"] = recovered_by
+        output = format_affordance_graph(graph)
+        output += "\n" + format_runtime_plan(runtime_plan)
+        if recovered_by:
+            output += f"\nRecovered empty UIA map via {recovered_by}."
+        if graph["named_control_count"] == 0:
+            analysis = analyze_windows_failure(
+                action="adaptive_observe",
+                query="",
+                app=observed_app,
+                result={"fallback_reason": "empty_accessibility_tree"},
+                output="The window exposes no interactive controls right now.",
+            )
+            data["adaptive"] = analysis.to_dict()
+            output += "\n" + format_recovery_plan(analysis)
+        result = ToolResult(ok=True, output=output + self._app_rect_token(observed_app, app_rect), data=data)
+        self._remember_adaptive_observe(cache_key, result)
+        resolved_cache_key = self._adaptive_observe_cache_key(observed_app, cap_i)
+        if resolved_cache_key != cache_key:
+            self._remember_adaptive_observe(resolved_cache_key, result)
+        return result
 
     # ── Hybrid resolver fallbacks: UIA -> OCR pixel (local, no model) -> the
     #    agent escalates to the vision model only if both miss. ──────────────
@@ -2623,6 +3058,12 @@ class ToolExecutor:
                 rect={"left": x - 14, "top": y - 12, "width": 28, "height": 24},
                 control_layer="OCR fallback",
                 control_reason="no accessible control — matched on-screen text",
+            )
+            self._remember_adaptive_success(
+                app,
+                failure_class="uia_no_match",
+                resolver_id="ocr_text_target",
+                detail=f"Clicked {matched}",
             )
             return ToolResult(ok=True, data=data, output=(
                 f"Clicked '{matched}' via OCR fallback at ({x},{y}). "
@@ -2669,6 +3110,12 @@ class ToolExecutor:
                 f"Found “{matched}” (OCR)", target=matched, app_rect=app_rect,
                 rect=rect, control_layer="OCR fallback",
                 control_reason="no accessible control — matched on-screen text")
+            self._remember_adaptive_success(
+                app,
+                failure_class="uia_no_match",
+                resolver_id="ocr_text_target",
+                detail=f"Found {matched}",
+            )
             return ToolResult(ok=True, data=data, output=(
                 f"OCR matches (no accessible control):\n1. {matched} [OcrText] "
                 f"@ ({x},{y}) via screen text. [uia:{x-14},{y-12},28,24]"
@@ -2718,6 +3165,12 @@ class ToolExecutor:
                 rect={"left": x - 14, "top": y - 12, "width": 28, "height": 24},
                 control_layer="OCR fallback",
                 control_reason="no accessible field — matched on-screen text",
+            )
+            self._remember_adaptive_success(
+                app,
+                failure_class="uia_no_match",
+                resolver_id="ocr_text_target",
+                detail=f"Typed into {matched}",
             )
             return ToolResult(ok=True, data=data, output=(
                 f"Typed into '{matched}' via OCR fallback at ({x},{y}). "
@@ -2889,6 +3342,109 @@ class ToolExecutor:
                 except Exception:
                     pass
 
+    def _calculator_read_result(self, app: str, read_result: str, expected: str = "",
+                                timeout: float = 0.8) -> str:
+        if not read_result:
+            return ""
+        try:
+            from .widget.desktop_features import find_ui_elements
+        except Exception:
+            return ""
+        deadline = time.time() + max(0.05, float(timeout))
+        last = ""
+        while True:
+            try:
+                rr = find_ui_elements(read_result, app, 1)
+                items = rr.get("items") or []
+                last = (items[0].get("name") or "").strip() if items else ""
+                if last and (not expected or self._calculator_result_matches(last, expected)):
+                    return last
+            except Exception:
+                pass
+            if time.time() >= deadline:
+                return last
+            time.sleep(0.08)
+
+    def _calculator_foreground_verified(self, app: str) -> bool:
+        try:
+            import win32gui
+            fg = win32gui.GetForegroundWindow()
+            fg_title = (win32gui.GetWindowText(fg) or "").lower()
+            needle = (app or "Calculator").lower()
+            return needle in fg_title and not win32gui.IsIconic(fg)
+        except Exception:
+            return False
+
+    def _calculator_keyboard_fast_path(self, targets: list[str], app: str,
+                                       read_result: str = "") -> Optional[ToolResult]:
+        if not read_result or not self._is_calculator_target(app):
+            return None
+        expression = self._calculator_expression_from_targets(targets)
+        expected = self._calculator_expected_result(expression or "")
+        if not expression or not expected:
+            return None
+        try:
+            import pyautogui
+            from .widget.desktop_features import _user_actively_typing, input_polite_enabled
+        except Exception:
+            return None
+        try:
+            if input_polite_enabled() and _user_actively_typing(0.75):
+                return None
+        except Exception:
+            return None
+
+        focused = self.focus_window(app or "Calculator")
+        if not focused.ok or not self._calculator_foreground_verified(app):
+            return None
+        try:
+            pyautogui.press("escape")
+            time.sleep(0.03)
+            pyautogui.write(expression, interval=0.0)
+            self._note_synthetic_input()
+            time.sleep(0.12)
+        except Exception as exc:
+            return ToolResult(ok=False, output=f"Calculator keyboard fast path failed: {exc}")
+
+        result = self._calculator_read_result(app, read_result, expected, timeout=0.8)
+        verified = bool(result and self._calculator_result_matches(result, expected))
+        app_rect = self._app_rect_payload(app)
+        steps = [f"{target}=key" for target in targets]
+        head = f"Clicked {len(targets)}/{len(targets)} in sequence via Calculator keyboard"
+        data = {
+            "ok": verified,
+            "clicked": len(targets),
+            "total": len(targets),
+            "steps": steps,
+            "failed": None if verified else read_result,
+            "fallback": "calculator_keyboard_fast",
+            "expression": expression,
+            "expected": expected,
+        }
+        if result:
+            data["result"] = result
+        data["overlay"] = _overlay_payload(
+            "app_focus" if app_rect else "status",
+            "uia_click_sequence",
+            "click",
+            head,
+            target=(targets[-1] if targets else ""),
+            app_rect=app_rect,
+            phase=("done" if verified else "error"),
+            fallback_reason="calculator_keyboard_fast",
+            control_layer="Calculator keyboard",
+            control_reason=(
+                "Calculator was foreground and user input was idle, so the "
+                "numeric sequence was entered as verified keystrokes"
+            ),
+        )
+        out = head + "\n" + " -> ".join(steps) + self._app_rect_token(app, app_rect)
+        if result:
+            out += f"\nResult - {read_result}: {result}"
+        if not verified:
+            out += f"\nExpected {expected}; keyboard result could not be verified."
+        return ToolResult(ok=verified, output=out, data=data)
+
     def _calculator_sequence_fallback(self, targets: list[str], app: str,
                                       read_result: str = "") -> Optional[ToolResult]:
         if not self._is_calculator_target(app):
@@ -2909,14 +3465,7 @@ class ToolExecutor:
         # minimized — typing would then go into whatever the USER has focused
         # (a real take typed '2847*916=' into a random window and Ctrl+C'd the
         # user's clipboard as the 'result'). Verify before sending anything.
-        try:
-            import win32gui
-            fg = win32gui.GetForegroundWindow()
-            fg_title = (win32gui.GetWindowText(fg) or "").lower()
-            needle = (app or "Calculator").lower()
-            if needle not in fg_title or win32gui.IsIconic(fg):
-                return None
-        except Exception:
+        if not self._calculator_foreground_verified(app):
             return None
         try:
             self._input_politeness_gate()
@@ -2928,7 +3477,10 @@ class ToolExecutor:
         except Exception as exc:
             return ToolResult(ok=False, output=f"Calculator keyboard fallback failed: {exc}")
 
-        result = self._calculator_clipboard_result() if read_result else ""
+        expected = self._calculator_expected_result(expression or "")
+        result = self._calculator_read_result(app, read_result, expected, timeout=0.8)
+        if read_result and expected and not self._calculator_result_matches(result, expected):
+            result = self._calculator_clipboard_result()
         app_rect = self._app_rect_payload(app)
         steps = [f"{target}=key" for target in targets]
         data = {
@@ -2979,6 +3531,10 @@ class ToolExecutor:
         targets = [str(t).strip() for t in (targets or []) if str(t).strip()]
         if not targets:
             return ToolResult(ok=False, output="uia_click_sequence: no targets given.")
+        self._clear_uia_find_cache()
+        calc_fast = self._calculator_keyboard_fast_path(targets, app, read_result)
+        if calc_fast is not None:
+            return calc_fast
         steps, clicked, failed = [], 0, None
         for tgt in targets:
             res = invoke_ui_element(tgt, app)
@@ -3020,6 +3576,13 @@ class ToolExecutor:
             suffix = self._electron_unlock_hint(app, data)
             out += ("\nThe rest were not attempted. Re-check the name of the "
                     "missing control with uia_find, then continue." + suffix)
+            out += self._adaptive_recovery_suffix(
+                action_type="uia_click_sequence",
+                query=str(failed or ""),
+                app=app,
+                data=data,
+                output=out,
+            )
         elif read_result:
             # Read the named result control back in THIS call so the agent can
             # verify + finish without spending a separate uia_find turn.
@@ -3062,6 +3625,7 @@ class ToolExecutor:
 
     def uia_click(self, query: str, app: str = ""):
         from .widget.desktop_features import invoke_ui_element
+        self._clear_uia_find_cache()
         before = self._click_snapshot()
         res = invoke_ui_element(query, app)
         if not res.get("ok"):
@@ -3084,7 +3648,15 @@ class ToolExecutor:
                 control_reason="no accessible control and OCR found no match",
             )
             suffix = self._electron_unlock_hint(app, data)
-            return ToolResult(ok=False, output=res.get("error", "click failed") + suffix, data=data)
+            output = res.get("error", "click failed") + suffix
+            output += self._adaptive_recovery_suffix(
+                action_type="uia_click",
+                query=query,
+                app=app,
+                data=data,
+                output=output,
+            )
+            return ToolResult(ok=False, output=output, data=data)
         app_rect = self._app_rect_payload(app)
         target = str(res.get("target") or query or "").strip()
         tok = self._uia_rect_token(res.get("rect", {})) + self._app_rect_token(app, app_rect)
@@ -3107,6 +3679,7 @@ class ToolExecutor:
 
     def uia_type(self, query: str, text: str, app: str = "", clear_first: bool = False, submit: bool = False):
         from .widget.desktop_features import type_into_ui_element
+        self._clear_uia_find_cache()
         res = type_into_ui_element(query, text, app, clear_first, submit)
         if not res.get("ok"):
             # Auto-fallback: OCR-find the field, click to focus, then paste.
@@ -3128,7 +3701,15 @@ class ToolExecutor:
                 control_reason="no accessible field and OCR found no match",
             )
             suffix = self._electron_unlock_hint(app, data)
-            return ToolResult(ok=False, output=res.get("error", "type failed") + suffix, data=data)
+            output = res.get("error", "type failed") + suffix
+            output += self._adaptive_recovery_suffix(
+                action_type="uia_type",
+                query=query,
+                app=app,
+                data=data,
+                output=output,
+            )
+            return ToolResult(ok=False, output=output, data=data)
         # Post-action verification: read the control back and confirm the text
         # actually landed (computer mastery, not just "fire and hope").
         verified = self._verify_typed(query, app, text)
@@ -3156,16 +3737,45 @@ class ToolExecutor:
         False if a value read-back contradicts it, None if not verifiable."""
         try:
             from .widget.desktop_features import _find_uia_control
-            ctrl, _info = _find_uia_control(query, app)
-            if ctrl is None:
+            needle = str(text or "").strip()
+            if not needle:
                 return None
-            try:
-                val = ctrl.GetValuePattern().Value
-            except Exception:
-                return None
-            if val is None:
-                return None
-            return (text or "").strip() in str(val)
+
+            def _normalize_readback(value: str) -> str:
+                return str(value).replace("\r\n", "\n").replace("\r", "\n")
+
+            needle = _normalize_readback(needle)
+            deadline = time.time() + 1.0
+            saw_readback = False
+            while True:
+                ctrl, _info = _find_uia_control(query, app)
+                values = []
+                if ctrl is not None:
+                    for getter_name, value_attr in (
+                        ("GetValuePattern", "Value"),
+                        ("GetLegacyIAccessiblePattern", "Value"),
+                    ):
+                        try:
+                            pattern = getattr(ctrl, getter_name)()
+                            val = getattr(pattern, value_attr)
+                            if val is not None:
+                                values.append(str(val))
+                        except Exception:
+                            pass
+                    try:
+                        pattern = ctrl.GetTextPattern()
+                        val = pattern.DocumentRange.GetText(-1)
+                        if val is not None:
+                            values.append(str(val))
+                    except Exception:
+                        pass
+                if values:
+                    saw_readback = True
+                    if any(needle in _normalize_readback(val) for val in values):
+                        return True
+                if time.time() >= deadline:
+                    return False if saw_readback else None
+                time.sleep(0.08)
         except Exception:
             return None
 
@@ -3544,6 +4154,7 @@ class ToolExecutor:
             ActionType.analyze_folder: lambda a: self.analyze_folder(a.args.get("path", ""), a.args.get("action", "scan")),
             ActionType.show_widget: lambda a: self.show_widget(a.args),
             ActionType.screen_context: lambda a: self.screen_context(),
+            ActionType.adaptive_observe: lambda a: self.adaptive_observe(a.args.get("app", ""), a.args.get("cap", 90)),
             ActionType.uia_find: lambda a: self.uia_find(a.args["query"], a.args.get("app", ""), a.args.get("limit", 5)),
             ActionType.uia_click: lambda a: self.uia_click(a.args["query"], a.args.get("app", "")),
             ActionType.uia_click_sequence: lambda a: self.uia_click_sequence(a.args.get("targets") or a.args.get("queries") or a.args.get("query"), a.args.get("app", ""), a.args.get("stop_on_error", True), a.args.get("read_result", "")),

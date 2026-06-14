@@ -91,6 +91,7 @@ _DESKTOP_POST_ACTION_TYPES = {
 }
 
 _UIA_ACTION_TYPES = {
+    ActionType.adaptive_observe,
     ActionType.uia_find,
     ActionType.uia_click,
     ActionType.uia_click_sequence,
@@ -215,7 +216,10 @@ _DESKTOP_IRRELEVANT_TOOL_EXCLUDES = {
     ActionType.run_and_watch,
     ActionType.bash,            # redundant with run_command for launching apps
     ActionType.analyze_folder,  # file analysis — not desktop control
-    ActionType.todo_write,      # multi-step todo tracking — noise for app control
+    # todo_write stays available on desktop tasks too — a long/multi-app run
+    # (e.g. "export this CapCut project then upload it") is exactly when the
+    # user wants to see named progress in the side panel. The tool's own
+    # guidance ("3+ distinct steps") keeps it off trivial app control.
 }
 
 
@@ -625,19 +629,55 @@ def _desktop_control_profile(
     except Exception:
         pass
 
-    count = int(profile.get("uia_control_count") or 0)
-    if target and count >= 12:
-        route = "UIA exact"
-    elif target and profile.get("electron_hint"):
-        route = "Electron unlock"
-    elif not target:
-        route = "UIA exact"
-    elif profile.get("ocr_available"):
-        route = "OCR fallback"
-    elif model_sees:
-        route = "Screenshot fallback"
-    else:
-        route = "UIA degraded"
+    try:
+        from .adaptive_windows import (
+            SurfaceRuntime,
+            build_affordance_graph,
+            classify_surface_runtime,
+        )
+        foreground = profile.get("foreground_window") if isinstance(profile.get("foreground_window"), dict) else {}
+        runtime_app = target or str(foreground.get("title") or "foreground")
+        graph = build_affordance_graph(
+            app=runtime_app,
+            count=int(profile.get("uia_control_count") or 0),
+            controls=profile.get("controls") or [],
+            source="uia",
+        )
+        runtime_plan = classify_surface_runtime(
+            app=runtime_app,
+            graph=graph,
+            app_rect=profile.get("app_rect") or None,
+            electron_hint=profile.get("electron_hint"),
+            ocr_available=bool(profile.get("ocr_available")),
+            model_vision=bool(model_sees),
+        )
+        profile["runtime"] = runtime_plan.to_dict()
+        if runtime_plan.runtime in {SurfaceRuntime.uia_rich, SurfaceRuntime.uia_sparse}:
+            route = "UIA exact"
+        elif runtime_plan.runtime == SurfaceRuntime.electron_locked:
+            route = "Electron unlock"
+        elif runtime_plan.runtime == SurfaceRuntime.visual_text:
+            route = "OCR fallback"
+        elif runtime_plan.runtime == SurfaceRuntime.window_missing:
+            route = "Window resolution"
+        elif runtime_plan.runtime == SurfaceRuntime.custom_rendered and model_sees:
+            route = "Screenshot fallback"
+        else:
+            route = "UIA degraded"
+    except Exception:
+        count = int(profile.get("uia_control_count") or 0)
+        if target and count >= 12:
+            route = "UIA exact"
+        elif target and profile.get("electron_hint"):
+            route = "Electron unlock"
+        elif not target:
+            route = "UIA exact"
+        elif profile.get("ocr_available"):
+            route = "OCR fallback"
+        elif model_sees:
+            route = "Screenshot fallback"
+        else:
+            route = "UIA degraded"
     profile["primary_route"] = route
     return profile
 
@@ -662,6 +702,12 @@ def _desktop_control_profile_text(profile: Dict[str, Any]) -> str:
         f"- OCR fallback: {ocr}",
         f"- Screenshot/vision fallback: {vision}",
     ]
+    runtime = profile.get("runtime") if isinstance(profile.get("runtime"), dict) else {}
+    if runtime.get("runtime"):
+        lines.append(
+            f"- Surface runtime: {runtime.get('runtime')} "
+            f"({runtime.get('primary_layer', 'unknown')})"
+        )
     if foreground_title and not profile.get("target_app"):
         if foreground_exe:
             lines.append(f"- Foreground window: {foreground_title} ({foreground_exe})")
@@ -2014,7 +2060,8 @@ class AgentService:
                         "Windows UI Automation (UIA) by control NAME — never by pixels, screenshots, or "
                         "guessed names.\n\n"
                         "CORE KIT (covers almost every desktop task — prefer these):\n"
-                        "run_command \"start <app>\" → open app · uia_wait → wait for a control · "
+                        "run_command \"start <app>\" → open app · adaptive_observe → map unfamiliar controls · "
+                        "uia_wait → wait for a control · "
                         "focus_window → bring forward · uia_find → locate/read a control · uia_click → "
                         "press one button · uia_click_sequence → many buttons in ONE call (+read_result "
                         "reads the answer back) · uia_type → enter text · keyboard_type / key_combo → "
@@ -2053,6 +2100,8 @@ class AgentService:
                         "- Every clause verified → finish stating the observed value (\"Display showed "
                         "4183\"), never a vague 'done'.\n\n"
                         "WHEN A CALL FAILS:\n"
+                        "- If the observation includes \"Adaptive recovery plan\", follow its first "
+                        "untried resolver before inventing another target name.\n"
                         "- Same target failed twice → STOP retrying it. Pick a different name from the "
                         "controls list, or switch to the keyboard path.\n"
                         "- Three different approaches failed → finish honestly: what you tried, what the "
@@ -2095,6 +2144,8 @@ class AgentService:
                         "DECISION TABLE:\n"
                         "- App not open → <action type=\"run_command\">{\"command\": \"start calc\"}</action> "
                         "(the result includes the window's control menu).\n"
+                        "- Unfamiliar/complex app → <action type=\"adaptive_observe\">{\"app\": \"AppName\"}</action> "
+                        "to map controls before guessing.\n"
                         "- Window result lists \"Visible controls: ...\" → those are the ONLY valid names; "
                         "copy them EXACTLY. A uia_find miss lists the controls that DO exist — pick from "
                         "that list, NEVER re-guess.\n"
@@ -2108,7 +2159,8 @@ class AgentService:
                         "yourself in the shell is a FAILURE even if correct.\n"
                         "- Always pass the app window title.\n\n"
                         "WHEN A CALL FAILS: same target failed twice → stop retrying it; pick a different "
-                        "listed name or the keyboard path. Three approaches failed → finish honestly with "
+                        "listed name or the keyboard path. If the observation includes \"Adaptive recovery "
+                        "plan\", follow its first untried resolver. Three approaches failed → finish honestly with "
                         "what you tried and what the app shows. Electron apps (Discord/Slack/VS Code) that "
                         "return no controls: only when the result says the DOM is locked → electron_unlock "
                         "with the app name, wait, retry.\n\n"
@@ -2960,6 +3012,13 @@ class AgentService:
                                     "commit_hash": _commit_hash,
                                     "message": f"[ai-computer] {action_type}: {os.path.basename(_fpath)}",
                                 })
+
+                    # ── Task panel: surface the model's named task list to the
+                    # UI side dock so the user sees long-run progress live. The
+                    # model drives this by calling todo_write; we just forward
+                    # the structured list.
+                    if action_type == "todo_write" and isinstance(res.data, dict) and res.data.get("todos") is not None:
+                        await self._emit(task_id, "todos", {"items": res.data.get("todos") or []})
 
                     # ── Auto-screenshot after computer actions so model sees result ──
                     post_action_note = ""

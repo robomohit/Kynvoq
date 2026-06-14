@@ -1,5 +1,9 @@
 # Orynn Design System Spec (Stitch-Ready)
 
+Implementation note: this file is a broad visual direction. For the real
+dashboard/capsule integration map, event contracts, and redesign acceptance
+checklist, use `docs/FRONTEND_REDESIGN_BRIDGE.md`.
+
 This document specifies the design system for **Orynn**, an autonomous agentic workspace. The aesthetic is inspired by the "Claude Desktop" and "Cursor" design language: clean, minimalist, high-fidelity, and focused on clarity and speed.
 
 ## 1. Brand Identity

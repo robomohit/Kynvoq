@@ -108,6 +108,7 @@ class ActionType(str, Enum):
     uia_click_sequence = "uia_click_sequence"
     uia_type = "uia_type"
     uia_wait = "uia_wait"
+    adaptive_observe = "adaptive_observe"
     electron_check = "electron_check"
     electron_unlock = "electron_unlock"
 

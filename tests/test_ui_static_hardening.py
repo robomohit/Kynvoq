@@ -124,7 +124,7 @@ def test_worked_for_capstone_when_minimal_stream_suppresses_work():
 
     # Work is tracked on action_start (the suppressed event) and reset per turn.
     assert "_turnDidWork = false" in js, "_turnDidWork not declared/reset"
-    assert "event.type === 'action_start') _turnDidWork = true" in js, \
+    assert "event.type === 'action_start'" in js and "_turnDidWork = true;" in js, \
         "_turnDidWork not set when a suppressed action_start fires"
     # collapseWorkIntoFold emits the capstone only when work happened (gated, not for chat).
     assert "work-capstone" in js, "work-capstone not emitted from JS"
@@ -916,7 +916,7 @@ def test_codex_contextual_hero_and_folder_tree():
     # contextual hero
     assert "renderWelcomeHero" in js, "contextual hero helper missing"
     assert "What should we build in ${pathLeaf(folder)}?" in js, "project-named hero missing"
-    assert "'What can I help you with?'" in js, "generic hero fallback missing"
+    assert "'What should I take care of?'" in js, "generic hero fallback missing"
 
     # folder-tree sidebar
     assert "history-group-lead" in js, "group lead wrapper missing"
@@ -936,13 +936,89 @@ def test_codex_files_changed_capstone():
     assert "noteEditedFile" in js and "_extractEditedPath" in js, "capture helpers missing"
     assert "!/read_file|view_file/i.test(_t)" in js, "reads must be excluded from changed files"
     assert "renderFilesChanged" in js, "capstone renderer missing"
+    assert "renderFilesChanged();" in js, "done path must render file capstone"
     assert "editedFiles.clear();" in js, "edited files not cleared between tasks"
     assert "files changed" in js, "capstone label missing"
+    assert "event.type === 'file_change'" in js and "renderCompactFileChange(event, preview)" in js
 
     # styling: monospace path rows + state tags
     assert ".files-changed-head" in css, "capstone header CSS missing"
     assert ".fc-path {" in css, "file path row CSS missing"
     assert ".fc-row.fc-new .fc-tag" in css and ".fc-row.fc-deleted .fc-tag" in css, "state tag CSS missing"
+
+
+def test_workbench_v2_sidebar_and_artifacts_stay_compact():
+    html = STATIC_HTML.read_text(encoding="utf-8")
+    js = (_STATIC / "app.js").read_text(encoding="utf-8", errors="replace")
+    css = (_STATIC / "workbench-v2.css").read_text(encoding="utf-8")
+
+    assert 'id="sidebar-collapse-toggle"' in html
+    assert "SIDEBAR_COLLAPSED_STORAGE_KEY" in js
+    assert "setSidebarCollapsed(storedSidebarCollapsed(), { persist: false })" in js
+    assert "sidebar-collapsed" in css
+    assert ".sidebar:hover" not in css
+
+    assert "renderCompactFileChange" in js
+    assert "renderStandaloneArtifact({ eyebrow: 'File change'" not in js
+    assert "Preview - ${lineCount}" in js
+    assert "body.hidden = true;" in js
+    assert ".compact-artifact-row" in css
+
+
+def test_clicky_textbox_overlay_is_click_through_and_event_driven():
+    root = Path(__file__).resolve().parents[1]
+    overlay = (root / "app" / "widget" / "virtual_cursor.py").read_text(
+        encoding="utf-8", errors="replace")
+    textbox = (root / "app" / "widget" / "textbox_overlay.py").read_text(
+        encoding="utf-8", errors="replace")
+    launcher = (root / "run_desktop.py").read_text(
+        encoding="utf-8", errors="replace")
+    main_py = (root / "app" / "main.py").read_text(
+        encoding="utf-8", errors="replace")
+    log_emitter = (root / "app" / "log_emitter.py").read_text(
+        encoding="utf-8", errors="replace")
+
+    assert "WindowTransparentForInput" in overlay
+    assert "WA_TransparentForMouseEvents" in overlay
+    assert "QCursor" in overlay and "QCursor.pos()" in overlay
+    assert "COMPANION_OFFSET_X" in overlay
+    assert "COMPANION_STIFFNESS" in overlay and "COMPANION_DAMPING" in overlay
+    assert "COMPANION_BLUE" in overlay
+    assert "_companion_display_pos = self._companion_cursor_target()" in overlay
+    assert "_companion_vel = QPointF(0, 0)" in overlay
+    assert "self._companion_vel = QPointF(" in overlay
+    assert "box_x = cx + 10" in overlay and "box_y = cy + 18 - th / 2" in overlay
+    assert "self._companion_bubble_scale += (" in overlay
+    assert "set_companion_enabled" in overlay
+    assert "set_companion_label" in overlay
+    assert "_paint_companion_bubble" in overlay
+    assert "_paint_companion_cursor" not in overlay
+    assert "COMPANION_ROTATION_DEG" not in overlay
+    assert "QColor(0x33, 0x80, 0xFF)" in overlay
+    assert "set_companion_label(label or f\"UIA {kind}\")" in overlay
+
+    assert "VirtualCursorOverlay()" in textbox
+    assert "set_companion_enabled(True, \"Orynn ready\")" in textbox
+    assert "/api/overlay/events" in textbox
+    assert "/api/active-tasks" in textbox
+    assert "keyboard.add_hotkey(\"ctrl+shift+m\"" in textbox
+    assert "voice.listen(timeout=8.0)" in textbox
+    assert "voice.speak(text)" in textbox
+    assert "build_task_payload" in textbox
+    assert "DESKTOP_HARDENING + goal" in textbox
+    assert "\"Working in background\"" in textbox
+
+    assert "--capsule" in launcher
+    assert "app.widget.textbox_overlay" in launcher
+    assert "_start_textbox_overlay(port)" in launcher
+    assert "if args.capsule:" in launcher
+    assert "if not args.dashboard:" not in launcher
+
+    assert '@app.get("/api/overlay/events"' in main_py
+    assert "log_emitter.read_global" in main_py
+    assert "global_cursor" in log_emitter
+    assert "read_global" in log_emitter
+    assert "MAX_GLOBAL_EVENTS" in log_emitter
 
 
 def test_codex_message_actions_and_contextual_suggestions():
