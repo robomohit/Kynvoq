@@ -42,7 +42,7 @@ from .premium_features import (
 from .providers import PlannerProvider, _capture_screenshot_b64, _captured_dimensions, _get_active_window_rect, _get_hwnd_for_title, detect_task_mode, classify_task_complexity, infer_isolated_app_name, is_vision_model
 from .safety import SafetyManager
 from .text_editor import TextEditorTool
-from .tools import ToolExecutor, _flash_pointer
+from .tools import ToolExecutor, _flash_pointer, detect_app_launch_intent
 from .plugins import PluginRegistry
 from .skills import skill_manager
 
@@ -1727,6 +1727,42 @@ class AgentService:
             "tier": getattr(provider, "model_tier", None),
             "local": str(provider_model).startswith("ollama/"),
         })
+
+        # ── Deterministic app-launch fast-path ──────────────────────────────
+        # "open / launch / switch to <known app>" is a bounded, predictable
+        # command — focus the window if it's already up, else launch it and wait
+        # for the window to actually appear. Running it directly (no LLM planner
+        # loop) is ~10x faster and can never mis-report "done" before the window
+        # exists. Anything that isn't a pure known-app launch returns None here
+        # and falls straight through to the normal agent.
+        if mode in ("computer", "auto"):
+            _launch = detect_app_launch_intent(goal)
+            if _launch:
+                _cmd, _title = _launch
+                self.permissions.grant(task_id, "desktop")
+                await self._emit(task_id, "status", {
+                    "message": f"Opening {_title}…", "elapsed_seconds": 0,
+                })
+                try:
+                    res = await asyncio.to_thread(tools.open_known_app, _cmd, _title)
+                except Exception as exc:
+                    res = ToolResult(ok=False, output=f"Couldn't open {_title}: {exc}")
+                now_iso = datetime.now(timezone.utc).isoformat()
+                if res.ok:
+                    self._finalize(task_id, "done", res.output or f"Opened {_title}.")
+                    await self._emit(task_id, "done", {
+                        "complete": True,
+                        "reason": f"Opened {_title}.",
+                        "finished_at": now_iso,
+                    })
+                else:
+                    self._finalize(task_id, "failed", res.output or f"Couldn't open {_title}.")
+                    await self._emit(task_id, "done", {
+                        "complete": False,
+                        "reason": res.output or f"Couldn't open {_title}.",
+                        "finished_at": now_iso,
+                    })
+                return
 
         # Build Skill Instructions
         skill_instructions = ""

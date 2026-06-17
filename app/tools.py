@@ -436,6 +436,58 @@ def _read_public_http_url(
     raise ToolError("Too many redirects while fetching URL.")
 
 
+# ── Deterministic app-launch fast-path ───────────────────────────────────────
+# A curated registry of apps Orynn can open by voice without any LLM: spoken name
+# -> (launch command, window-title substring to verify). Deliberately NARROW —
+# only Windows built-ins with a stable, matchable window title and a reliable
+# `start` command. Browsers / third-party apps are left out on purpose (their
+# launch + title vary per machine), so "open chrome" correctly falls through to
+# the planner instead of failing. This is the "bounded command" layer the North
+# Star favors: fast, predictable, never mis-reported.
+_KNOWN_LAUNCH_APPS: Dict[str, tuple] = {
+    "notepad": ("start notepad", "Notepad"),
+    "calculator": ("start calc", "Calculator"),
+    "calc": ("start calc", "Calculator"),
+    "paint": ("start mspaint", "Paint"),
+    "ms paint": ("start mspaint", "Paint"),
+    "mspaint": ("start mspaint", "Paint"),
+    "wordpad": ("start wordpad", "WordPad"),
+    "settings": ("start ms-settings:", "Settings"),
+    "task manager": ("start taskmgr", "Task Manager"),
+}
+
+_LAUNCH_VERB_RE = re.compile(
+    r"^(?:(?:hey\s+|ok\s+|okay\s+)?orynn[,\s]+|please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+)*"
+    r"(open(?:\s+up)?|launch|start|run|bring\s+up|pull\s+up|fire\s+up|go\s+to|switch\s+to|show\s+me)\s+(.+)$"
+)
+# A pure launch chains no other action; any of these means "do more than open" —
+# hand it to the planner instead (e.g. "open notepad AND type hello").
+_LAUNCH_EXTRA_RE = re.compile(r"(\b(?:and|then|after|also|to|with|so|while|in|on)\b|[;,])")
+_LAUNCH_FILLER_RE = re.compile(
+    r"\b(?:the|my|a|an|app|application|program|tool|window|please|up|for\s+me)\b"
+)
+
+
+def detect_app_launch_intent(goal: str) -> Optional[tuple]:
+    """If `goal` is a PURE 'open/launch/switch to <known app>' command, return its
+    (launch_command, window_title); otherwise None. Anything with extra steps,
+    unknown apps, or surrounding wrapper text falls through (None) so the normal
+    planner handles it. Matching is exact against the curated registry — narrow by
+    design."""
+    text = re.sub(r"\s+", " ", str(goal or "")).strip().lower().rstrip(" .!?")
+    if not text:
+        return None
+    m = _LAUNCH_VERB_RE.match(text)
+    if not m:
+        return None
+    rest = m.group(2).strip()
+    if _LAUNCH_EXTRA_RE.search(rest):
+        return None
+    rest = _LAUNCH_FILLER_RE.sub(" ", rest)
+    rest = re.sub(r"\s+", " ", rest).strip()
+    return _KNOWN_LAUNCH_APPS.get(rest)
+
+
 class ToolExecutor:
     def __init__(self, workspace: Path, text_editor=None, plugin_registry=None, *, home_dir: Optional[Path] = None, memory: Optional["MemoryStore"] = None):
         self.workspace = workspace.resolve()
@@ -1392,6 +1444,52 @@ class ToolExecutor:
                 )
             time.sleep(0.1)
         return ToolResult(ok=False, output=f"Timed out waiting for a visible window matching '{needle}'.")
+
+    def open_known_app(self, launch_command: str, window_title: str, timeout: float = 12.0) -> ToolResult:
+        """Deterministically open (or focus) a known app — no LLM. If a window
+        matching `window_title` is already visible, focus it instead of launching a
+        duplicate; otherwise launch detached and wait for the window to actually
+        appear. The success of this call IS the verification (a real window, not a
+        model claiming 'done'), which is what makes the 'open <app>' command a
+        true 10/10. Used by the run_task fast-path for spoken launch commands."""
+        if win32gui is None:
+            return ToolResult(ok=False, output="Opening apps is only available on Windows.")
+        title = (window_title or "").strip()
+        # 1. Already open? Focus it — covers single-instance apps and "switch to X".
+        try:
+            if title and self._iter_matching_windows(title):
+                focused = self.focus_window(title)
+                if focused.ok:
+                    return focused
+        except Exception:
+            pass
+        # 2. Launch detached (so it outlives this process), then verify by title.
+        command = self._normalize_gui_launch_command(launch_command)
+        try:
+            creationflags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+            popen_kwargs: Dict[str, Any] = {
+                "shell": True,
+                "cwd": self.workspace,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+            subprocess.Popen(command, **popen_kwargs)
+        except Exception as exc:
+            return ToolResult(ok=False, output=f"Couldn't launch {title or command}: {exc}")
+        if not title:
+            return ToolResult(ok=True, output=f"Launched: {command}")
+        verify = self.wait_for_window(title, timeout=timeout)
+        if verify.ok:
+            return verify
+        return ToolResult(
+            ok=False,
+            output=f"Ran '{command}' but no '{title}' window appeared in time.",
+        )
 
     def _auto_wait_after_launch(self, command: str):
         title_hint = self._guess_launch_target_title(command)

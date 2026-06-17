@@ -1502,7 +1502,9 @@ async def test_unified_surface_desktop_task_can_reach_browser_web_and_files(monk
     monkeypatch.setattr("app.agent.is_vision_model", lambda model: False)
     captured = _capture_tool_names(monkeypatch, service)
 
-    await service.run_task("task-unified-desktop", "Open Notepad", mode="computer", model="tier:uia")
+    # NB: bare "open <app>" takes the deterministic launch fast-path (no LLM); use a
+    # multi-step desktop goal so the reactive loop runs and we can read its tool surface.
+    await service.run_task("task-unified-desktop", "Type a note into Notepad", mode="computer", model="tier:uia")
 
     names = captured["names"]
     # Desktop control stays available …

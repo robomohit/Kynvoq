@@ -298,10 +298,20 @@ VOICE_BREVITY = (
 
 def build_task_payload(goal: str) -> dict[str, Any]:
     mode = _detect_mode(goal)
+    # A pure "open/launch/switch to <known app>" command runs the deterministic
+    # fast-path server-side (no LLM), so keep its goal RAW — prepending the long
+    # desktop-hardening prompt or the voice-brevity note would only bloat it (and
+    # the hardening prompt is what once pushed the goal past the 2000-char cap).
+    try:
+        from app.tools import detect_app_launch_intent
+        is_app_launch = detect_app_launch_intent(goal) is not None
+    except Exception:
+        is_app_launch = False
     payload_goal = goal
-    if mode in {"computer", "computer_use", "computer_isolated"}:
-        payload_goal = DESKTOP_HARDENING + goal
-    payload_goal = payload_goal + VOICE_BREVITY
+    if not is_app_launch:
+        if mode in {"computer", "computer_use", "computer_isolated"}:
+            payload_goal = DESKTOP_HARDENING + goal
+        payload_goal = payload_goal + VOICE_BREVITY
     width, height = _screen_size()
     return {
         "task_id": "clicky-" + secrets.token_hex(5),

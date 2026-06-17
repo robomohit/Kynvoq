@@ -166,12 +166,12 @@ def test_voice_brevity_appended_but_stripped_from_labels():
 
 
 def test_voice_desktop_payload_fits_task_schema():
-    """REGRESSION: a spoken desktop command ("open notepad") prepends the ~1.7KB
+    """REGRESSION: a multi-step spoken desktop command prepends the ~1.7KB
     desktop-hardening prompt to the goal. If TaskIn.goal's max_length is shorter
-    than that fixed overhead, the backend rejects EVERY voice desktop command with
-    HTTP 422 and the bubble just says "Couldn't start task" — the whole free
-    push-to-talk desktop path silently dies. Pin the voice->submit contract so the
-    cap can never again fall below the hardening prompt.
+    than that fixed overhead, the backend rejects EVERY such command with HTTP 422
+    and the bubble just says "Couldn't start task" — the free push-to-talk desktop
+    path silently dies. Pin the voice->submit contract so the cap can never again
+    fall below the hardening prompt.
     """
     import os
 
@@ -184,14 +184,64 @@ def test_voice_desktop_payload_fits_task_schema():
         pytest.skip("PySide6 not importable in this environment")
     from app.main import TaskIn, TaskPreflightIn
 
-    payload = t.build_task_payload("open notepad")
-    assert payload["mode"] == "computer"  # short "open X" routes to the desktop path
-    # The exact body the push-to-talk handler POSTs must validate cleanly.
-    TaskIn(**payload)  # raises ValidationError if the goal exceeds the cap
-    TaskPreflightIn(goal=payload["goal"], mode=payload["mode"])  # preflight uses the same goal
+    # A real multi-step desktop command DOES carry the hardening prompt and must fit.
+    payload = t.build_task_payload("open notepad and type a quick note for me")
+    assert payload["mode"] == "computer"
+    assert t.DESKTOP_HARDENING in payload["goal"]  # hardening is present...
+    TaskIn(**payload)  # ...and still validates (cap >= hardening overhead)
+    TaskPreflightIn(goal=payload["goal"], mode=payload["mode"])
     # A generously long dictated command must still fit, with headroom over the prompt.
     long_cmd = "open notepad and " + ("type a long dictated sentence " * 40)
     TaskIn(**t.build_task_payload(long_cmd))
+
+
+def test_app_launch_payload_is_unwrapped():
+    """A pure 'open <known app>' command takes the deterministic fast-path, so its
+    goal stays RAW — no hardening prompt, no voice-brevity note (which is what once
+    blew past the 2000-char cap). A command that does MORE than open keeps the full
+    desktop wrapper."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from app.widget import textbox_overlay as t
+    except Exception:
+        import pytest
+
+        pytest.skip("PySide6 not importable in this environment")
+
+    launch = t.build_task_payload("open notepad")
+    assert launch["mode"] == "computer"
+    assert launch["goal"] == "open notepad"  # untouched: no hardening, no brevity
+    assert t.DESKTOP_HARDENING not in launch["goal"]
+    assert "[Reply format:" not in launch["goal"]
+
+    # "open X and <do more>" is NOT a pure launch -> full wrapper applies.
+    multi = t.build_task_payload("open notepad and type hello")
+    assert t.DESKTOP_HARDENING in multi["goal"]
+
+
+def test_detect_app_launch_intent():
+    """The intent detector must catch pure known-app launches and reject anything
+    with extra steps, unknown apps, or non-launch phrasing (those fall to the LLM)."""
+    from app.tools import detect_app_launch_intent as d
+
+    # Pure launches across verbs / fillers / casing.
+    assert d("open notepad") == ("start notepad", "Notepad")
+    assert d("launch the calculator") == ("start calc", "Calculator")
+    assert d("Open Calc") == ("start calc", "Calculator")
+    assert d("switch to settings") == ("start ms-settings:", "Settings")
+    assert d("open task manager please") == ("start taskmgr", "Task Manager")
+    assert d("open the ms paint app") == ("start mspaint", "Paint")
+    assert d("hey orynn, open notepad") == ("start notepad", "Notepad")
+
+    # Not pure launches / unknown -> None (planner handles these).
+    assert d("open notepad and type hello") is None
+    assert d("open chrome") is None            # not in the curated registry
+    assert d("what's open in notepad") is None  # not a launch verb
+    assert d("type hello") is None
+    assert d("open notepad to write a note") is None
+    assert d("") is None
 
 
 def test_overlay_action_dispatch_routes_to_cursor_methods():
