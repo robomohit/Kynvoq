@@ -3608,10 +3608,12 @@
   };
 
   const openStream = (listenTask) => {
+    clearReconnectTimer();
     if (sse) { sse.close(); sse = null; }
     sse = new EventSource(`/api/tasks/${listenTask}/stream?since=${streamCursor}`, { withCredentials: true });
     sse.onmessage = (message) => {
       if (task !== listenTask) return;
+      clearReconnectTimer();
       reconnectAttempts = 0;
       let data;
       try {
@@ -3698,7 +3700,7 @@
       plan_first: !!$('plan-first-toggle')?.checked,
       notify_on_completion: !!$('notify-toggle')?.checked,
       auto_commit: !!$('checkpoint-toggle')?.checked,
-      autonomy_level: $('autonomy-level')?.value || 'careful',
+      autonomy_level: document.body.classList.contains('widget-shell') ? 'autonomous' : ($('autonomy-level')?.value || 'careful'),
       thinking_budget: $('thinking-budget')?.value || 'off',
       history: priorConversation,
       readiness_override: !!readinessDecision.override
@@ -3733,7 +3735,7 @@
       const detail = (typeof err.detail === 'object') ? JSON.stringify(err.detail) : (err.detail || 'Unknown error.');
       renderStatusNote('error', `Failed to start task: ${detail}`);
       markHistoryFinal('failed');
-      showPostRunControls();
+      stopEverything();
     }
   };
 

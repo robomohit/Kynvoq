@@ -51,15 +51,30 @@ _log = logging.getLogger("agent")
 TOKEN_BUDGET_DEFAULT = 100_000  # max combined input+output tokens per task
 MODEL_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 XML_FALLBACK_MAX_STEPS = 3
-APPROVAL_WAIT_TIMEOUT_SECONDS = float(os.environ.get("APPROVAL_WAIT_TIMEOUT_SECONDS", "300"))
-PERMISSION_WAIT_TIMEOUT_SECONDS = float(os.environ.get("PERMISSION_WAIT_TIMEOUT_SECONDS", "300"))
-AGENT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "25"))
-BROWSER_MAX_STEPS = int(os.environ.get("BROWSER_MAX_STEPS", "35"))
+
+
+def _env_num(name: str, default, cast):
+    """Read a numeric env var, falling back to `default` when unset OR empty.
+
+    os.environ.get(name, default) only uses the default when the key is
+    absent; a key present with an empty value (e.g. ".env" line "FOO=")
+    returns "" and crashes cast(""). Treat empty/whitespace as unset.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return cast(raw)
+
+
+APPROVAL_WAIT_TIMEOUT_SECONDS = _env_num("APPROVAL_WAIT_TIMEOUT_SECONDS", 300.0, float)
+PERMISSION_WAIT_TIMEOUT_SECONDS = _env_num("PERMISSION_WAIT_TIMEOUT_SECONDS", 300.0, float)
+AGENT_MAX_STEPS = _env_num("AGENT_MAX_STEPS", 25, int)
+BROWSER_MAX_STEPS = _env_num("BROWSER_MAX_STEPS", 35, int)
 # Desktop/computer tasks click individual controls (one step each), read each
 # outcome back to verify, and may need to undo+redo to recover from a misstep —
 # so they legitimately need MORE budget than a generic agent task, not less. 25
 # was cutting off correct recoveries mid-way (e.g. a chained calculation).
-DESKTOP_MAX_STEPS = int(os.environ.get("DESKTOP_MAX_STEPS", "40"))
+DESKTOP_MAX_STEPS = _env_num("DESKTOP_MAX_STEPS", 40, int)
 
 _SCREENSHOT_ACTIONS = {
     ActionType.mouse_click,
@@ -999,7 +1014,7 @@ class SubTaskWorker:
                 if not granted:
                     raise RuntimeError(f"Permission denied for {denied_scope or 'requested scope'}")
 
-                if action.requires_approval or decision.requires_approval:
+                if self.agent_service._approval_gated(self.task_id, action, decision):
                     self.agent_service._prepare_approval_wait(self.task_id, action.id)
                     await self._emit("approval_required", {
                         "action_id": action.id,
@@ -1231,6 +1246,12 @@ class AgentService:
         self._task_environments: Dict[str, Dict[str, Any]] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._paused_tasks: set[str] = set()
+        # Tasks (e.g. voice/floating-bubble) that run fully autonomous — no
+        # approval prompts. The stop hotkey (Ctrl+Shift+X) is the safety net.
+        # The one exception is catastrophic, unrecoverable shell commands
+        # ("Hard-blocked" in safety.py), which still gate since a stop can't
+        # undo e.g. a disk format.
+        self._approval_bypass_tasks: set[str] = set()
         self._approvals: Dict[str, asyncio.Future] = {}
         self._approval_overrides: Dict[str, str] = {}
         self._permission_waits: Dict[str, asyncio.Future] = {}
@@ -1690,6 +1711,12 @@ class AgentService:
         is_auto_approve = mode in ("coding", "chat", "auto", "computer", "computer_isolated", "computer_use")
         if autonomy_level == "careful":
             is_auto_approve = False
+        # "autonomous" (floating-bubble / voice tasks): run with no approval
+        # prompts at all — the stop hotkey is the safety net. Catastrophic
+        # hard-blocked shell commands are the sole exception (see _approval_gated).
+        if autonomy_level == "autonomous":
+            is_auto_approve = True
+            self._approval_bypass_tasks.add(task_id)
         if mode in ("computer", "computer_isolated"):
             self.permissions.grant(task_id, "desktop")
 
@@ -2872,7 +2899,7 @@ class AgentService:
                     # different code path (hierarchical plan). The streaming loop here runs only when
                     # the hierarchical planner is not used or falls back — no double-evaluation occurs.
                     decision = self.safety.evaluate(act, safe_mode=not is_auto_approve)
-                    if act.requires_approval or decision.requires_approval:
+                    if self._approval_gated(task_id, act, decision):
                         self._prepare_approval_wait(task_id, act.id)
                         await self._emit(task_id, "approval_required", {
                             "action_id": act.id,
@@ -3165,6 +3192,7 @@ class AgentService:
     def _finalize(self, task_id: str, status: str, reason: str = ""):
         if self._on_task_complete: self._on_task_complete(task_id, status, reason)
         self._paused_tasks.discard(task_id)
+        self._approval_bypass_tasks.discard(task_id)
         self.permissions.clear(task_id)
         self._approvals.pop(task_id, None)
         self._permission_waits.pop(task_id, None)
@@ -3175,6 +3203,17 @@ class AgentService:
 
     def _prepare_approval_wait(self, task_id: str, action_id: str) -> asyncio.Future:
         return self._approvals.setdefault(f"{task_id}:{action_id}", asyncio.Future())
+
+    def _approval_gated(self, task_id: str, action, decision) -> bool:
+        """Whether an action must wait for user approval. Autonomous tasks (the
+        floating-bubble flow) skip every prompt — except catastrophic,
+        unrecoverable shell commands flagged 'Hard-blocked' by safety.py, which
+        a stop hotkey can't undo."""
+        if not (getattr(action, "requires_approval", False) or decision.requires_approval):
+            return False
+        if task_id in self._approval_bypass_tasks:
+            return str(decision.reason or "").startswith("Hard-blocked")
+        return True
 
     async def _wait_for_approval(self, task_id: str, action_id: str) -> bool:
         fut = self._prepare_approval_wait(task_id, action_id)

@@ -491,6 +491,29 @@ def _shorten_url(u: str, max_len: int = 28) -> str:
         return (u or "?")[:max_len]
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_TABLE_SEP_RE = re.compile(r"(?m)^\s*\|?\s*:?-{2,}[-\s|:]*$")
+
+
+def _plain_companion_text(value: str, limit: int = 200) -> str:
+    """Plain, compact prose for the floating cursor textbox."""
+    text = str(value or "")
+    text = text.replace("```", " ")
+    text = _MD_LINK_RE.sub(r"\1", text)
+    text = _MD_TABLE_SEP_RE.sub(" ", text)
+    text = text.replace("|", " ")
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)
+    text = re.sub(r"(?m)^\s{0,3}>\s?", "", text)
+    text = re.sub(r"(?m)^\s{0,3}[-*+]\s+", "", text)
+    text = re.sub(r"(?m)^\s{0,3}\d+\.\s+", "", text)
+    text = text.replace("**", "").replace("__", "")
+    text = re.sub(r"[*_`~]", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 3)].rstrip() + "..."
+
+
 def _safe_external_url(value: str) -> str:
     text = str(value or "").strip()
     try:
@@ -2946,6 +2969,7 @@ def main(port: int = 8000) -> int:
                     self.statusChanged_local("Voice output unavailable on this PC")
                 self.statusChanged_local("Voice on — click the mic and talk")
                 self._vcursor.set_companion_label("Voice ready")
+                self._vcursor.set_cursor_state("idle")
             else:
                 self.voice_btn.setIcon(_icon("soundoff", 16, "#1A1D24", 1.8))
                 try:
@@ -2954,6 +2978,7 @@ def main(port: int = 8000) -> int:
                 except Exception:
                     pass
                 self._vcursor.set_companion_label("Ready")
+                self._vcursor.set_cursor_state("idle")
 
         def _toggle_mic(self) -> None:
             """Click to start/stop a single dictation capture."""
@@ -3000,10 +3025,12 @@ def main(port: int = 8000) -> int:
             text = (text or "").strip()
             if not text:
                 self._vcursor.set_companion_label("No speech heard")
+                self._vcursor.set_cursor_state("idle")
                 self.statusChanged_local(
                     "Didn't catch that — check your mic is on")
                 return
             self._vcursor.set_companion_label("Heard voice")
+            self._vcursor.set_cursor_state("idle")
             if self._setup_mode:
                 self.input.setText(text)
                 return
@@ -3501,7 +3528,8 @@ def main(port: int = 8000) -> int:
                                        action: str = "") -> str:
             phrase = (action or self._last_action_phrase or "").strip()
             if phrase:
-                return phrase[:56]
+                limit = 200 if state == "done" else 56
+                return phrase[:limit]
             return {
                 "idle": "Ready",
                 "focused": "Ready",
@@ -3558,6 +3586,12 @@ def main(port: int = 8000) -> int:
             try:
                 self._vcursor.set_companion_label(
                     self._companion_label_for_state(state, action))
+                if state == "listening":
+                    self._vcursor.set_cursor_state("listening")
+                elif state in ("submitting", "planning", "acting"):
+                    self._vcursor.set_cursor_state("thinking")
+                else:
+                    self._vcursor.set_cursor_state("idle")
             except Exception:
                 pass
             self._sync_top_widget_status(state, action)
@@ -4123,7 +4157,8 @@ def main(port: int = 8000) -> int:
             self._answer_card = None
             self._answer_text_buf = ""
             self._answer_tools_used = []
-            self._set_capsule_state("done", "Done — result ready")
+            final_label = _plain_companion_text(clean) or "Done"
+            self._set_capsule_state("done", final_label)
             self._adjust()
 
         def _append_sources_strip(self, card, sources: list) -> None:

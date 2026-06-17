@@ -14,8 +14,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QObject, Signal
-from PySide6.QtGui import QAction, QGuiApplication, QIcon
+from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .virtual_cursor import VirtualCursorOverlay
@@ -24,27 +24,35 @@ from .virtual_cursor import VirtualCursorOverlay
 DESKTOP_HARDENING = (
     "You are driving the user's Windows desktop. Prefer UI Automation "
     "(UIA) over screenshots - it is faster and never mis-clicks:\n"
-    "1. `focus_window` (or `wait_for_window`) to bring the target app "
+    "1. To OPEN or launch an app, press the Windows key, type the app "
+    "name, then press Enter (Start-menu search) - this works for any "
+    "installed app. Do NOT guess `start appname:` protocol/URI links "
+    "(e.g. 'microsoftcopilot:') - an unregistered one just pops a 'no "
+    "app to open this link' error. Common built-ins can also be launched "
+    "by exe via run_command: notepad, calc, explorer, mspaint, cmd. If "
+    "Start search shows no match, tell the user the app isn't installed "
+    "rather than guessing.\n"
+    "2. `focus_window` (or `wait_for_window`) to bring the target app "
     "to the front.\n"
-    "2. `uia_find` with the control's visible NAME (e.g. 'File', "
+    "3. `uia_find` with the control's visible NAME (e.g. 'File', "
     "'Search', 'Send') to locate it - DO NOT take a screenshot or "
     "guess coordinates. ALWAYS pass the `app` window-title (e.g. "
     "app='Notepad') so UIA targets the right window even if focus "
     "didn't take.\n"
-    "3. Act with `uia_click` (buttons/menus/channels) or `uia_type` "
+    "4. Act with `uia_click` (buttons/menus/channels) or `uia_type` "
     "(text boxes; clear_first=true to replace text, submit=true to "
     "press Enter and send/search in one step). After navigating, use "
     "`uia_wait` to block until the next control appears instead of "
     "guessing a delay.\n"
-    "4. If `uia_find` returns nothing AND the app is Electron "
+    "5. If `uia_find` returns nothing AND the app is Electron "
     "(VS Code, Slack, Discord, Spotify, Notion, Cursor...), call "
     "`electron_check` then `electron_unlock` on its .exe to relaunch "
     "with --force-renderer-accessibility, then retry uia_find.\n"
-    "5. Only fall back to `screenshot` + coordinate clicks when a "
+    "6. Only fall back to `screenshot` + coordinate clicks when a "
     "control has no accessible name (canvas/custom-drawn UI).\n"
-    "6. Stop after at most 8 steps. If blocked, ask a clear question "
+    "7. Stop after at most 10 steps. If blocked, ask a clear question "
     "instead of looping.\n"
-    "7. Never click Send / Submit / Pay / Delete without explicit "
+    "8. Never click Send / Submit / Pay / Delete without explicit "
     "user confirmation.\n\n"
     "TASK: "
 )
@@ -73,6 +81,62 @@ ACTION_LABELS = {
     "run_command": "Running command",
 }
 
+LIVE_DESKTOP_ACTION_LABELS = {
+    "wait_for_window": "Finding window",
+    "focus_window": "Focusing app",
+    "observe": "Reading app controls",
+    "find": "Finding control",
+    "wait": "Waiting for control",
+    "click": "Clicking control",
+    "type": "Typing into control",
+    "press_keys": "Pressing shortcut",
+}
+
+LIVE_DESKTOP_ACTIONS = set(LIVE_DESKTOP_ACTION_LABELS)
+
+LIVE_BLOCKED_KEY_COMBOS = {
+    "alt+f4",
+    "alt+tab",
+    "ctrl+shift+l",
+    "ctrl+shift+m",
+    "ctrl+shift+space",
+    "ctrl+shift+x",
+    "ctrl+q",
+    "ctrl+w",
+    "ctrl+shift+w",
+    "win+d",
+    "shift+delete",
+    "win+l",
+    "delete",
+    "del",
+}
+
+LIVE_LABEL_HOLD_SECONDS = 2.8
+LIVE_TOOL_LABEL_HOLD_SECONDS = 1.6
+
+_LIVE_LABEL_SOURCES = {
+    "live_status",
+    "live_input",
+    "live_reply",
+    "live_tool",
+    "live_error",
+    "live_stop",
+}
+
+# Desktop-task "churn" label sources — the noisy per-step status/action chatter
+# from a running task ("Orynning…", "Searching…", "Clicking Save"). While Gemini
+# Live is the active driver it OWNS the bubble text (Live narrates the task out
+# loud), so this churn is muted to stop the bubble flashing between the live
+# transcript and the task's step labels. The flying cursor still shows what's
+# happening on screen. The one exception is `task_result`: a task's final answer
+# is meaningful and a single, non-flickering update, so it surfaces even mid-Live.
+_TASK_CHURN_SOURCES = {
+    "task_status",
+    "task_prime",
+    "task_action",
+    "system_wait",
+}
+
 
 def _clean_text(value: Any) -> str:
     text = str(value or "").replace("\r", " ").replace("\n", " ")
@@ -87,11 +151,110 @@ def _short(value: Any, limit: int = 56) -> str:
     return text[: max(0, limit - 3)].rstrip() + "..."
 
 
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_TABLE_SEP_RE = re.compile(r"(?m)^\s*\|?\s*:?-{2,}[-\s|:]*$")
+
+
+def _strip_markdown(value: Any) -> str:
+    """Flatten model markdown into plain prose for the popup bubble — no
+    asterisks, headings, tables, bullets, or code fences."""
+    text = str(value or "")
+    text = text.replace("```", " ")
+    text = _MD_LINK_RE.sub(r"\1", text)          # [text](url) -> text
+    text = _MD_TABLE_SEP_RE.sub(" ", text)       # drop |---|---| separator rows
+    text = text.replace("|", " ")                # table cell pipes -> spaces
+    text = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", text)     # headings
+    text = re.sub(r"(?m)^\s{0,3}>\s?", "", text)          # blockquotes
+    text = re.sub(r"(?m)^\s{0,3}[-*+]\s+", "", text)      # bullet lists
+    text = re.sub(r"(?m)^\s{0,3}\d+\.\s+", "", text)      # numbered lists
+    text = text.replace("**", "").replace("__", "")       # bold
+    text = re.sub(r"[*_`~]", "", text)                    # leftover emphasis/code
+    return text
+
+
+def _merge_streamed_text(current: str, chunk: str) -> str:
+    """Merge either delta or cumulative transcript chunks without duplication."""
+    current = str(current or "")
+    chunk = str(chunk or "")
+    if not current:
+        return chunk
+    if not chunk:
+        return current
+    if chunk == current or current.endswith(chunk):
+        return current
+    if chunk.startswith(current):
+        return chunk
+    max_overlap = min(len(current), len(chunk))
+    for size in range(max_overlap, 0, -1):
+        if current[-size:] == chunk[:size]:
+            return current + chunk[size:]
+    return current + chunk
+
+
+def _clean_live_status(value: Any) -> str:
+    text = _clean_text(value)
+    low = text.lower()
+    if low.startswith("gemini live tool:"):
+        return "Working..."
+    if low == "gemini live listening":
+        return "Listening"
+    return text
+
+
+# Playful "working" words shown in the bubble while the agent is busy — rotated
+# at random as status events arrive, Claude-Code style ("Brewing", "Noodling"…).
+_THINKING_WORDS = [
+    "Thinking", "Brewing", "Cooking", "Noodling", "Percolating", "Pondering",
+    "Conjuring", "Cogitating", "Scheming", "Mulling", "Tinkering", "Finagling",
+    "Vibing", "Crunching", "Wrangling", "Plotting", "Hatching", "Summoning",
+    "Channelling", "Whirring", "Spelunking", "Marinating", "Simmering",
+    "Manifesting", "Untangling", "Orynning", "Computing", "Calculating",
+]
+_last_thinking_word = [""]
+
+
+def _thinking_word() -> str:
+    """A random playful 'busy' word, avoiding an immediate repeat."""
+    import random
+    pool = [w for w in _THINKING_WORDS if w != _last_thinking_word[0]] or _THINKING_WORDS
+    word = random.choice(pool)
+    _last_thinking_word[0] = word
+    return word + "…"
+
+
+def _humanize_status(message: Any) -> str:
+    """Collapse the agent's noisy per-step status spam into a friendly label.
+
+    "Thinking through step 3…", "Working on step 3…", and "…waiting on model
+    (step 3, 12s)" all become a random playful word ("Brewing…", "Noodling…").
+    Other messages keep their text with any "step N" fragments stripped.
+    """
+    text = _clean_text(message)
+    low = text.lower()
+    if not text:
+        return _thinking_word()
+    if "waiting on model" in low or low.startswith(("thinking", "working")):
+        return _thinking_word()
+    # Strip any leftover "step N" / "(step N, Xs)" fragments from other messages.
+    cleaned = re.sub(r"\s*\(?\bstep\s*\d+(?:,\s*\d+\s*s)?\)?", "", text, flags=re.I)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" …·-")
+    return cleaned or _thinking_word()
+
+
 def _strip_hardening(goal: str) -> str:
     goal = str(goal or "")
     if goal.startswith(DESKTOP_HARDENING):
-        return goal[len(DESKTOP_HARDENING):]
-    return goal
+        goal = goal[len(DESKTOP_HARDENING):]
+    # Drop the voice-brevity reply-format note appended in build_task_payload so
+    # it never shows up when echoing the goal back in a label.
+    idx = goal.find(VOICE_BREVITY)
+    if idx != -1:
+        goal = goal[:idx]
+    else:
+        marker = "[Reply format:"
+        if marker in goal:
+            goal = goal[: goal.find(marker)]
+    return goal.rstrip()
 
 
 def _detect_mode(goal: str) -> str:
@@ -121,11 +284,20 @@ def _screen_size() -> tuple[int, int]:
         return 1280, 800
 
 
+VOICE_BREVITY = (
+    "\n\n[Reply format: your final answer is shown in a tiny on-screen popup. "
+    "Use plain text only — no markdown, asterisks, headings, tables, or bullet "
+    "lists. Keep it to one or two short sentences (about 200 characters max). "
+    "If the full answer won't fit, give only the single most important point.]"
+)
+
+
 def build_task_payload(goal: str) -> dict[str, Any]:
     mode = _detect_mode(goal)
     payload_goal = goal
     if mode in {"computer", "computer_use", "computer_isolated"}:
         payload_goal = DESKTOP_HARDENING + goal
+    payload_goal = payload_goal + VOICE_BREVITY
     width, height = _screen_size()
     return {
         "task_id": "clicky-" + secrets.token_hex(5),
@@ -133,7 +305,9 @@ def build_task_payload(goal: str) -> dict[str, Any]:
         "mode": mode,
         "screen_width": width,
         "screen_height": height,
-        "autonomy_level": "balanced",
+        # Floating-bubble tasks run with NO approval prompts — stop with the
+        # Ctrl+Shift+X hotkey instead. (Catastrophic shell commands still gate.)
+        "autonomy_level": "autonomous",
         "thinking_budget": "off",
     }
 
@@ -189,6 +363,13 @@ class OverlayController(QObject):
     labelRequested = Signal(str)
     listenRequested = Signal()
     quitRequested = Signal()
+    # Carries a parsed overlay-action payload from the poll thread to the GUI
+    # thread, where it drives the VirtualCursorOverlay (fly-to-target, focus
+    # ring, app glow). Cross-thread Qt signals marshal automatically.
+    overlayActionRequested = Signal(dict)
+    cursorStateRequested = Signal(str)  # "idle" | "listening" | "thinking"
+    audioLevelRequested = Signal(float)  # live mic level → reactive waveform
+    notifyRequested = Signal(str, str)   # (title, message) → tray toast
 
     def __init__(self, port: int, speak_replies: bool = False):
         super().__init__()
@@ -197,7 +378,160 @@ class OverlayController(QObject):
         self._cursor = 0
         self._voice_task_ids: set[str] = set()
         self._speak_replies = bool(speak_replies)
+        self._recorder: Any = None
+        self._recording = False
+        self._ptt_lock = threading.Lock()
+        self._ptt_combo = "ctrl+shift+space"
+        self._live_combo = "ctrl+shift+l"
+        self._stop_combo = "ctrl+shift+x"
+        self._overlay: Any = None       # VirtualCursorOverlay, attached in main()
+        self._tray: Any = None          # QSystemTrayIcon, for completion toasts
+        self._effects_enabled = True    # honoured from the show_action_glow pref
+        self._active_task_running = False
+        self._live: Any = None
+        self._live_cancel = threading.Event()
+        self._live_generation = 0
+        self._live_error_generation: int | None = None
+        self._desktop_tools: Any = None
+        # Gemini Live streams its spoken reply as many tiny transcript chunks;
+        # accumulate them into the running sentence instead of flashing one word
+        # at a time. _live_reply_done=True means the next chunk starts a new reply.
+        self._live_input_buffer = ""
+        self._live_input_done = True
+        self._live_reply_buffer = ""
+        self._live_reply_done = True
+        self._label_protect_until = 0.0
+        self._label_protect_source = ""
+        # _set_label is called from the Live audio thread, the poll thread and the
+        # GUI thread; guard the read-decide-write of the protection window so the
+        # arbitration can't race into a flicker.
+        self._label_lock = threading.Lock()
         self.listenRequested.connect(self.listen_once)
+        self.notifyRequested.connect(self._on_notify)
+
+    def _reset_live_buffers(self) -> None:
+        self._live_input_buffer = ""
+        self._live_input_done = True
+        self._live_reply_buffer = ""
+        self._live_reply_done = True
+
+    def _clear_live_if_inactive(self) -> None:
+        live = self._live
+        if live is None:
+            return
+        try:
+            if live.is_running():
+                return
+        except Exception:
+            pass
+        self._live = None
+
+    def _next_live_generation(self) -> int:
+        self._live_generation += 1
+        self._live_error_generation = None
+        return self._live_generation
+
+    def _live_generation_current(self, generation: int | None) -> bool:
+        return generation is None or generation == self._live_generation
+
+    def attach_overlay(self, overlay: Any) -> None:
+        """Give the controller the cursor overlay so it can drive fly-to-target
+        animations. Wires the cross-thread signals to GUI-thread handlers."""
+        self._overlay = overlay
+        self.overlayActionRequested.connect(self._on_overlay_action)
+        self.cursorStateRequested.connect(self._on_cursor_state)
+        self.audioLevelRequested.connect(self._on_audio_level)
+
+    def set_tray(self, tray: Any) -> None:
+        """Give the controller the tray icon so it can show completion toasts."""
+        self._tray = tray
+
+    def _on_audio_level(self, level: float) -> None:
+        if self._overlay is not None and hasattr(self._overlay, "set_audio_level"):
+            try:
+                self._overlay.set_audio_level(level)
+            except Exception:
+                pass
+
+    def _on_notify(self, title: str, message: str) -> None:
+        if self._tray is None or not message:
+            return
+        try:
+            self._tray.showMessage(title, message, QSystemTrayIcon.Information, 5000)
+        except Exception:
+            pass
+
+    def _live_is_running(self) -> bool:
+        live = self._live
+        try:
+            return bool(live is not None and live.is_running())
+        except Exception:
+            return False
+
+    def _set_live_owns_bubble(self, owns: bool) -> None:
+        """Tell the overlay whether Gemini Live currently owns the bubble text, so a
+        Live-spawned desktop task's flying-cursor step labels don't flash over the
+        live conversation. (The cursor still flies; only the bubble text is held.)"""
+        ov = self._overlay
+        if ov is not None and hasattr(ov, "set_companion_text_locked"):
+            try:
+                ov.set_companion_text_locked(bool(owns))
+            except Exception:
+                pass
+
+    def _set_label(
+        self,
+        text: Any,
+        *,
+        source: str = "system",
+        hold_seconds: float | None = None,
+        force: bool = False,
+    ) -> bool:
+        label = _clean_text(text)
+        if not label:
+            return False
+        with self._label_lock:
+            now = time.monotonic()
+            protected = now < self._label_protect_until
+            # "Live is holding the bubble" = a Live label is still inside its hold
+            # window. Requiring `protected` (not just the source) means task labels
+            # resume the instant Live's hold expires / Live stops — no stale lockout.
+            live_holding = protected and self._label_protect_source in _LIVE_LABEL_SOURCES
+            live_running = self._live_is_running()
+
+            if not force:
+                # Gemini Live owns the bubble while it drives: mute the desktop
+                # task's per-step churn so it can't flash over the conversation.
+                # (task_result — the final answer — is deliberately not in the
+                # churn set, so a task's outcome still surfaces during Live.)
+                if source in _TASK_CHURN_SOURCES and (live_running or live_holding):
+                    return False
+                # Don't let the periodic "Listening" status wipe a fresher, more
+                # meaningful Live label (what the user said / the reply / a tool).
+                if (
+                    source == "live_status"
+                    and live_holding
+                    and self._label_protect_source in {"live_input", "live_reply", "live_tool"}
+                ):
+                    return False
+
+            if hold_seconds is None:
+                if source == "live_tool":
+                    hold_seconds = LIVE_TOOL_LABEL_HOLD_SECONDS
+                elif source in _LIVE_LABEL_SOURCES:
+                    hold_seconds = LIVE_LABEL_HOLD_SECONDS
+                elif source in {"task_action", "task_result", "voice", "system"}:
+                    hold_seconds = 1.2
+                else:
+                    hold_seconds = 0.0
+            if hold_seconds > 0:
+                next_until = now + float(hold_seconds)
+                if next_until >= self._label_protect_until:
+                    self._label_protect_until = next_until
+                    self._label_protect_source = source
+
+        self.labelRequested.emit(label)
+        return True
 
     def start(self) -> None:
         threading.Thread(target=self._poll_loop, daemon=True).start()
@@ -205,16 +539,766 @@ class OverlayController(QObject):
 
     def stop(self) -> None:
         self._stop.set()
+        self._live_cancel.set()
+        live = self._live
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                pass
 
     def install_hotkey(self) -> bool:
+        """Push-to-talk: hold the hotkey to record, release to transcribe + send.
+
+        Default hold key is Ctrl+Shift+Space (override with ORYNN_PTT_KEY, e.g.
+        "f8"). The classic tap-to-talk on Ctrl+Shift+M is kept as a fallback.
+        """
         try:
             import keyboard
 
+            self._ptt_combo = (os.getenv("ORYNN_PTT_KEY") or "ctrl+shift+space").strip()
+            # Press starts recording; a watcher thread detects release (combo
+            # trigger_on_release is unreliable in the keyboard lib, so we poll).
+            keyboard.add_hotkey(self._ptt_combo, self._ptt_start)
+            # Backwards-compatible tap-to-talk (records until silence).
             keyboard.add_hotkey("ctrl+shift+m", self.listenRequested.emit)
+            # Real-time Gemini Live conversation (toggle on/off).
+            self._live_combo = (os.getenv("ORYNN_LIVE_KEY") or "ctrl+shift+l").strip()
+            keyboard.add_hotkey(self._live_combo, self._toggle_live)
+            # Emergency stop: instantly kill whatever the agent is doing.
+            self._stop_combo = (os.getenv("ORYNN_STOP_KEY") or "ctrl+shift+x").strip()
+            keyboard.add_hotkey(self._stop_combo, self._stop_all)
+            print(f"[clicky] push-to-talk: hold {self._ptt_combo} (tap Ctrl+Shift+M); "
+                  f"live: {self._live_combo}; stop: {self._stop_combo}", flush=True)
             return True
         except Exception as exc:
             print(f"[clicky] voice hotkey unavailable: {exc}", flush=True)
             return False
+
+    # ── Push-to-talk ─────────────────────────────────────────────────────────
+    # Hold the hotkey to record; release to send. Tap Esc while holding to
+    # cancel. A safety cap stops a stuck key from recording forever.
+    PTT_MAX_SECONDS = 60.0
+    PTT_MIN_SECONDS = 0.4  # shorter than this = accidental tap, ignore
+
+    def _ptt_start(self) -> None:
+        with self._ptt_lock:
+            if self._recording:
+                return
+            try:
+                from . import voice
+            except Exception:
+                self.cursorStateRequested.emit("idle")
+                self._set_label("Voice unavailable", source="voice", force=True)
+                return
+            if not voice.push_to_talk_available():
+                self.cursorStateRequested.emit("idle")
+                if voice.stt_available():
+                    self._set_label("Hold-to-talk unavailable; tap Ctrl+Shift+M", source="voice", force=True)
+                else:
+                    self._set_label("Voice unavailable", source="voice", force=True)
+                return
+            recorder = voice.Recorder()
+            if not recorder.start():
+                self.cursorStateRequested.emit("idle")
+                self._set_label("Mic unavailable", source="voice", force=True)
+                return
+            self._recorder = recorder
+            self._recording = True
+            voice.cue("start")
+            self.cursorStateRequested.emit("listening")
+            self._set_label("Listening…", source="voice", force=True)
+        threading.Thread(target=self._ptt_watch, daemon=True).start()
+
+    def _ptt_watch(self) -> None:
+        """Poll the hotkey until released (more reliable than the keyboard lib's
+        trigger_on_release for combos). Esc cancels; a max cap is enforced."""
+        try:
+            import keyboard
+        except Exception:
+            self._ptt_stop(cancelled=True)
+            return
+        start = time.time()
+        cancelled = False
+        while self._recording:
+            # Feed the live mic level to the reactive listening waveform.
+            rec = self._recorder
+            if rec is not None:
+                try:
+                    self.audioLevelRequested.emit(rec.level())
+                except Exception:
+                    pass
+            try:
+                held = keyboard.is_pressed(self._ptt_combo)
+                esc = keyboard.is_pressed("esc")
+            except Exception:
+                held, esc = False, False
+            if esc:
+                cancelled = True
+                break
+            if not held:
+                break
+            if time.time() - start >= self.PTT_MAX_SECONDS:
+                break
+            time.sleep(0.05)
+        self._ptt_stop(cancelled=cancelled)
+
+    def _discard_recording(self) -> None:
+        """Stop and forget any active recorder without transcribing it."""
+        with self._ptt_lock:
+            self._recording = False
+            recorder = self._recorder
+            self._recorder = None
+        if recorder is None:
+            return
+        try:
+            recorder.stop()
+        except Exception:
+            pass
+
+    def _ptt_stop(self, cancelled: bool = False) -> None:
+        with self._ptt_lock:
+            if not self._recording:
+                return
+            self._recording = False
+            recorder = self._recorder
+            self._recorder = None
+        if recorder is None:
+            return
+        threading.Thread(
+            target=self._ptt_finish, args=(recorder, cancelled), daemon=True
+        ).start()
+
+    def _ptt_finish(self, recorder: Any, cancelled: bool = False) -> None:
+        from . import voice
+
+        try:
+            wav = recorder.stop()
+        except Exception:
+            wav = b""
+        if cancelled:
+            voice.cue("cancel")
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Cancelled", source="voice", force=True)
+            return
+        # Ignore accidental ultra-short taps without burning an API call.
+        if voice.wav_seconds(wav) < self.PTT_MIN_SECONDS:
+            voice.cue("error")
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Didn't catch that", source="voice", force=True)
+            return
+        voice.cue("stop")
+        self.cursorStateRequested.emit("thinking")
+        self._set_label(_thinking_word(), source="voice", force=True)
+        try:
+            transcript = voice.transcribe_wav(wav) or ""
+        except Exception:
+            transcript = ""
+        transcript = _clean_text(transcript)
+        if not transcript:
+            voice.cue("error")
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Didn't catch that", source="voice", force=True)
+            return
+        self._set_label("Heard: " + _short(transcript, 150), source="voice", force=True)
+        self._submit_voice_task(transcript)
+
+    # ── Emergency stop ───────────────────────────────────────────────────────
+    def _stop_all(self) -> None:
+        """Hotkey handler: instantly halt everything — cancel any recording, stop
+        speech, and KILL every running/queued task. Runs off the keyboard thread
+        so the UI stays responsive."""
+        threading.Thread(target=self._stop_all_worker, daemon=True).start()
+
+    def _kill_active_tasks(self) -> int:
+        stopped = 0
+        data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
+        tasks = data.get("tasks", []) if isinstance(data, dict) else []
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            tid = str(t.get("id") or t.get("task_id") or "").strip()
+            if not tid:
+                continue
+            try:
+                self.client.request("POST", f"/api/tasks/{tid}/kill", timeout=5.0)
+                stopped += 1
+            except Exception:
+                pass
+        return stopped
+
+    def _stop_all_worker(self) -> None:
+        # 1. Drop any in-progress voice capture and stop the spinner.
+        recording_was_active = bool(self._recording)
+        self._discard_recording()
+        self._live_cancel.set()
+        live = self._live
+        live_was_running = False
+        if live is not None:
+            try:
+                live_was_running = bool(live.is_running())
+                live.stop()
+            except Exception:
+                pass
+        self._set_live_owns_bubble(False)
+        try:
+            from . import voice
+            voice.stop_speaking()
+            voice.cue("cancel")
+        except Exception:
+            pass
+        self.cursorStateRequested.emit("idle")
+        # 2. Kill every active task (the kill flag halts the worker at its next
+        #    checkpoint — more aggressive than a plain cancel).
+        stopped = 0
+        try:
+            stopped = self._kill_active_tasks()
+        except Exception:
+            pass
+        self._active_task_running = False
+        did_stop = bool(stopped or live_was_running or recording_was_active)
+        self._set_label("Stopped" if did_stop else "Nothing to stop", source="live_stop", force=True)
+
+    # ── Gemini Live conversation ─────────────────────────────────────────────
+    def _toggle_live(self) -> None:
+        live = self._live
+        if live is not None and live.is_running():
+            self._next_live_generation()
+            self._live_cancel.set()
+            live.stop()
+            self._live = None
+            self._set_live_owns_bubble(False)
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Gemini Live off", source="live_stop", force=True)
+            return
+        try:
+            from .gemini_live import GeminiLiveCallbacks, GeminiLiveCompanion
+
+            generation = self._next_live_generation()
+            callbacks = GeminiLiveCallbacks(
+                on_status=lambda text, gen=generation: self._live_status(text, gen),
+                on_input_transcript=(
+                    lambda text, finished, gen=generation:
+                    self._live_input_transcript(text, finished, gen)
+                ),
+                on_output_transcript=(
+                    lambda text, finished, gen=generation:
+                    self._live_output_transcript(text, finished, gen)
+                ),
+                on_audio_level=(
+                    lambda level, gen=generation:
+                    self.audioLevelRequested.emit(level)
+                    if self._live_generation_current(gen) else None
+                ),
+                on_error=lambda text, gen=generation: self._live_error(text, gen),
+                on_stopped=lambda text, gen=generation: self._live_stopped(text, gen),
+                on_tool=lambda name, args, gen=generation: self._live_tool_for_generation(gen, name, args),
+            )
+            live = GeminiLiveCompanion(callbacks)
+            self._live = live
+            if live.start():
+                self._live_cancel.clear()
+                self._reset_live_buffers()
+                self._set_live_owns_bubble(True)
+                self.cursorStateRequested.emit("listening")
+                self._set_label("Starting Gemini Live...", source="live_status", force=True)
+            else:
+                self._live = None
+                self._set_live_owns_bubble(False)
+        except Exception as exc:
+            self._live = None
+            self._set_live_owns_bubble(False)
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Gemini Live unavailable", source="live_error", force=True)
+            print(f"[clicky] Gemini Live unavailable: {exc}", flush=True)
+
+    def _live_status(self, text: str, generation: int | None = None) -> None:
+        if not self._live_generation_current(generation):
+            return
+        msg = _clean_live_status(text) or "Gemini Live"
+        if msg == "Live tool call failed":
+            self.cursorStateRequested.emit("thinking")
+            self._set_label(msg, source="live_tool", force=True)
+            return
+        if "listening" in msg.lower():
+            self.cursorStateRequested.emit("listening")
+        self._set_label(_short(msg, 150), source="live_status")
+
+    def _live_input_transcript(self, text: str, finished: bool, generation: int | None = None) -> None:
+        if not self._live_generation_current(generation):
+            return
+        chunk = text or ""
+        if not chunk and not finished:
+            return
+        if self._live_input_done:
+            self._live_input_buffer = ""
+            self._live_input_done = False
+        self._live_input_buffer = _merge_streamed_text(self._live_input_buffer, chunk)
+        heard = _short(_strip_markdown(self._live_input_buffer).strip(), 150)
+        if heard:
+            prefix = "Heard: " if finished else "Hearing: "
+            self.cursorStateRequested.emit("listening")
+            self._set_label(prefix + heard, source="live_input", force=True)
+        if finished:
+            self._live_input_done = True
+            self._live_reply_done = True
+
+    def _live_output_transcript(self, text: str, finished: bool, generation: int | None = None) -> None:
+        if not self._live_generation_current(generation):
+            return
+        # Gemini sends the spoken reply as incremental chunks. Append them so the
+        # bubble shows the growing sentence, not one flashing word at a time.
+        chunk = text or ""
+        if finished and not chunk:
+            self._live_reply_done = True
+            self.cursorStateRequested.emit("listening")
+            return
+        if self._live_reply_done:
+            self._live_reply_buffer = ""
+            self._live_reply_done = False
+        self._live_reply_buffer = _merge_streamed_text(self._live_reply_buffer, chunk)
+        display = _short(_strip_markdown(self._live_reply_buffer).strip(), 220)
+        if display:
+            self.cursorStateRequested.emit("thinking")
+            self._set_label(display, source="live_reply", force=True)
+        if finished:
+            self._live_reply_done = True
+            self.cursorStateRequested.emit("listening")
+
+    def _live_error(self, text: str, generation: int | None = None) -> None:
+        if not self._live_generation_current(generation):
+            return
+        self.cursorStateRequested.emit("idle")
+        self._live_cancel.set()
+        self._live_error_generation = generation if generation is not None else self._live_generation
+        self._live = None
+        self._set_live_owns_bubble(False)
+        self._set_label(_short(text or "Gemini Live error", 180), source="live_error", force=True)
+
+    def _live_stopped(self, text: str = "", generation: int | None = None) -> None:
+        if not self._live_generation_current(generation):
+            return
+        current_generation = generation if generation is not None else self._live_generation
+        self.cursorStateRequested.emit("idle")
+        self._reset_live_buffers()
+        self._live = None
+        self._set_live_owns_bubble(False)
+        if self._live_error_generation == current_generation:
+            self._live_error_generation = None
+            return
+        self._set_label(_short(text or "Gemini Live stopped", 120), source="live_stop", force=True)
+
+    def _live_desktop_tools(self) -> Any:
+        tools = self._desktop_tools
+        if tools is not None:
+            return tools
+        from app.tools import ToolExecutor
+
+        raw = os.getenv("ORYNN_WORKSPACE") or os.getenv("AI_COMPUTER_WORKSPACE")
+        workspace = Path(raw).expanduser() if raw else Path(__file__).resolve().parents[2]
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._desktop_tools = ToolExecutor(workspace)
+        return self._desktop_tools
+
+    @staticmethod
+    def _live_float(value: Any, default: float, low: float, high: float) -> float:
+        try:
+            parsed = float(value)
+        except Exception:
+            parsed = default
+        return max(low, min(high, parsed))
+
+    @staticmethod
+    def _live_int(value: Any, default: int, low: int, high: int) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            parsed = default
+        return max(low, min(high, parsed))
+
+    @staticmethod
+    def _live_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _normalize_keys(keys: Any) -> str:
+        aliases = {
+            "control": "ctrl",
+            "ctl": "ctrl",
+            "windows": "win",
+            "window": "win",
+            "cmd": "win",
+            "command": "win",
+            "spacebar": "space",
+        }
+        order = {"ctrl": 0, "shift": 1, "alt": 2, "win": 3}
+        parts = [
+            aliases.get(p.strip().lower(), p.strip().lower())
+            for p in str(keys or "").split("+")
+            if p.strip()
+        ]
+        parts = sorted(dict.fromkeys(parts), key=lambda p: (order.get(p, 10), p))
+        return "+".join(parts)
+
+    @classmethod
+    def _live_keys_allowed(cls, keys: Any) -> bool:
+        normalized = cls._normalize_keys(keys)
+        if not normalized:
+            return False
+        blocked = set(LIVE_BLOCKED_KEY_COMBOS)
+        for env_name in ("ORYNN_LIVE_KEY", "ORYNN_STOP_KEY", "ORYNN_PTT_KEY"):
+            env_combo = cls._normalize_keys(os.getenv(env_name) or "")
+            if env_combo:
+                blocked.add(env_combo)
+        if normalized in blocked:
+            return False
+        parts = set(normalized.split("+"))
+        if {"delete", "del"} & parts:
+            return False
+        if not re.fullmatch(r"[a-z0-9_+\- ]+", normalized):
+            return False
+        return True
+
+    @staticmethod
+    def _compact_live_tool_data(data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            return {}
+        keep: dict[str, Any] = {}
+        for key in (
+            "items",
+            "controls",
+            "count",
+            "target",
+            "method",
+            "verified",
+            "title",
+            "hwnd",
+            "pid",
+            "summary",
+            "next_tools",
+            "error",
+        ):
+            if key in data:
+                keep[key] = data[key]
+        try:
+            encoded = json.dumps(keep, default=str)
+        except Exception:
+            return {"summary": _short(str(keep), 1800)}
+        if len(encoded) > 1800:
+            return {"summary": _short(encoded, 1800), "truncated": True}
+        return keep
+
+    def _emit_live_tool_overlay(self, data: Any, ok: bool) -> None:
+        if not isinstance(data, dict):
+            return
+        overlay = data.get("overlay")
+        if not isinstance(overlay, dict):
+            return
+        event = {"type": "action_result", "ok": ok, "overlay": overlay}
+        if self._overlay_is_drawable(event):
+            self.overlayActionRequested.emit(event)
+
+    @staticmethod
+    def _live_tool_target(data: Any) -> str:
+        if not isinstance(data, dict):
+            return ""
+        overlay = data.get("overlay")
+        if isinstance(overlay, dict):
+            target = _clean_text(overlay.get("target") or "")
+            if target:
+                return target
+        for key in ("target", "title", "name", "automation_id"):
+            target = _clean_text(data.get(key) or "")
+            if target:
+                return target
+        items = data.get("items")
+        if isinstance(items, list) and items:
+            first = items[0]
+            if isinstance(first, dict):
+                for key in ("name", "automation_id"):
+                    target = _clean_text(first.get(key) or "")
+                    if target:
+                        return target
+        return ""
+
+    @staticmethod
+    def _live_tool_graph_count(data: Any) -> int | None:
+        if not isinstance(data, dict):
+            return None
+        graph = data.get("graph")
+        if not isinstance(graph, dict):
+            return None
+        try:
+            count = int(graph.get("named_control_count"))
+        except Exception:
+            return None
+        return count if count >= 0 else None
+
+    @staticmethod
+    def _live_tool_title_from_output(output: str) -> str:
+        match = re.search(r"(?:Focused window|Window ready):\s*'([^']+)'", output or "")
+        return _clean_text(match.group(1)) if match else ""
+
+    def _live_tool_display_label(self, action: str, ok: bool, output: str, data: Any) -> str:
+        if not ok:
+            return _short(output or "Action failed", 120)
+
+        target = self._live_tool_target(data)
+        if action in {"wait_for_window", "focus_window"} and not target:
+            target = self._live_tool_title_from_output(output)
+
+        if action == "wait_for_window":
+            return f"Window ready: {_short(target, 70)}" if target else "Window ready"
+        if action == "focus_window":
+            return f"Focused: {_short(target, 70)}" if target else "Focused app"
+        if action == "observe":
+            count = self._live_tool_graph_count(data)
+            return f"Mapped {count} controls" if count is not None else "Read app controls"
+        if action == "find":
+            return f"Found {_short(target, 80)}" if target else "Found control"
+        if action == "wait":
+            return f"Control ready: {_short(target, 80)}" if target else "Control ready"
+        if action == "click":
+            return f"Clicked {_short(target, 80)}" if target else "Clicked control"
+        if action == "type":
+            return f"Typed into {_short(target, 80)}" if target else "Typed into control"
+        if action == "press_keys":
+            return "Pressed shortcut"
+        return "Done"
+
+    def _live_tool_result(self, action: str, result: Any) -> dict[str, Any]:
+        ok = bool(getattr(result, "ok", False))
+        output = _clean_text(getattr(result, "output", "") or "")
+        data = getattr(result, "data", None)
+        self._emit_live_tool_overlay(data, ok)
+        label = self._live_tool_display_label(action, ok, output, data)
+        self._set_label(_short(label, 150), source="live_tool", force=True)
+        self.cursorStateRequested.emit("thinking")
+        response: dict[str, Any] = {
+            "ok": ok,
+            "action": action,
+            "output": _short(output, 1200),
+        }
+        compact = self._compact_live_tool_data(data)
+        if compact:
+            response["data"] = compact
+        return response
+
+    def _live_cancel_requested(self) -> bool:
+        if self._stop.is_set() or self._live_cancel.is_set():
+            return True
+        live = self._live
+        try:
+            if live is not None and hasattr(live, "stop_requested"):
+                return bool(live.stop_requested())
+        except Exception:
+            pass
+        return False
+
+    def _raise_if_live_cancelled(self) -> None:
+        if self._live_cancel_requested():
+            raise InterruptedError("Gemini Live was stopped.")
+
+    def _run_live_interruptible_wait(self, runner: Any, timeout: float) -> Any:
+        deadline = time.monotonic() + max(0.1, float(timeout))
+        last_result = None
+        while True:
+            self._raise_if_live_cancelled()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return last_result
+            result = runner(min(0.45, max(0.1, remaining)))
+            self._raise_if_live_cancelled()
+            if bool(getattr(result, "ok", False)):
+                return result
+            last_result = result
+            output = _clean_text(getattr(result, "output", "") or "").lower()
+            if any(term in output for term in ("only available", "not available", "needs a")):
+                return result
+            if time.monotonic() >= deadline:
+                return result
+
+    def _run_live_desktop_action(self, action: str, args: dict[str, Any]) -> Any:
+        self._raise_if_live_cancelled()
+        tools = self._live_desktop_tools()
+        app = _clean_text(args.get("app") or "")
+        title = _clean_text(args.get("title") or app)
+        query = _clean_text(args.get("query") or "")
+        timeout = self._live_float(args.get("timeout"), 6.0, 0.5, 10.0)
+        limit = self._live_int(args.get("limit"), 5, 1, 10)
+        cap = self._live_int(args.get("cap"), 90, 20, 220)
+
+        if action == "wait_for_window":
+            if not title:
+                raise ValueError("Missing title or app for wait_for_window.")
+            return self._run_live_interruptible_wait(
+                lambda step_timeout: tools.wait_for_window(
+                    title,
+                    timeout=step_timeout,
+                    paint_seconds=0.05,
+                ),
+                timeout,
+            )
+        if action == "focus_window":
+            if not title:
+                raise ValueError("Missing title or app for focus_window.")
+            result = tools.focus_window(title)
+            self._raise_if_live_cancelled()
+            return result
+        if action == "observe":
+            result = tools.adaptive_observe(app, cap=cap)
+            self._raise_if_live_cancelled()
+            return result
+        if action == "find":
+            if not query:
+                raise ValueError("Missing query for find.")
+            result = tools.uia_find(query, app, limit=limit)
+            self._raise_if_live_cancelled()
+            return result
+        if action == "wait":
+            if not query:
+                raise ValueError("Missing query for wait.")
+            return self._run_live_interruptible_wait(
+                lambda step_timeout: tools.uia_wait(query, app, timeout=step_timeout),
+                timeout,
+            )
+        if action == "click":
+            if not query:
+                raise ValueError("Missing query for click.")
+            result = tools.uia_click(query, app)
+            self._raise_if_live_cancelled()
+            return result
+        if action == "type":
+            if not query:
+                raise ValueError("Missing query for type.")
+            text = str(args.get("text") or "")
+            if not text.strip():
+                raise ValueError("Missing text for type.")
+            result = tools.uia_type(
+                query,
+                text,
+                app,
+                clear_first=self._live_bool(args.get("clear_first")),
+                submit=self._live_bool(args.get("submit")),
+            )
+            self._raise_if_live_cancelled()
+            return result
+        if action == "press_keys":
+            keys = _clean_text(args.get("keys") or "")
+            if not self._live_keys_allowed(keys):
+                raise ValueError("That keyboard shortcut is not allowed from Live.")
+            if app:
+                focused = tools.focus_window(app)
+                self._raise_if_live_cancelled()
+                if not bool(getattr(focused, "ok", False)):
+                    return focused
+            result = tools.key(keys)
+            self._raise_if_live_cancelled()
+            return result
+        raise ValueError(f"Unsupported desktop action: {action}")
+
+    def _live_desktop_control(self, args: dict[str, Any]) -> dict[str, Any]:
+        action = _clean_text(args.get("action") or "").lower().replace("-", "_")
+        if action not in LIVE_DESKTOP_ACTIONS:
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Unsupported desktop action", source="live_tool", force=True)
+            return {"ok": False, "message": f"Unknown desktop action: {action or '(missing)'}"}
+        self.cursorStateRequested.emit("thinking")
+        self._set_label(LIVE_DESKTOP_ACTION_LABELS[action], source="live_tool", force=True)
+        try:
+            result = self._run_live_desktop_action(action, args)
+            return self._live_tool_result(action, result)
+        except InterruptedError as exc:
+            message = str(exc)[:200] or "Gemini Live was stopped."
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Stopped", source="live_stop", force=True)
+            return {"ok": False, "action": action, "message": message}
+        except Exception as exc:
+            message = str(exc)[:200] or "Desktop action failed."
+            self.cursorStateRequested.emit("thinking")
+            self._set_label(_short(message, 150), source="live_tool", force=True)
+            return {"ok": False, "action": action, "message": message}
+
+    def _live_tool_for_generation(self, generation: int, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if not self._live_generation_current(generation):
+            return {"ok": False, "message": "Gemini Live session changed."}
+        return self._live_tool(name, args)
+
+    def _live_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
+        name = str(name or "")
+        args = args if isinstance(args, dict) else {}
+        if name == "desktop_control":
+            return self._live_desktop_control(args)
+        if name == "start_desktop_task":
+            return self._live_start_desktop_task(args)
+        if name == "stop_current_task":
+            try:
+                stopped = self._kill_active_tasks()
+            except Exception as exc:
+                return {"ok": False, "message": str(exc)[:200]}
+            self.cursorStateRequested.emit("idle")
+            self._active_task_running = False
+            self._set_label("Stopped", source="live_stop", force=True)
+            return {"ok": True, "stopped": stopped, "message": "Stop request accepted."}
+        if name == "get_companion_status":
+            try:
+                data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
+                tasks = data.get("tasks", []) if isinstance(data, dict) else []
+                return {"ok": True, "active_tasks": len(tasks)}
+            except Exception as exc:
+                return {"ok": False, "message": str(exc)[:200]}
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Unsupported Live tool", source="live_tool", force=True)
+        return {"ok": False, "message": f"Unknown tool: {name}"}
+
+    def _live_start_desktop_task(self, args: dict[str, Any]) -> dict[str, Any]:
+        goal = _clean_text(args.get("goal") or "")
+        if not goal:
+            return {"ok": False, "message": "Missing goal."}
+        payload = build_task_payload(goal)
+        task_id = str(payload.get("task_id") or "")
+        try:
+            preflight = self.client.request(
+                "POST",
+                "/api/tasks/preflight",
+                {
+                    "goal": payload.get("goal", ""),
+                    "mode": payload.get("mode", "auto"),
+                    "model": payload.get("model"),
+                    "isolated_app": payload.get("isolated_app"),
+                },
+                timeout=10.0,
+            )
+            if isinstance(preflight, dict):
+                if preflight.get("blocked"):
+                    self.cursorStateRequested.emit("idle")
+                    self._set_label("Setup needed", source="live_tool", force=True)
+                    return {"ok": False, "message": "Setup needed before task can run."}
+                if preflight.get("can_override") and preflight.get("issues"):
+                    payload["readiness_override"] = True
+            self.client.request("POST", "/api/tasks", payload, timeout=20.0)
+            self._active_task_running = True
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Started: " + _short(goal, 120), source="live_tool", force=True)
+            return {
+                "ok": True,
+                "task_id": task_id,
+                "message": "Orynn started the desktop task.",
+            }
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")[:200]
+            self.cursorStateRequested.emit("idle")
+            self._set_label(_short(body or "Couldn't start task"), source="live_error", force=True)
+            return {"ok": False, "message": body or "Couldn't start task"}
+        except Exception as exc:
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Couldn't start task", source="live_error", force=True)
+            return {"ok": False, "message": str(exc)[:200]}
 
     def _load_preferences_async(self) -> None:
         def run() -> None:
@@ -224,6 +1308,11 @@ class OverlayController(QObject):
                 if isinstance(saved, dict):
                     self._speak_replies = bool(
                         saved.get("speak_replies") or self._speak_replies
+                    )
+                    # Reuse the existing "show action glow" preference to gate the
+                    # whole flying-cursor effect set (default on).
+                    self._effects_enabled = bool(
+                        saved.get("show_action_glow", True)
                     )
             except Exception:
                 pass
@@ -251,17 +1340,32 @@ class OverlayController(QObject):
                         )
                     except Exception:
                         pass
-                    label = self._label_for_event(ev)
-                    if label:
-                        self.labelRequested.emit(label)
+                    # Drive the flying cursor / focus rings from action geometry.
+                    # When an event carries a drawable overlay, the show_* call
+                    # also sets a clean action label, so skip the label path to
+                    # avoid a blank action_result overriding it.
+                    dispatched = False
+                    if (self._effects_enabled and self._overlay is not None
+                            and self._overlay_is_drawable(ev)):
+                        self.overlayActionRequested.emit(ev)
+                        dispatched = True
                         idle_label_shown = True
-                    self._maybe_speak_final(ev)
+                    if not dispatched:
+                        label = self._label_for_event(ev)
+                        if label:
+                            self._set_label(label, source=self._label_source_for_event(ev))
+                            idle_label_shown = True
+                    self._update_cursor_state_from_event(ev)
+                    self._maybe_finalize(ev)
                 if not idle_label_shown:
                     self._prime_from_active_task()
                     idle_label_shown = True
+                # The bubble collapses itself to the resting orb ~10s after the
+                # last activity (handled in the overlay's morph), so no explicit
+                # "revert to ready" is needed here.
             except Exception:
                 if not idle_label_shown:
-                    self.labelRequested.emit("Waiting for Orynn")
+                    self._set_label("Waiting for Orynn", source="system_wait")
                     idle_label_shown = True
             self._stop.wait(0.45)
 
@@ -269,27 +1373,130 @@ class OverlayController(QObject):
         try:
             data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
             tasks = data.get("tasks", []) if isinstance(data, dict) else []
-            if not tasks:
-                return
-            tasks = [task for task in tasks if isinstance(task, dict)]
-            tasks.sort(key=lambda task: str(task.get("created_at") or ""))
-            task = tasks[-1]
-            goal = _strip_hardening(str(task.get("goal") or "Working"))
-            self.labelRequested.emit("Working: " + _short(goal, 42))
+            if tasks:
+                self._set_label(_thinking_word(), source="task_prime")
         except Exception:
             pass
+
+    # ── Flying-cursor dispatch (runs on the poll thread; only reads dicts) ────
+    @staticmethod
+    def _overlay_is_drawable(ev: dict[str, Any]) -> bool:
+        ov = ev.get("overlay")
+        if not isinstance(ov, dict):
+            return False
+        otype = str(ov.get("type") or "").lower()
+        if otype == "uia_control":
+            return isinstance(ov.get("rect"), dict)
+        if otype == "app_focus":
+            return isinstance(ov.get("app_rect"), dict) or isinstance(ov.get("rect"), dict)
+        if otype == "point":
+            return isinstance(ov.get("point"), dict)
+        return False
+
+    def _update_cursor_state_from_event(self, ev: dict[str, Any]) -> None:
+        t = str(ev.get("type") or "")
+        if t == "task_created":
+            self._active_task_running = True
+        elif t in ("done", "complete", "error", "failed", "cancelled"):
+            self._active_task_running = False
+        else:
+            return
+        # While Gemini Live drives, it owns the cursor state the same way it owns
+        # the bubble text: a task it spawned must not flip the cursor to idle (or
+        # thinking) underneath the live conversation — that's the cursor analog of
+        # the textbox flashing. Live's own transcripts manage its cursor state.
+        if self._live_is_running():
+            return
+        if t == "task_created":
+            self.cursorStateRequested.emit("thinking")
+        else:
+            self.cursorStateRequested.emit("idle")
+
+    # ── GUI-thread handlers (driven by cross-thread signals) ─────────────────
+    def _on_cursor_state(self, state: str) -> None:
+        if self._overlay is not None and hasattr(self._overlay, "set_cursor_state"):
+            try:
+                self._overlay.set_cursor_state(state)
+            except Exception:
+                pass
+
+    def _on_overlay_action(self, ev: dict[str, Any]) -> None:
+        """Translate an event's overlay geometry into a cursor animation. Runs on
+        the GUI thread (connected via a queued signal). Mirrors the capsule's
+        _apply_overlay so the default mode gets the same fly-to-target visuals."""
+        overlay = self._overlay
+        if overlay is None:
+            return
+        ov = ev.get("overlay")
+        if not isinstance(ov, dict):
+            return
+        label = _strip_markdown(str(ov.get("label") or "").strip())
+        otype = str(ov.get("type") or "").lower()
+        kind = str(ov.get("kind") or "").lower()
+
+        def rect_from(key: str):
+            r = ov.get(key)
+            if not isinstance(r, dict):
+                return None
+            try:
+                l, t = int(r.get("left", 0)), int(r.get("top", 0))
+                w, h = int(r.get("width", 0)), int(r.get("height", 0))
+                if w > 0 and h > 0:
+                    return l, t, w, h
+            except Exception:
+                return None
+            return None
+
+        try:
+            if otype == "uia_control":
+                rect = rect_from("rect")
+                if rect:
+                    app_rect = rect_from("app_rect")
+                    if app_rect:
+                        overlay.show_app_focus(*app_rect, label=label)
+                    overlay.show_uia(*rect, label=label, kind=kind or "find")
+                    return
+            if otype == "app_focus":
+                rect = rect_from("app_rect") or rect_from("rect")
+                if rect:
+                    overlay.show_app_focus(*rect, label=label)
+                    return
+            if otype == "point":
+                pt = ov.get("point")
+                if isinstance(pt, dict):
+                    x, y = int(pt.get("x", 0)), int(pt.get("y", 0))
+                    if kind in ("click", "double_click"):
+                        overlay.show_click(x, y, label=label or "Clicking")
+                    elif kind == "drag":
+                        overlay.show_click(x, y, label=label or "Dragging")
+                    elif kind == "type":
+                        overlay.show_type(x, y, text=label or "Typing")
+                    else:
+                        overlay.show_action(label or "Thinking", x, y)
+        except Exception as exc:
+            print(f"[clicky] overlay action error: {exc}", flush=True)
+
+    @staticmethod
+    def _label_source_for_event(ev: dict[str, Any]) -> str:
+        event_type = str(ev.get("type") or "")
+        if event_type in {"status", "provider_info", "task_created", "queued"}:
+            return "task_status"
+        if event_type in {"done", "complete", "error", "failed", "cancelled"}:
+            return "task_result"
+        if event_type in {"action_start", "action_result", "control_profile", "tool", "file_change"}:
+            return "task_action"
+        return "task_status"
 
     def _label_for_event(self, ev: dict[str, Any]) -> str:
         event_type = str(ev.get("type") or "")
         if event_type == "status":
             if ev.get("heartbeat"):
                 return ""
-            return _short(ev.get("message") or "Working")
+            return _short(_humanize_status(ev.get("message") or "Thinking"))
         if event_type == "provider_info" and ev.get("retrying"):
             return _short(ev.get("message") or "Waiting on model")
         if event_type == "task_created":
-            goal = _strip_hardening(str(ev.get("goal") or ""))
-            return "Started: " + _short(goal, 45) if goal else "Started task"
+            return _thinking_word()
         if event_type == "queued":
             return "Queued behind another task"
         if event_type == "control_profile":
@@ -314,36 +1521,38 @@ class OverlayController(QObject):
             path = ev.get("path") or ev.get("file") or ev.get("filename")
             return "Edited " + _short(path, 45) if path else "Edited file"
         if event_type == "agent":
-            text = ev.get("text") or ""
-            first_sentence = re.split(r"(?<=[.!?])\s+", str(text), maxsplit=1)[0]
-            return _short(first_sentence)
+            # Intermediate model reasoning/planning ("STEP 3 of 6…", "PLAN: …",
+            # "Use uiawait for…") — internal chain-of-thought, not a user-facing
+            # message. Keep it out of the bubble: the final answer arrives via the
+            # "done" event, and live progress shows via status + action labels.
+            return ""
         if event_type in {"approval_required", "permission_required"}:
             return "Needs approval"
         if event_type in {"approval_timeout", "permission_timeout"}:
             return "Approval timed out"
         if event_type in {"done", "complete"}:
-            return _short(ev.get("reason") or "Done")
+            return _short(_strip_markdown(ev.get("reason") or "Done"), 200)
         if event_type in {"error", "failed"}:
-            return _short(ev.get("reason") or ev.get("message") or "Task failed")
+            return _short(_strip_markdown(ev.get("reason") or ev.get("message") or "Task failed"))
         if event_type == "cancelled":
             return "Cancelled"
         return ""
 
-    def _maybe_speak_final(self, ev: dict[str, Any]) -> None:
-        if not self._speak_replies:
-            return
-        if ev.get("type") not in {"done", "complete"}:
+    def _maybe_finalize(self, ev: dict[str, Any]) -> None:
+        """On a terminal event, play a soft done/fail chime for voice-initiated
+        tasks. (Spoken replies were removed — the answer shows in the bubble.)"""
+        et = ev.get("type")
+        if et not in {"done", "complete", "error", "failed"}:
             return
         task_id = str(ev.get("task_id") or "")
         if task_id not in self._voice_task_ids:
             return
-        text = _short(ev.get("reason") or "Done", 160)
         try:
             from . import voice
-
-            voice.speak(text)
+            voice.cue("fail" if et in {"error", "failed"} else "done")
         except Exception:
             pass
+        self._voice_task_ids.discard(task_id)
 
     def listen_once(self) -> None:
         threading.Thread(target=self._listen_worker, daemon=True).start()
@@ -352,28 +1561,37 @@ class OverlayController(QObject):
         try:
             from . import voice
         except Exception:
-            self.labelRequested.emit("Voice unavailable")
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Voice unavailable", source="voice", force=True)
             return
 
         if not voice.stt_available():
-            self.labelRequested.emit("Voice unavailable")
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Voice unavailable", source="voice", force=True)
             return
 
-        self.labelRequested.emit("Listening...")
+        voice.cue("start")
+        self.cursorStateRequested.emit("listening")
+        self._set_label("Listening...", source="voice", force=True)
         try:
             transcript = voice.listen(timeout=8.0)
         except Exception:
             transcript = ""
         transcript = _clean_text(transcript)
         if not transcript:
-            self.labelRequested.emit("Didn't catch that")
+            voice.cue("error")
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Didn't catch that", source="voice", force=True)
             return
-        self.labelRequested.emit("Heard: " + _short(transcript, 44))
+        voice.cue("stop")
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Heard: " + _short(transcript, 150), source="voice", force=True)
         self._submit_voice_task(transcript)
 
     def _submit_voice_task(self, transcript: str) -> None:
         payload = build_task_payload(transcript)
         task_id = str(payload.get("task_id") or "")
+        self.cursorStateRequested.emit("thinking")
         try:
             preflight = self.client.request(
                 "POST",
@@ -388,19 +1606,22 @@ class OverlayController(QObject):
             )
             if isinstance(preflight, dict):
                 if preflight.get("blocked"):
-                    self.labelRequested.emit("Setup needed")
+                    self.cursorStateRequested.emit("idle")
+                    self._set_label("Setup needed", source="voice", force=True)
                     return
                 if preflight.get("can_override") and preflight.get("issues"):
                     payload["readiness_override"] = True
             self.client.request("POST", "/api/tasks", payload, timeout=20.0)
             if task_id:
                 self._voice_task_ids.add(task_id)
-            self.labelRequested.emit("Working in background")
+            self._set_label(_thinking_word(), source="voice", force=True)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:180]
-            self.labelRequested.emit(_short(body or "Couldn't start task"))
+            self.cursorStateRequested.emit("idle")
+            self._set_label(_short(body or "Couldn't start task"), source="voice", force=True)
         except Exception:
-            self.labelRequested.emit("Couldn't start task")
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Couldn't start task", source="voice", force=True)
 
 
 def _app_icon() -> QIcon:
@@ -408,8 +1629,22 @@ def _app_icon() -> QIcon:
     for name in ("app_icon.ico", "orynn_app_icon.png"):
         path = root / name
         if path.exists():
-            return QIcon(str(path))
-    return QIcon()
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(QColor(0, 0, 0, 0))
+    painter = QPainter(pixmap)
+    try:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QColor("#e8f5ff"))
+        painter.setBrush(QColor("#2563eb"))
+        painter.drawEllipse(3, 3, 26, 26)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, "O")
+    finally:
+        painter.end()
+    return QIcon(pixmap)
 
 
 def _install_tray(app: QApplication, controller: OverlayController) -> QSystemTrayIcon | None:
@@ -420,9 +1655,12 @@ def _install_tray(app: QApplication, controller: OverlayController) -> QSystemTr
     menu = QMenu()
     listen = QAction("Listen now", menu)
     listen.triggered.connect(controller.listenRequested.emit)
+    live = QAction("Toggle Gemini Live", menu)
+    live.triggered.connect(controller._toggle_live)
     quit_action = QAction("Quit textbox", menu)
     quit_action.triggered.connect(app.quit)
     menu.addAction(listen)
+    menu.addAction(live)
     menu.addSeparator()
     menu.addAction(quit_action)
     tray.setContextMenu(menu)
@@ -432,7 +1670,7 @@ def _install_tray(app: QApplication, controller: OverlayController) -> QSystemTr
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Orynn mouse textbox overlay.")
-    parser.add_argument("--port", type=int, default=int(os.getenv("ORYNN_PORT", "8000")))
+    parser.add_argument("--port", type=int, default=int(os.getenv("ORYNN_PORT") or "8000"))
     parser.add_argument("--no-hotkey", action="store_true")
     parser.add_argument("--no-tray", action="store_true")
     parser.add_argument("--speak-replies", action="store_true")
@@ -440,6 +1678,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Best-effort: load .env so GROQ_API_KEY is present even when this overlay is
+    # launched standalone (run_desktop already loads it for the spawned child).
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
+    except Exception:
+        pass
+
     args = parse_args(argv)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
@@ -454,6 +1701,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     controller = OverlayController(args.port, speak_replies=speak_replies)
     controller.labelRequested.connect(overlay.set_companion_label)
+    controller.attach_overlay(overlay)  # enable fly-to-target cursor animations
     controller.quitRequested.connect(app.quit)
     app.aboutToQuit.connect(controller.stop)
 
@@ -463,10 +1711,23 @@ def main(argv: list[str] | None = None) -> int:
         if tray is not None:
             # Keep the object alive for the lifetime of the app.
             app._orynn_tray = tray  # type: ignore[attr-defined]
+            controller.set_tray(tray)  # enable completion toasts
 
     hotkey_ready = False if args.no_hotkey else controller.install_hotkey()
     controller.start()
-    overlay.set_companion_label("Orynn ready" if hotkey_ready else "Orynn ready")
+    if hotkey_ready or args.no_hotkey:
+        overlay.set_companion_label("Orynn ready")
+    else:
+        # Global hotkey registration failed (often needs elevation on Windows).
+        # Without it, push-to-talk AND the Gemini Live toggle silently do nothing —
+        # so don't fail quietly: tell the user in the bubble and a tray toast.
+        warn = "Voice keys inactive — try running Orynn as administrator"
+        overlay.set_companion_label(warn)
+        controller.notifyRequested.emit(
+            "Orynn voice keys inactive",
+            "Couldn't register the global hotkeys (Ctrl+Shift+Space to talk, "
+            "Ctrl+Shift+L for Live). Try launching Orynn as administrator.",
+        )
     return int(app.exec())
 
 

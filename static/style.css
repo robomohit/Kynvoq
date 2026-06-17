@@ -4003,7 +4003,13 @@
   body.widget-shell #mcp-overlay { display: none !important; }
   body.widget-shell { margin: 0; padding: 0; overflow: hidden; }
   body.widget-shell #vorb-root {
-    position: fixed; left: 10px; right: 10px; top: 10px; bottom: auto; width: auto;
+    position: fixed;
+    left: 50%;
+    right: auto;
+    top: 10px;
+    bottom: auto;
+    width: min(600px, calc(100vw - 20px));
+    transform: translateX(-50%);
   }
   /* easy_drag handles window dragging on non-interactive areas */
 
@@ -4013,7 +4019,7 @@
      blur and shadow so there is no double outline, and uses a very
      light fill so the acrylic-blurred wallpaper shows through.
      ============================================================ */
-  body.qt-shell #vorb-root { left: 0; right: 0; top: 0; }
+  body.qt-shell #vorb-root { top: 0; width: min(600px, 100vw); }
   body.qt-shell .vcap {
     border: none !important;
     box-shadow: none !important;
@@ -4026,6 +4032,20 @@
   body.qt-shell .vcap-sheen { opacity: .06; }
   body.qt-shell .vcap-reply {
     background: rgba(255,255,255,.07);
+  }
+  @media (max-width: 460px) {
+    body.widget-shell .vcap-row {
+      gap: 8px;
+      padding-left: 14px;
+      padding-right: 8px;
+    }
+    body.widget-shell .vcap-wave {
+      display: none;
+    }
+    body.widget-shell .vcap-btn {
+      width: 38px;
+      height: 38px;
+    }
   }
 
   /* ─────────────────────────────────────────────────────────────

@@ -78,6 +78,7 @@ def _start_backend(preferred_port: int) -> int:
 
 
 def _start_textbox_overlay(port: int) -> subprocess.Popen | None:
+    _stop_existing_textbox_overlays(port)
     cmd = [
         sys.executable,
         "-m",
@@ -103,6 +104,50 @@ def _start_textbox_overlay(port: int) -> subprocess.Popen | None:
     except Exception as exc:
         print(f"[Desktop] Textbox overlay failed to start: {exc}", file=sys.stderr)
         return None
+
+
+def _stop_existing_textbox_overlays(port: int) -> int:
+    """Retire stale textbox overlays before starting a fresh one.
+
+    Re-running the desktop launcher used to stack multiple always-on-top overlay
+    processes. They all listened for the same Live/stop hotkeys and all tried to
+    render status, which made the companion feel flaky. Keep one overlay per
+    backend port.
+    """
+    try:
+        import psutil
+    except Exception:
+        return 0
+    marker = "app.widget.textbox_overlay"
+    wanted_port = str(int(port))
+    victims = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.pid == os.getpid():
+                continue
+            cmdline = [str(part) for part in (proc.info.get("cmdline") or [])]
+            joined = " ".join(cmdline)
+            if marker not in joined:
+                continue
+            if "--port" in cmdline:
+                idx = cmdline.index("--port")
+                if idx + 1 < len(cmdline) and cmdline[idx + 1] != wanted_port:
+                    continue
+            elif wanted_port not in joined:
+                continue
+            proc.terminate()
+            victims.append(proc)
+        except Exception:
+            continue
+    if victims:
+        gone, alive = psutil.wait_procs(victims, timeout=2.0)
+        for proc in alive:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        print(f"[Desktop] Restarted textbox overlay ({len(victims)} stale instance(s) stopped).")
+    return len(victims)
 
 
 def parse_args():

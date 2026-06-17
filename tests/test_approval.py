@@ -5,6 +5,32 @@ from app.agent import AgentService
 from app.models import Action, ActionDecision, ActionType, DangerLevel, ToolError
 from app.log_emitter import log_emitter
 
+def test_autonomous_tasks_bypass_approval(workspace):
+    """Floating-bubble (autonomous) tasks skip approval prompts, except the
+    catastrophic 'Hard-blocked' shell commands which always gate."""
+    s = AgentService(workspace, log_emitter=log_emitter)
+    act = Action(id="x", type=ActionType.mouse_click, args={})
+
+    normal = ActionDecision(danger=DangerLevel.high, reason="filesystem/shell mutation",
+                            requires_approval=True)
+    catastrophic = ActionDecision(danger=DangerLevel.high,
+                                  reason="Hard-blocked dangerous shell command: format c:",
+                                  requires_approval=True)
+
+    # Non-autonomous task: both gate.
+    assert s._approval_gated("t1", act, normal) is True
+    assert s._approval_gated("t1", act, catastrophic) is True
+
+    # Autonomous task: normal actions no longer gate; catastrophic still does.
+    s._approval_bypass_tasks.add("t1")
+    assert s._approval_gated("t1", act, normal) is False
+    assert s._approval_gated("t1", act, catastrophic) is True
+
+    # An action nobody flagged never gates regardless.
+    safe = ActionDecision(danger=DangerLevel.low, reason="safe", requires_approval=False)
+    assert s._approval_gated("t1", act, safe) is False
+
+
 @pytest.mark.asyncio
 async def test_approval_flow(monkeypatch, workspace):
     s = AgentService(workspace, log_emitter=log_emitter)

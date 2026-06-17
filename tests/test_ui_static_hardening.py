@@ -987,7 +987,11 @@ def test_clicky_textbox_overlay_is_click_through_and_event_driven():
     assert "_companion_display_pos = self._companion_cursor_target()" in overlay
     assert "_companion_vel = QPointF(0, 0)" in overlay
     assert "self._companion_vel = QPointF(" in overlay
-    assert "box_x = cx + 10" in overlay and "box_y = cy + 18 - th / 2" in overlay
+    # Bubble anchors near the cursor and grows to fit word-wrapped text
+    # (Clicky-style response overlay), rather than a fixed single-line pill.
+    assert "box_x = cx" in overlay and "box_y = cy" in overlay
+    assert "COMPANION_MAX_TEXT_WIDTH" in overlay
+    assert "TextWordWrap" in overlay
     assert "self._companion_bubble_scale += (" in overlay
     assert "set_companion_enabled" in overlay
     assert "set_companion_label" in overlay
@@ -995,7 +999,11 @@ def test_clicky_textbox_overlay_is_click_through_and_event_driven():
     assert "_paint_companion_cursor" not in overlay
     assert "COMPANION_ROTATION_DEG" not in overlay
     assert "QColor(0x33, 0x80, 0xFF)" in overlay
-    assert "set_companion_label(label or f\"UIA {kind}\")" in overlay
+    # Cursor-action feedback routes through the lock-aware helper so it can't flash
+    # the bubble while Gemini Live owns the text; the authoritative setter remains.
+    assert "_action_companion_label(label or f\"UIA {kind}\")" in overlay
+    assert "def set_companion_text_locked(self, locked: bool)" in overlay
+    assert "if self._companion_text_locked:" in overlay
 
     assert "VirtualCursorOverlay()" in textbox
     assert "set_companion_enabled(True, \"Orynn ready\")" in textbox
@@ -1003,10 +1011,12 @@ def test_clicky_textbox_overlay_is_click_through_and_event_driven():
     assert "/api/active-tasks" in textbox
     assert "keyboard.add_hotkey(\"ctrl+shift+m\"" in textbox
     assert "voice.listen(timeout=8.0)" in textbox
-    assert "voice.speak(text)" in textbox
     assert "build_task_payload" in textbox
     assert "DESKTOP_HARDENING + goal" in textbox
-    assert "\"Working in background\"" in textbox
+    # A failed global-hotkey registration must NOT fail silently — the user is told
+    # in the bubble + a tray toast, not left with a dead push-to-talk/Live key.
+    assert '"Orynn ready" if hotkey_ready else "Orynn ready"' not in textbox
+    assert "Voice keys inactive" in textbox
 
     assert "--capsule" in launcher
     assert "app.widget.textbox_overlay" in launcher
@@ -1042,6 +1052,26 @@ def test_codex_message_actions_and_contextual_suggestions():
     assert "if (picks.length >= 2) break;" in js, "recent suggestions should stay capped"
     assert "if (picks.length < 2) return;" in js, "new-user fallback to examples missing"
     assert ".example-btn.suggestion-recent .sug-text" in css, "recent-chip text style missing"
+
+
+def test_widget_shell_task_stream_lifecycle_is_hardened():
+    """The floating capsule should run as an autonomous surface and never leave
+    stale SSE reconnect loops behind after recovery or failed task creation."""
+    js = (_STATIC / "app.js").read_text(encoding="utf-8", errors="replace")
+    css = (_STATIC / "style.css").read_text(encoding="utf-8", errors="replace")
+
+    open_stream = js[js.index("const openStream ="):js.index("  // Gather the prior conversation")]
+    assert "clearReconnectTimer();\n    if (sse) { sse.close(); sse = null; }" in open_stream
+    assert "clearReconnectTimer();\n      reconnectAttempts = 0;" in open_stream
+
+    assert (
+        "autonomy_level: document.body.classList.contains('widget-shell') "
+        "? 'autonomous' : ($('autonomy-level')?.value || 'careful')"
+    ) in js
+    assert "markHistoryFinal('failed');\n      stopEverything();" in js
+    assert "width: min(600px, calc(100vw - 20px));" in css
+    assert "body.qt-shell #vorb-root { top: 0; width: min(600px, 100vw); }" in css
+    assert "@media (max-width: 460px)" in css and "body.widget-shell .vcap-wave {\n      display: none;" in css
 
 
 def test_professional_motion_and_keyboard_focus():

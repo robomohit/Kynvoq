@@ -49,7 +49,7 @@ def _load_or_create_api_key() -> str:
 API_KEY = _load_or_create_api_key()
 print(f"[Orynn] Agent API key configured: {bool(API_KEY)}", flush=True)
 SESSION_COOKIE_NAME = "orynn_session"
-SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "43200"))
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS") or "43200")
 _sessions: Dict[str, datetime] = {}
 
 from contextlib import asynccontextmanager
@@ -691,7 +691,7 @@ from pydantic import BaseModel, Field
 
 class TaskIn(BaseModel):
     task_id: str = Field(..., min_length=1, max_length=128, pattern=TASK_ID_PATTERN)
-    goal: str = Field(..., min_length=1, max_length=2000)
+    goal: str = Field(..., min_length=1, max_length=8000)  # voice/computer tasks prepend the ~1.7KB desktop-hardening system prompt to the goal; stays under the 10KB request guard
     model: Optional[str] = None  # None = auto-pick from available keys
     mode: Literal["auto", "coding", "computer", "computer_use", "computer_isolated", "explain"] = "auto"
     screen_width: int = 1280
@@ -702,7 +702,7 @@ class TaskIn(BaseModel):
     plan_first: bool = False
     notify_on_completion: bool = False
     auto_commit: bool = False
-    autonomy_level: Literal["careful", "balanced", "fast"] = "balanced"
+    autonomy_level: Literal["careful", "balanced", "fast", "autonomous"] = "balanced"
     thinking_budget: Literal["off", "standard", "extended"] = "off"
     readiness_override: bool = False
     # Prior conversation turns ([{role: "user"|"assistant", content}]) so a
@@ -711,7 +711,7 @@ class TaskIn(BaseModel):
 
 
 class TaskPreflightIn(BaseModel):
-    goal: str = Field(..., min_length=1, max_length=2000)
+    goal: str = Field(..., min_length=1, max_length=8000)  # voice/computer tasks prepend the ~1.7KB desktop-hardening system prompt to the goal; stays under the 10KB request guard
     model: Optional[str] = None
     mode: Literal["auto", "coding", "computer", "computer_use", "computer_isolated", "explain"] = "auto"
     isolated_app: Optional[str] = None
@@ -1273,7 +1273,7 @@ def _submit_managed_task(
     plan_first: bool = False,
     notify_on_completion: bool = False,
     auto_commit: bool = False,
-    autonomy_level: Literal["careful", "balanced", "fast"] = "balanced",
+    autonomy_level: Literal["careful", "balanced", "fast", "autonomous"] = "balanced",
     thinking_budget: Literal["off", "standard", "extended"] = "off",
     readiness_override: bool = False,
 ) -> TaskRecord:

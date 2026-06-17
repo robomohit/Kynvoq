@@ -90,3 +90,7 @@ static/_*.html
 
 # UI audit scratch (before/after + third-party reference shots — not shipped)
 docs/ui_audit/
+
+# Trash artifacts (app-generated cleanup state, not source)
+.trash/
+capsule_trash_manifest.json

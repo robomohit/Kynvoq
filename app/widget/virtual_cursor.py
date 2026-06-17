@@ -19,6 +19,7 @@ forwards mouse_click / keyboard_type to this overlay.
 from __future__ import annotations
 
 import math
+import os
 import re
 
 from PySide6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QTimer,
@@ -31,11 +32,21 @@ from PySide6.QtWidgets import QWidget
 
 # Tunable look
 RIPPLE_COLOR = QColor(91, 224, 208)        # accent teal
-COMPANION_BLUE = QColor(0x33, 0x80, 0xFF)  # Clicky-style status bubble
+COMPANION_BLUE = QColor(0x33, 0x80, 0xFF)  # legacy status bubble accent
 CURSOR_COLOR = QColor(20, 24, 32, 235)     # near-black
 CURSOR_OUTLINE = QColor(255, 255, 255, 240)
 LABEL_BG = QColor(20, 24, 32, 220)
 LABEL_FG = QColor(240, 242, 248, 245)
+
+# Clicky-inspired dark-glass palette for the companion textbox (Farza's Clicky
+# DesignSystem.swift). The bubble grows to fit wrapped text and carries an
+# animated status dot, matching Clicky's floating response overlay.
+DS_SURFACE = QColor(0x17, 0x19, 0x18)      # surface1 #171918
+DS_BORDER = QColor(0x37, 0x3B, 0x39)       # borderSubtle #373B39
+DS_TEXT = QColor(0xEC, 0xEE, 0xED)         # textPrimary #ECEEED
+DS_BLUE = QColor(0x60, 0xA5, 0xFA)         # blue400 — listening/working
+DS_GREEN = QColor(0x34, 0xD3, 0x99)        # success — idle/heard/done
+DS_AMBER = QColor(0xFF, 0xB2, 0x24)        # warning — errors/cancel
 
 
 class _Ripple:
@@ -125,9 +136,14 @@ class VirtualCursorOverlay(QWidget):
     CLICK_PULSE_MS = 320      # cursor scale pulse duration on click
     COMPANION_OFFSET_X = 35   # Clicky: buddyX = cursorX + 35
     COMPANION_OFFSET_Y = 25
-    COMPANION_STIFFNESS = 0.28
-    COMPANION_DAMPING = 0.62
+    COMPANION_STIFFNESS = 0.30
+    # Over-damped on purpose: with stiffness 0.30 the follow only overshoots
+    # (i.e. bounces past the cursor and wobbles back) when damping is above
+    # ~0.22. Keep it well below that so the bubble glides to the cursor and
+    # settles without any spring/bounce.
+    COMPANION_DAMPING = 0.0
     COMPANION_SNAP_DISTANCE = 900
+    EXPAND_HOLD_MS = 10000  # collapse textbox → orb this long after last activity
     # Companion follow/bubble behavior adapted from
     # Bitshank-2338/clicky-windows ui/overlay.py, MIT License.
 
@@ -182,10 +198,36 @@ class VirtualCursorOverlay(QWidget):
         self._companion_enabled = False
         self._companion_label = ""
         self._companion_label_set_ms = 0
+        # When True, cursor-action feedback (show_click / show_uia / show_action …)
+        # stops writing the bubble text. Set while Gemini Live owns the bubble so a
+        # Live-spawned desktop task can't flash its per-step labels over the live
+        # conversation — the cursor still flies and the rings/glow still draw, only
+        # the floating text is held. The authoritative set_companion_label (used by
+        # Live's own narration) is never gated by this.
+        self._companion_text_locked = False
         self._companion_display_pos = self._companion_cursor_target()
         self._companion_vel = QPointF(0, 0)
         self._companion_bubble_alpha = 1.0
         self._companion_bubble_scale = 1.0
+        # Cursor state morph: "idle" (arrow), "listening" (pulsing waveform while
+        # push-to-talk is held), "thinking" (spinner while the agent works).
+        self._cursor_state = "idle"
+        self._audio_level = 0.0  # live mic loudness 0..1 for the waveform
+        # Orb ↔ textbox morph: 0 = resting "presence" orb (minimized cursor),
+        # 1 = full textbox. Eases up on voice/agent activity, collapses back to
+        # the orb EXPAND_HOLD_MS after the last activity/answer.
+        self._companion_expand = 0.0
+
+        # Quiet companion: the bubble is invisible while idle and only appears
+        # when there's something to show; it also auto-hides while a fullscreen
+        # app (e.g. a game) is in front. How long an answer/label lingers before
+        # it fades back to invisible (ms); fullscreen-hide can be disabled.
+        self.COMPANION_IDLE_HIDE_MS = int(os.getenv("ORYNN_COMPANION_HIDE_MS") or "6500")
+        self._hide_in_fullscreen = (
+            os.getenv("ORYNN_HIDE_IN_FULLSCREEN") or "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        self._fs_check_ms = 0       # throttle the (cheap) foreground-window probe
+        self._fs_cached = False
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
@@ -198,7 +240,7 @@ class VirtualCursorOverlay(QWidget):
         self._ripples.append(_Ripple(x, y))
         self._click_pulse_start_ms = self._now_ms()
         self._set_action_label(label)
-        self.set_companion_label(label)
+        self._action_companion_label(label)
         self._bump_cursor_visibility()
         self._ensure_visible()
 
@@ -208,23 +250,58 @@ class VirtualCursorOverlay(QWidget):
         self._carets.append(_Caret(x, y, text))
         if text:
             self._set_action_label(f"Typing “{text[:24]}”")
-            self.set_companion_label(f"Typing {text[:32]}")
+            self._action_companion_label(f"Typing {text[:32]}")
         else:
             self._set_action_label("Typing")
-            self.set_companion_label("Typing")
+            self._action_companion_label("Typing")
         self._bump_cursor_visibility()
         self._ensure_visible()
 
+    def set_cursor_state(self, state: str) -> None:
+        """Morph the idle cursor: 'idle' (arrow), 'listening' (waveform), or
+        'thinking' (spinner). No-op if unchanged."""
+        state = state if state in ("idle", "listening", "thinking") else "idle"
+        if state != self._cursor_state:
+            self._cursor_state = state
+            if state != "listening":
+                self._audio_level = 0.0
+            self._ensure_visible()
+            self.update()
+
+    def set_audio_level(self, level: float) -> None:
+        """Live mic loudness (0..1) so the listening waveform reacts to the voice."""
+        try:
+            self._audio_level = max(0.0, min(1.0, float(level)))
+        except Exception:
+            self._audio_level = 0.0
+        if self._cursor_state == "listening":
+            self._ensure_visible()
+            self.update()
+
     def show_uia(self, x: int, y: int, w: int, h: int,
                  label: str = "", kind: str = "click") -> None:
-        """UIA action feedback: trace a focus ring around the control's exact
-        bounds and show what's happening. No cursor travel — UIA acts directly
-        on the control, so we highlight precisely instead of faking a click.
-        Keep only the latest spotlight so the view stays clean."""
+        """UIA action feedback: fly the buddy to the control, then trace a focus
+        ring around its exact bounds. The ring stays authoritative (the true
+        bounds); the flying cursor is the 'presenter' so the user sees WHERE the
+        agent is acting — the Clicky fly-to-element feel, on the reliable UIA
+        path. Keep only the latest spotlight so the view stays clean."""
         x, y, w, h = self._to_local_rect(x, y, w, h)
         self._spotlights = [s for s in self._spotlights if s.progress() < 0.7]
         self._spotlights.append(_Spotlight(x, y, w, h, label, kind))
-        self.set_companion_label(label or f"UIA {kind}")
+        interactive = kind in ("click", "double_click", "type", "drag", "press")
+        if interactive:
+            # Land on the control centre, pulse, and ping a ripple — a click.
+            cx, cy = x + w // 2, y + h // 2
+            self._move_cursor_to(cx, cy)
+            self._click_pulse_start_ms = self._now_ms()
+            self._ripples.append(_Ripple(cx, cy))
+        else:
+            # find/wait: point at the control's leading corner, no click.
+            self._move_cursor_to(x + min(16, max(4, w // 3)),
+                                 y + min(16, max(4, h // 3)))
+        self._set_action_label(label or f"UIA {kind}")
+        self._action_companion_label(label or f"UIA {kind}")
+        self._bump_cursor_visibility()
         self._ensure_visible()
 
     def show_app_focus(self, x: int, y: int, w: int, h: int,
@@ -239,7 +316,7 @@ class VirtualCursorOverlay(QWidget):
         else:
             self._app_glow.rearm(x, y, w, h, label, now)
         if label:
-            self.set_companion_label(label)
+            self._action_companion_label(label)
         self._ensure_visible()
 
     def keep_app_glow_alive(self) -> None:
@@ -267,7 +344,7 @@ class VirtualCursorOverlay(QWidget):
             x, y = self._to_local_point(x, y)
             self._move_cursor_to(x, y)
         self._set_action_label(label)
-        self.set_companion_label(label)
+        self._action_companion_label(label)
         self._bump_cursor_visibility()
         self._ensure_visible()
 
@@ -285,19 +362,38 @@ class VirtualCursorOverlay(QWidget):
             self.update()
 
     def set_companion_label(self, label: str) -> None:
-        """Update the compact bubble that follows the real pointer."""
+        """Update the bubble that follows the real pointer. The bubble word-wraps
+        and grows to fit, so allow a few lines of text (Clicky-style) rather than
+        a single truncated line."""
         text = (label or "").strip()
-        if len(text) > 56:
-            text = text[:53].rstrip() + "..."
+        if len(text) > 220:
+            text = text[:217].rstrip() + "..."
         if text != self._companion_label:
             self._companion_label = text
             self._companion_label_set_ms = self._now_ms()
             self._companion_bubble_alpha = 0.0
-            self._companion_bubble_scale = 0.5
+            # Subtle pop-in: start near full size so it eases in gently rather
+            # than springing from tiny (which read as "slop").
+            self._companion_bubble_scale = 0.88
         if self._companion_enabled:
             if not self.isVisible():
                 self._ensure_visible()
             self.update()
+
+    def set_companion_text_locked(self, locked: bool) -> None:
+        """Lock/unlock the bubble text against cursor-action feedback. While locked
+        (Gemini Live owns the bubble), show_* keep flying the cursor and drawing
+        rings/glow but stop overwriting the floating text, so a Live-spawned task's
+        step labels can't flash over the live conversation."""
+        self._companion_text_locked = bool(locked)
+
+    def _action_companion_label(self, label: str) -> None:
+        """Set the bubble text from a cursor action — unless something else (Live)
+        currently owns it, in which case the spatial feedback still plays but the
+        text is left untouched."""
+        if self._companion_text_locked:
+            return
+        self.set_companion_label(label)
 
     # Internal: set the floating action label that follows the cursor.
     def _set_action_label(self, label: str) -> None:
@@ -314,6 +410,68 @@ class VirtualCursorOverlay(QWidget):
         if not self.isVisible():
             self.show()
             self.raise_()
+
+    def _companion_active(self, now_ms: int) -> bool:
+        """True when the companion has something worth showing right now. When this
+        is False the bubble fades out and the overlay disappears — so it's only ever
+        on screen while listening, thinking, surfacing an answer, or drawing an
+        in-flight action; never just sitting there following the cursor."""
+        if self._cursor_state in ("listening", "thinking"):
+            return True
+        if self._companion_label and (
+                now_ms - self._companion_label_set_ms) < self.COMPANION_IDLE_HIDE_MS:
+            return True
+        if (self._ripples or self._carets or self._spotlights
+                or self._app_glow is not None or self._trail):
+            return True
+        if self._action_label_text and (
+                now_ms - self._action_label_set_ms) < (
+                    self._ACTION_LABEL_HOLD_MS + self._ACTION_LABEL_FADE_MS):
+            return True
+        if now_ms < self._cursor_visible_until:
+            return True
+        return False
+
+    def _fullscreen_app_in_front(self) -> bool:
+        """True when a fullscreen app (e.g. a game) owns the foreground, so the
+        companion should stay out of the way. The probe is cheap but throttled +
+        cached so it runs at most ~2x/sec. Opt out with ORYNN_HIDE_IN_FULLSCREEN=0."""
+        if not self._hide_in_fullscreen:
+            return False
+        now = self._now_ms()
+        if now - self._fs_check_ms < 400:
+            return self._fs_cached
+        self._fs_check_ms = now
+        self._fs_cached = self._compute_fullscreen_in_front()
+        return self._fs_cached
+
+    def _compute_fullscreen_in_front(self) -> bool:
+        try:
+            import win32api
+            import win32con
+            import win32gui
+        except Exception:
+            return False
+        try:
+            hwnd = win32gui.GetForegroundWindow()
+            if not hwnd:
+                return False
+            # The desktop / shell / taskbar are not "a fullscreen app".
+            if win32gui.GetClassName(hwnd) in (
+                "Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"
+            ):
+                return False
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            mon = win32api.GetMonitorInfo(
+                win32api.MonitorFromWindow(hwnd, win32con.MONITOR_DEFAULTTONEAREST)
+            )["Monitor"]
+            # Foreground window covers the WHOLE monitor (including the taskbar
+            # area) → borderless/exclusive fullscreen. A merely maximized window
+            # leaves the taskbar, so its rect won't reach the monitor's bounds.
+            return (left <= mon[0] and top <= mon[1]
+                    and right >= mon[2] and bottom >= mon[3])
+        except Exception:
+            return False
 
     def _sync_virtual_geometry(self) -> None:
         """Cover all monitors and remember the global-to-local offset."""
@@ -416,8 +574,9 @@ class VirtualCursorOverlay(QWidget):
             x, y = self._bezier_point(eased)
             self._cursor_x, self._cursor_y = int(x), int(y)
 
-        # Record trail breadcrumbs (independent of motion — tracks position)
         now_ms = self._now_ms()
+
+        # Record trail breadcrumbs (independent of motion — tracks position)
         if (self._cursor_x >= 0
                 and now_ms - self._last_trail_ms >= self.TRAIL_STRIDE_MS
                 and self._anim_t < 1.0):  # only drop trail while moving
@@ -442,61 +601,109 @@ class VirtualCursorOverlay(QWidget):
         if self._app_glow is not None and not self._app_glow.alive(now_ms):
             self._app_glow = None
 
-        companion_alive = self._companion_enabled
-        if companion_alive:
+        # Quiet companion: it's only "awake" (visible + following the cursor) while
+        # there's something to show — listening, thinking, a fresh answer, or
+        # in-flight action effects. Otherwise it fades out and disappears, so it
+        # never sits on screen distracting the user (e.g. while gaming). A
+        # fullscreen app in the foreground force-sleeps it.
+        awake = (
+            self._companion_enabled
+            and self._companion_active(now_ms)
+            and not self._fullscreen_app_in_front()
+        )
+        companion_alive = False
+        if self._companion_enabled:
             try:
-                target = self._companion_cursor_target()
-                dx = target.x() - self._companion_display_pos.x()
-                dy = target.y() - self._companion_display_pos.y()
-                dist = math.hypot(dx, dy)
-                if dist > self.COMPANION_SNAP_DISTANCE:
-                    self._companion_display_pos = QPointF(
-                        target.x(), target.y())
-                    self._companion_vel = QPointF(0, 0)
+                if awake:
+                    target = self._companion_cursor_target()
+                    dx = target.x() - self._companion_display_pos.x()
+                    dy = target.y() - self._companion_display_pos.y()
+                    dist = math.hypot(dx, dy)
+                    if dist > self.COMPANION_SNAP_DISTANCE:
+                        self._companion_display_pos = QPointF(
+                            target.x(), target.y())
+                        self._companion_vel = QPointF(0, 0)
+                    else:
+                        stiffness, damping = (
+                            self.COMPANION_STIFFNESS,
+                            self.COMPANION_DAMPING,
+                        )
+                        ax = dx * stiffness
+                        ay = dy * stiffness
+                        self._companion_vel = QPointF(
+                            self._companion_vel.x() * damping + ax,
+                            self._companion_vel.y() * damping + ay,
+                        )
+                        self._companion_display_pos = QPointF(
+                            self._companion_display_pos.x()
+                            + self._companion_vel.x(),
+                            self._companion_display_pos.y()
+                            + self._companion_vel.y(),
+                        )
+                    # Smooth, quick fade-in + gentle ease to full size (no bounce).
+                    self._companion_bubble_alpha = min(
+                        1.0, self._companion_bubble_alpha + 0.16)
+                    self._companion_bubble_scale += (
+                        1.0 - self._companion_bubble_scale) * 0.22
                 else:
-                    stiffness, damping = (
-                        self.COMPANION_STIFFNESS,
-                        self.COMPANION_DAMPING,
-                    )
-                    ax = dx * stiffness
-                    ay = dy * stiffness
-                    self._companion_vel = QPointF(
-                        self._companion_vel.x() * damping + ax,
-                        self._companion_vel.y() * damping + ay,
-                    )
-                    self._companion_display_pos = QPointF(
-                        self._companion_display_pos.x()
-                        + self._companion_vel.x(),
-                        self._companion_display_pos.y()
-                        + self._companion_vel.y(),
-                    )
-                self._companion_bubble_alpha = min(
-                    1.0, self._companion_bubble_alpha + 0.05)
-                self._companion_bubble_scale += (
-                    1.0 - self._companion_bubble_scale) * 0.15
-                if not self.isVisible():
+                    # Asleep: fade out in place (don't chase the cursor), then the
+                    # window hides once it's fully transparent.
+                    self._companion_bubble_alpha = max(
+                        0.0, self._companion_bubble_alpha - 0.12)
+                    self._companion_bubble_scale += (
+                        0.9 - self._companion_bubble_scale) * 0.16
+                companion_alive = self._companion_bubble_alpha > 0.02
+                if companion_alive and not self.isVisible():
                     self._ensure_visible()
             except Exception:
                 companion_alive = False
 
-        # Hide if everything is done — also wait for the action label
-        # fade to finish so the user gets to read what just happened.
         label_alive = (self._action_label_text and
                        now_ms - self._action_label_set_ms <
                        (self._ACTION_LABEL_HOLD_MS
                         + self._ACTION_LABEL_FADE_MS))
-        all_done = (not self._ripples and not self._carets
-                    and not self._spotlights
-                    and self._app_glow is None
-                    and not self._trail
-                    and not label_alive
-                    and now_ms >= self._cursor_visible_until
-                    and self._anim_t >= 1.0
-                    and not companion_alive)
-        if all_done and self.isVisible():
-            self.hide()
-            self._action_label_text = ""
-        elif not all_done:
+
+        # Repaint ONLY when something is actually moving/animating. The overlay
+        # used to update() every single tick (60fps) even sitting idle, burning
+        # CPU/battery for an identical frame. A still mouse on a settled bubble
+        # now costs zero repaints.
+        companion_moving = False
+        if companion_alive:
+            tgt = self._companion_cursor_target()
+            companion_moving = math.hypot(
+                tgt.x() - self._companion_display_pos.x(),
+                tgt.y() - self._companion_display_pos.y()) > 0.5
+        # "Animating" only while the bubble is at least faintly visible and not yet
+        # settled. A fully-faded (asleep) bubble has alpha 0 and must NOT count as
+        # animating — otherwise it would repaint forever and never hide.
+        bubble_anim = self._companion_bubble_alpha > 0.02 and (
+            self._companion_bubble_alpha < 0.999
+            or abs(self._companion_bubble_scale - 1.0) > 0.004)
+
+        # Orb ↔ textbox morph: expand to the textbox while busy or while a recent
+        # label is still fresh; collapse back to the resting orb EXPAND_HOLD_MS
+        # after the last activity/answer.
+        busy = (
+            self._anim_t < 1.0
+            or bool(self._ripples or self._carets or self._spotlights)
+            or self._app_glow is not None
+            or bool(self._trail)
+            or label_alive
+            or now_ms < self._cursor_visible_until
+            or self._cursor_state in ("listening", "thinking")
+        )
+        recent_label = (now_ms - self._companion_label_set_ms) < self.EXPAND_HOLD_MS
+        target_expand = 1.0 if (busy or recent_label) else 0.0
+        self._companion_expand += (target_expand - self._companion_expand) * 0.18
+        expand_anim = abs(self._companion_expand - target_expand) > 0.01
+
+        animating = busy or bubble_anim or companion_moving or expand_anim
+
+        if not companion_alive and not animating:
+            if self.isVisible():
+                self.hide()
+                self._action_label_text = ""
+        elif animating:
             self.update()
 
     # ── painting ────────────────────────────────────────────────────────
@@ -504,6 +711,14 @@ class VirtualCursorOverlay(QWidget):
         from PySide6.QtGui import QRadialGradient
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+
+        # CRITICAL: explicitly clear the layered overlay to fully transparent
+        # every frame. With WA_NoSystemBackground this window is NOT auto-cleared,
+        # so without this each repaint draws ON TOP of the last — leaving a trail
+        # of hundreds of ghost bubbles as the cursor moves (the screen-flood bug).
+        p.setCompositionMode(QPainter.CompositionMode_Clear)
+        p.fillRect(self.rect(), Qt.transparent)
+        p.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
         # 1. Trail breadcrumbs — small dots fading out behind the cursor
         for i, (tx, ty, age) in enumerate(self._trail):
@@ -567,26 +782,29 @@ class VirtualCursorOverlay(QWidget):
         for s in self._spotlights:
             self._paint_spotlight(p, s, now0)
 
-        # 4. Cursor + soft accent glow halo
+        # 4. Cursor + soft accent glow halo. The action cursor now shows DURING
+        # UIA spotlights too, so the buddy is seen flying to / sitting on the
+        # control (Clicky fly-to-target), with the ring marking exact bounds.
         now = self._now_ms()
         action_visible = (now < self._cursor_visible_until
-                          and self._cursor_x >= 0
-                          and not self._spotlights)
+                          and self._cursor_x >= 0)
         if action_visible:
-            # Glow halo behind the cursor — radial gradient, accent color
             cx, cy = self._cursor_x, self._cursor_y
-            grad = QRadialGradient(cx, cy + 4, self.GLOW_RADIUS)
-            g0 = QColor(RIPPLE_COLOR); g0.setAlpha(120)
+            # Flight "swoop": the cursor grows toward the arc apex and its glow
+            # swells mid-flight, settling on landing (Clicky-style).
+            flight = self._flight_scale()
+            glow_r = int(self.GLOW_RADIUS * (0.7 + 0.6 * flight))
+            grad = QRadialGradient(cx, cy + 4, max(1, glow_r))
+            g0 = QColor(RIPPLE_COLOR); g0.setAlpha(int(120 * min(1.0, flight)))
             g1 = QColor(RIPPLE_COLOR); g1.setAlpha(0)
             grad.setColorAt(0.0, g0)
             grad.setColorAt(1.0, g1)
             p.setBrush(QBrush(grad))
             p.setPen(Qt.NoPen)
-            p.drawEllipse(QPoint(cx, cy + 4),
-                          self.GLOW_RADIUS, self.GLOW_RADIUS)
+            p.drawEllipse(QPoint(cx, cy + 4), glow_r, glow_r)
 
-            # Cursor with click-pulse scale (briefly shrinks → pops back)
-            scale = self._click_pulse_scale(now)
+            # Cursor with combined click-pulse + flight-apex scale.
+            scale = self._click_pulse_scale(now) * flight
             self._paint_cursor(p, cx, cy, scale=scale)
 
             # Action label pill — fades in/out under the cursor
@@ -597,6 +815,10 @@ class VirtualCursorOverlay(QWidget):
             if not has_target_overlay:
                 cx = self._companion_display_pos.x()
                 cy = self._companion_display_pos.y()
+                # The listening/thinking indicators are drawn INSIDE the bubble
+                # (in the status-dot slot) by _paint_companion_bubble, so they
+                # read as one tidy element instead of a circle floating off the
+                # corner.
                 self._paint_companion_bubble(p, cx, cy, now)
 
         p.end()
@@ -732,43 +954,191 @@ class VirtualCursorOverlay(QWidget):
         p.drawText(QRect(x + pad_x + 10, y, w - pad_x * 2 - 10, h),
                    Qt.AlignVCenter | Qt.AlignLeft, text)
 
+    COMPANION_MAX_TEXT_WIDTH = 300  # px, like Clicky's response overlay
+
+    @classmethod
+    def _companion_text_width_limit(
+        cls,
+        screen_width: int,
+        margin: int,
+        pad_x: int,
+        dot_gap: int,
+    ) -> int:
+        """Return a text width that keeps the expanded bubble inside the screen."""
+        available_w = max(1, int(screen_width) - max(0, margin) * 2)
+        chrome_w = max(0, pad_x) * 2 + max(0, dot_gap)
+        return max(1, min(cls.COMPANION_MAX_TEXT_WIDTH, available_w - chrome_w))
+
+    def _companion_dot(self, text: str) -> tuple:
+        """Pick the status-dot colour (and whether it pulses) from the label,
+        mirroring Clicky's animated status dot."""
+        t = text.lower()
+        if t.startswith("listening"):
+            return DS_BLUE, True
+        bad = ("didn't", "failed", "couldn't", "unavailable", "cancel",
+               "error", "timed out", "needs approval")
+        if any(k in t for k in bad):
+            return DS_AMBER, False
+        # Settled/idle states are green even if their text mentions an action
+        # word (e.g. a completion reason that says "typing").
+        settled = ("orynn ready", "heard:", "done", "ready", "welcome", "all set")
+        if any(t.startswith(k) for k in settled):
+            return DS_GREEN, False
+        busy = ("transcrib", "working", "thinking", "started", "queued",
+                "using", "clicking", "typing", "reading", "focus", "finding",
+                "waiting", "scrolling", "running", "editing", "pressing")
+        if any(k in t for k in busy):
+            return DS_BLUE, True
+        return DS_GREEN, False
+
+    def _paint_orb(self, p: QPainter, ox: float, oy: float,
+                   color: QColor, a: float, r: float = 4.6) -> None:
+        """The resting 'presence' orb — a glossy glowing dot: soft layered glow,
+        a crisp core, and a small offset highlight for a 3D sheen."""
+        p.setPen(Qt.NoPen)
+        for rr, alpha in ((r * 2.7, 24), (r * 1.9, 40), (r * 1.3, 75)):
+            c = QColor(color); c.setAlpha(int(alpha * a))
+            p.setBrush(QBrush(c))
+            p.drawEllipse(QPointF(ox, oy), rr, rr)
+        core = QColor(color); core.setAlpha(int(255 * a))
+        p.setBrush(QBrush(core))
+        p.drawEllipse(QPointF(ox, oy), r, r)
+        hi = QColor(255, 255, 255); hi.setAlpha(int(150 * a))
+        p.setBrush(QBrush(hi))
+        p.drawEllipse(QPointF(ox - r * 0.32, oy - r * 0.32), r * 0.34, r * 0.34)
+
     def _paint_companion_bubble(self, p: QPainter, cx: float, cy: float,
                                 now_ms: int) -> None:
-        text = self._companion_label or "Orynn ready"
-        if text == "Ready":
+        """Morphs between a resting 'presence' orb (the minimized cursor) and the
+        full textbox. self._companion_expand drives it: 0 = just the orb, 1 = the
+        capsule unfolded with text."""
+        text = self._companion_label or ""
+        if text in ("Ready", "Orynn ready"):
             text = "Orynn ready"
-        p.setFont(QFont("Segoe UI", 9, QFont.Medium))
+        expand = max(0.0, min(1.0, self._companion_expand))
+        orb_a = max(0.0, min(1.0, self._companion_bubble_alpha))
+        if orb_a < 0.02:
+            return
+
+        p.setFont(QFont("Segoe UI", 10))
         fm = p.fontMetrics()
-        pad_x, pad_y = 8, 4
-        tw = fm.horizontalAdvance(text) + pad_x * 2
-        th = fm.height() + pad_y * 2
+        pad_x, pad_y = 13, 9
+        dot_gap = 16
 
-        box_x = cx + 10
-        box_y = cy + 18 - th / 2
+        geo = self.geometry()
+        margin = 8
+        available_w = max(26, int(geo.width()) - margin * 2)
+        available_h = max(26, int(geo.height()) - margin * 2)
 
-        scale = max(0.01, self._companion_bubble_scale)
+        max_tw = self._companion_text_width_limit(
+            geo.width(), margin, pad_x, dot_gap
+        )
+        flags = int(Qt.TextWordWrap | Qt.AlignLeft | Qt.AlignTop)
+        bound = fm.boundingRect(QRect(0, 0, max_tw, 4000), flags, text or " ")
+        tw = max(1, min(max_tw, bound.width()))
+        th = min(
+            max(fm.height(), bound.height()),
+            max(fm.height(), available_h - pad_y * 2),
+        )
+        full_w = min(tw + pad_x * 2 + dot_gap, available_w)
+        full_h = min(th + pad_y * 2, available_h)
+        text_w = max(1.0, full_w - pad_x * 2 - dot_gap)
+        text_h = max(1.0, full_h - pad_y * 2)
+
+        # Expanded box position, clamped on-screen using the FULL size so the orb
+        # anchor stays put across the whole morph (no jump as it grows/shrinks).
+        box_x, box_y = cx, cy
+        if box_x + full_w > geo.width() - margin:
+            box_x = cx - full_w - 18
+        if box_y + full_h > geo.height() - margin:
+            box_y = cy - full_h - 8
+        max_x = max(margin, geo.width() - full_w - margin)
+        max_y = max(margin, geo.height() - full_h - margin)
+        box_x = max(margin, min(box_x, max_x))
+        box_y = max(margin, min(box_y, max_y))
+
+        # Fixed orb anchor (the resting cursor): the top-left indicator slot.
+        orb_cx = box_x + pad_x + 4
+        orb_cy = box_y + pad_y + fm.ascent() / 2 + 1
+
+        # The capsule grows from a small circle hugging the orb to the full box.
+        coll = 26.0
+        cap_x = (orb_cx - coll / 2) + (box_x - (orb_cx - coll / 2)) * expand
+        cap_y = (orb_cy - coll / 2) + (box_y - (orb_cy - coll / 2)) * expand
+        cap_w = coll + (full_w - coll) * expand
+        cap_h = coll + (full_h - coll) * expand
+        radius = 13.0 + (11.0 - 13.0) * expand
+        cap_a = orb_a * expand
+
         p.save()
-        p.translate(box_x, box_y + th / 2)
-        p.scale(scale, scale)
-        p.translate(-box_x, -(box_y + th / 2))
-
-        alpha = int(255 * self._companion_bubble_alpha)
-        bg = QColor(COMPANION_BLUE)
-        bg.setAlpha(alpha)
-        glow = QColor(COMPANION_BLUE)
-        glow.setAlpha(int(90 * self._companion_bubble_alpha))
-
-        p.setBrush(QBrush(glow))
         p.setPen(Qt.NoPen)
-        p.drawRoundedRect(QRectF(box_x - 4, box_y - 4, tw + 8, th + 8),
-                          9, 9)
+        if cap_a > 0.01:
+            bg = QColor(DS_SURFACE); bg.setAlpha(int(245 * cap_a))
+            p.setBrush(QBrush(bg))
+            border = QColor(DS_BORDER); border.setAlpha(int(220 * cap_a))
+            p.setPen(QPen(border, 1.0))
+            p.drawRoundedRect(QRectF(cap_x, cap_y, cap_w, cap_h), radius, radius)
 
-        p.setBrush(QBrush(bg))
-        p.drawRoundedRect(QRectF(box_x, box_y, tw, th), 6, 6)
+        # Persistent orb / state indicator at the fixed anchor.
+        if self._cursor_state == "thinking":
+            self._paint_mini_spinner(p, orb_cx, orb_cy, 6.0, now_ms, orb_a)
+        elif self._cursor_state == "listening":
+            lvl = self._audio_level
+            glow = QColor(DS_BLUE); glow.setAlpha(int(70 * orb_a))
+            p.setPen(Qt.NoPen); p.setBrush(QBrush(glow))
+            p.drawEllipse(QPointF(orb_cx, orb_cy), 5 + lvl * 5, 5 + lvl * 5)
+            core = QColor(DS_BLUE); core.setAlpha(int(255 * orb_a))
+            p.setBrush(QBrush(core))
+            p.drawEllipse(QPointF(orb_cx, orb_cy), 3 + lvl * 4, 3 + lvl * 4)
+        else:
+            col, _ = self._companion_dot(text)
+            if col != DS_AMBER:  # blue "presence" everywhere except errors
+                col = DS_BLUE
+            self._paint_orb(p, orb_cx, orb_cy, col, orb_a)
 
-        p.setPen(QPen(QColor(255, 255, 255, alpha), 1))
-        p.drawText(QRectF(box_x, box_y, tw, th), Qt.AlignCenter, text)
+        # Text fades in over the second half of the expansion.
+        text_a = max(0.0, (expand - 0.4) / 0.6) * orb_a
+        if text_a > 0.02 and text:
+            fg = QColor(DS_TEXT); fg.setAlpha(int(255 * text_a))
+            p.setPen(QPen(fg))
+            text_rect = QRectF(
+                box_x + pad_x + dot_gap,
+                box_y + pad_y,
+                text_w,
+                text_h,
+            )
+            p.drawText(text_rect, flags, text)
         p.restore()
+
+    def _flight_scale(self) -> float:
+        """1.0 at rest; swells toward ~1.28x at the bezier arc's apex while the
+        cursor is in flight, settling back to 1.0 on landing."""
+        if 0.0 < self._anim_t < 1.0:
+            return 1.0 + 0.28 * math.sin(math.pi * self._anim_t)
+        return 1.0
+
+    def _paint_mini_spinner(self, p: QPainter, cx: float, cy: float,
+                            r: float, now_ms: int, a: float = 1.0) -> None:
+        """A small comet-arc spinner drawn inside the bubble's indicator slot:
+        a faint track with a bright head fading into a tapering tail. The angle
+        is taken mod 360 — now_ms is the raw epoch (~1.7e12) and an unbounded
+        angle overflows the 32-bit int QPainter.drawArc expects."""
+        rect = QRectF(cx - r, cy - r, 2 * r, 2 * r)
+        track = QColor(DS_BLUE); track.setAlpha(int(30 * a))
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(track, 2.0))
+        p.drawArc(rect, 0, 360 * 16)
+        head = ((now_ms / 1100.0) * 360.0) % 360.0
+        span = 220.0
+        segs = 14
+        seg = span / segs
+        for i in range(segs):
+            frac = (i + 1) / segs
+            ang = head - (1.0 - frac) * span
+            alpha = int((18 + 212 * (frac ** 1.6)) * a)
+            col = QColor(DS_BLUE); col.setAlpha(alpha)
+            p.setPen(QPen(col, 2.0, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(rect, int(-ang * 16), int(-(seg + 0.8) * 16))
 
     def _paint_action_label(self, p: QPainter, cx: int, cy: int,
                             now_ms: int) -> None:

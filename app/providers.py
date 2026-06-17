@@ -1135,6 +1135,46 @@ def _ollama_name(model: str) -> str:
     return raw
 
 
+def _llm_read_timeout() -> float:
+    """Max seconds to wait for a model response. Env-overridable.
+
+    Was effectively 300s (a single flat httpx timeout), which let a desktop step
+    hang for 5 minutes before failing. 120s is generous for a slow free model yet
+    bounded enough that a genuine stall surfaces quickly.
+    """
+    try:
+        val = float(os.environ.get("ORYNN_LLM_TIMEOUT") or "120")
+        return val if val > 0 else 120.0
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _build_llm_http_client() -> "httpx.Client":
+    """A hardened httpx client for every LLM call.
+
+    Why this exists: a long-running backend kept a *persistent* httpx.Client with a
+    flat 300s timeout. After the process sat idle for hours, a request reused a dead
+    pooled keep-alive connection and hung until that 300s timeout fired — the exact
+    "stuck for 5 minutes on step 1" symptom, gone after a restart. This config makes
+    that impossible:
+      • connect/pool capped at 10s  -> a dead/contended connection fails fast,
+      • keepalive_expiry=15s        -> idle connections are dropped, never reused stale,
+      • transport retries=2         -> a connection-level failure retries on a FRESH
+                                       socket automatically (self-healing),
+      • read bounded by _llm_read_timeout() instead of 300s.
+    """
+    transport = httpx.HTTPTransport(
+        retries=2,
+        limits=httpx.Limits(
+            max_keepalive_connections=10, max_connections=50, keepalive_expiry=15.0
+        ),
+    )
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=10.0, read=_llm_read_timeout(), write=20.0, pool=10.0),
+        transport=transport,
+    )
+
+
 class PlannerProvider:
     def __init__(self, model: str = DEFAULT_OPENROUTER_MODEL):
         # A speed-tier selection ("tier:quick"/"tier:balanced") resolves to its
@@ -1153,8 +1193,10 @@ class PlannerProvider:
         self._total_input_tokens: int = 0
         self._total_output_tokens: int = 0
         self.thinking_budget: str = "off"
-        # Persistent HTTP client — reuses TCP connections and avoids SSL handshake per call
-        self._http_client = httpx.Client(timeout=300)
+        # Persistent HTTP client — reuses TCP connections and avoids SSL handshake per
+        # call, but hardened so a stale pooled connection can't hang a request (see
+        # _build_llm_http_client). Closed in close()/__del__ so sockets don't leak.
+        self._http_client = _build_llm_http_client()
         # Cache provider type so _is_X() string checks don't repeat every call
         m = model.lower()
         self._is_anthropic_model = "anthropic" in m or "claude" in m
@@ -1162,6 +1204,20 @@ class PlannerProvider:
         self._is_openrouter_model = "openrouter" in m or ("/" in m and not self._is_anthropic_model and not self._is_openai_model)
         self._is_groq_model = "groq" in m
         self._is_ollama_model = m.startswith("ollama/")
+
+    def close(self) -> None:
+        """Release the pooled HTTP connections. Safe to call more than once."""
+        client = getattr(self, "_http_client", None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        # Safety net so a provider that isn't explicitly closed still frees its
+        # sockets when garbage-collected, rather than leaking over a long session.
+        self.close()
 
     @property
     def total_tokens(self) -> int:
@@ -1262,6 +1318,12 @@ class PlannerProvider:
                     time.sleep(2 ** attempt)
                     continue
                 raise
+            except httpx.TransportError as e:
+                # Connection/read-timeout error (e.g. a dead pooled connection or a
+                # slow free model). Retry rather than let it hang or crash the task.
+                last_err = e
+                time.sleep(2 ** attempt)
+                continue
         raise last_err or RuntimeError("All API retries exhausted")
 
     def _chat_openai(self, system: str, prompt: str, screenshot_b64: Optional[str] = None) -> str:
@@ -1299,6 +1361,12 @@ class PlannerProvider:
                     time.sleep(2 ** attempt)
                     continue
                 raise
+            except httpx.TransportError as e:
+                # Connection/read-timeout error (e.g. a dead pooled connection or a
+                # slow free model). Retry rather than let it hang or crash the task.
+                last_err = e
+                time.sleep(2 ** attempt)
+                continue
         raise last_err or RuntimeError("All API retries exhausted")
 
     def _chat_openrouter(self, system: str, prompt: str, screenshot_b64: Optional[str] = None, _model_override: Optional[str] = None) -> str:
@@ -1362,6 +1430,17 @@ class PlannerProvider:
                         if e.response.status_code in (402, 429) or e.response.status_code >= 500:
                             if not is_last_model:
                                 break  # fail fast to next model
+                            time.sleep(2 ** (attempt + 1))
+                            continue
+                        break
+                    except httpx.TransportError as e:
+                        # Connection/timeout error (dead pooled connection, slow free
+                        # model, network blip). Fail over to the next model, or back
+                        # off and retry on the last — never bubble up as a 5-min hang.
+                        last_err = e
+                        if not is_last_model:
+                            break
+                        if attempt < 2:
                             time.sleep(2 ** (attempt + 1))
                             continue
                         break
@@ -1492,7 +1571,7 @@ class PlannerProvider:
         last_err = None
         for attempt in range(3):
             try:
-                with httpx.Client(timeout=300) as client:
+                with _build_llm_http_client() as client:
                     resp = client.post(
                         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self._google_key}",
                         json=payload,
@@ -1505,6 +1584,12 @@ class PlannerProvider:
                     time.sleep(2 ** attempt)
                     continue
                 raise
+            except httpx.TransportError as e:
+                # Connection/read-timeout error (e.g. a dead pooled connection or a
+                # slow free model). Retry rather than let it hang or crash the task.
+                last_err = e
+                time.sleep(2 ** attempt)
+                continue
         raise last_err or RuntimeError("All API retries exhausted")
 
     def _chat_groq(self, system: str, prompt: str, screenshot_b64: Optional[str] = None) -> str:
@@ -1528,7 +1613,7 @@ class PlannerProvider:
         last_err = None
         for attempt in range(3):
             try:
-                with httpx.Client(timeout=300) as client:
+                with _build_llm_http_client() as client:
                     resp = client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {self._groq_key}"},
@@ -1542,6 +1627,12 @@ class PlannerProvider:
                     time.sleep(2 ** attempt)
                     continue
                 raise
+            except httpx.TransportError as e:
+                # Connection/read-timeout error (e.g. a dead pooled connection or a
+                # slow free model). Retry rather than let it hang or crash the task.
+                last_err = e
+                time.sleep(2 ** attempt)
+                continue
         raise last_err or RuntimeError("All API retries exhausted")
 
     # Fallback model chain: when a provider 429s, try the next one
@@ -1571,11 +1662,14 @@ class PlannerProvider:
 
         try:
             return primary_fn(system, prompt, screenshot_b64)
-        except (httpx.HTTPStatusError, RuntimeError) as primary_err:
-            # Check if this is a rate-limit (429) or server error (5xx)
+        except (httpx.HTTPStatusError, httpx.TransportError, RuntimeError) as primary_err:
+            # Check if this is a rate-limit (429), server error (5xx), or a
+            # connection/timeout error — any of which should fail over to OpenRouter.
             is_retryable = False
             if isinstance(primary_err, httpx.HTTPStatusError):
                 is_retryable = primary_err.response.status_code in (402, 429) or primary_err.response.status_code >= 500
+            elif isinstance(primary_err, httpx.TransportError):
+                is_retryable = True  # dead connection / timeout — try the fallback chain
             elif "rate" in str(primary_err).lower() or "429" in str(primary_err) or "402" in str(primary_err):
                 is_retryable = True
 
