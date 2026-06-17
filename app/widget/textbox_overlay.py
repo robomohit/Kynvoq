@@ -118,6 +118,14 @@ LIVE_BLOCKED_KEY_COMBOS = {
 LIVE_LABEL_HOLD_SECONDS = 2.8
 LIVE_TOOL_LABEL_HOLD_SECONDS = 1.6
 
+# How long start_desktop_task waits for the job to finish before handing back
+# "still working" — most spoken commands (opens, quick actions) finish within this,
+# so Live can speak the REAL outcome instead of a bare "started". Override with
+# ORYNN_LIVE_TASK_WAIT. Kept well under GEMINI_LIVE_TOOL_TIMEOUT (15s) so the wait
+# always returns before the outer tool timeout could fire.
+LIVE_TASK_RESULT_WAIT = 6.0
+TERMINAL_TASK_STATES = {"done", "complete", "error", "failed", "cancelled"}
+
 _LIVE_LABEL_SOURCES = {
     "live_status",
     "live_input",
@@ -405,6 +413,12 @@ class OverlayController(QObject):
         # Goal of the desktop task currently running (if any), so Live can name it
         # when it refuses to start a second, colliding action on top of it.
         self._active_task_goal: str = ""
+        # Tasks Live launched (task_id -> short goal), so when one finishes we can
+        # feed the outcome back to the conversation instead of losing it.
+        self._live_task_ids: dict[str, str] = {}
+        # The most recent finished Live task's outcome, surfaced via
+        # get_companion_status so Live can answer "did it work?" for longer jobs.
+        self._last_task_result: dict[str, Any] | None = None
         self._live: Any = None
         self._live_cancel = threading.Event()
         self._live_generation = 0
@@ -1308,7 +1322,12 @@ class OverlayController(QObject):
             try:
                 data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
                 tasks = data.get("tasks", []) if isinstance(data, dict) else []
-                return {"ok": True, "active_tasks": len(tasks)}
+                resp: dict[str, Any] = {"ok": True, "active_tasks": len(tasks)}
+                if self._active_task_goal:
+                    resp["current_task"] = self._active_task_goal
+                if self._last_task_result:
+                    resp["last_result"] = self._last_task_result
+                return resp
             except Exception as exc:
                 return {"ok": False, "message": str(exc)[:200]}
         self.cursorStateRequested.emit("thinking")
@@ -1343,13 +1362,9 @@ class OverlayController(QObject):
             self.client.request("POST", "/api/tasks", payload, timeout=20.0)
             self._active_task_running = True
             self._active_task_goal = _short(goal, 80)
+            self._live_task_ids[task_id] = self._active_task_goal
             self.cursorStateRequested.emit("thinking")
             self._set_label("Started: " + _short(goal, 120), source="live_tool", force=True)
-            return {
-                "ok": True,
-                "task_id": task_id,
-                "message": "Orynn started the desktop task.",
-            }
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:200]
             self.cursorStateRequested.emit("idle")
@@ -1359,6 +1374,72 @@ class OverlayController(QObject):
             self.cursorStateRequested.emit("idle")
             self._set_label("Couldn't start task", source="live_error", force=True)
             return {"ok": False, "message": str(exc)[:200]}
+        # Wait briefly for the result so Live can report what actually happened,
+        # not just "started" — most commands finish within the window. Longer jobs
+        # hand back "still working" and surface later via get_companion_status.
+        return self._await_task_outcome(task_id, goal)
+
+    def _await_task_outcome(self, task_id: str, goal: str) -> dict[str, Any]:
+        budget = self._live_float(os.getenv("ORYNN_LIVE_TASK_WAIT"), LIVE_TASK_RESULT_WAIT, 0.0, 30.0)
+        deadline = time.monotonic() + budget
+        status, summary = "running", ""
+        first = True
+        while first or time.monotonic() < deadline:
+            first = False
+            if self._live_cancel_requested():
+                return {"ok": False, "task_id": task_id, "status": "stopped",
+                        "message": "Stopped before it finished."}
+            try:
+                d = self.client.request("GET", f"/api/tasks/{task_id}", timeout=5.0)
+            except Exception:
+                d = None
+            if isinstance(d, dict):
+                status = str(d.get("status") or status)
+                summary = _clean_text(
+                    d.get("reason") or d.get("error") or d.get("result") or summary
+                )
+                if status in TERMINAL_TASK_STATES:
+                    break
+            if time.monotonic() >= deadline:
+                break
+            self._stop.wait(0.5)
+
+        if status in ("done", "complete"):
+            self._finish_live_task(task_id, status, summary, ok=True)
+            self._set_label("Done: " + _short(summary or goal, 120), source="live_tool", force=True)
+            return {"ok": True, "task_id": task_id, "status": "done",
+                    "result": _short(summary, 600) or "Done.",
+                    "message": "The desktop task finished — tell the user the result."}
+        if status in ("error", "failed", "cancelled"):
+            self._finish_live_task(task_id, status, summary, ok=False)
+            return {"ok": False, "task_id": task_id, "status": status,
+                    "result": _short(summary, 600),
+                    "message": f"The desktop task {status}. Tell the user briefly what happened."}
+        return {"ok": True, "task_id": task_id, "status": "running",
+                "message": ("Orynn is working on it in the background; it isn't done yet. "
+                            "Tell the user you've started — you can check later with "
+                            "get_companion_status.")}
+
+    def _finish_live_task(self, task_id: str, status: str, summary: str, ok: bool) -> None:
+        self._active_task_running = False
+        self._active_task_goal = ""
+        goal = self._live_task_ids.pop(task_id, "")
+        self._last_task_result = {
+            "goal": goal, "status": status, "ok": bool(ok),
+            "summary": _short(summary, 200),
+        }
+
+    def _capture_live_task_outcome(self, ev: dict[str, Any]) -> None:
+        """When a Live-launched task finishes AFTER the brief inline wait, record its
+        outcome so get_companion_status can report it (longer jobs land here)."""
+        task_id = str(ev.get("task_id") or "")
+        if not task_id or task_id not in self._live_task_ids:
+            return
+        et = str(ev.get("type") or "")
+        if et not in TERMINAL_TASK_STATES:
+            return
+        summary = _clean_text(ev.get("reason") or ev.get("message") or "")
+        self._finish_live_task(task_id, et, summary, ok=et in ("done", "complete"))
 
     def _load_preferences_async(self) -> None:
         def run() -> None:
@@ -1416,6 +1497,7 @@ class OverlayController(QObject):
                             self._set_label(label, source=self._label_source_for_event(ev))
                             idle_label_shown = True
                     self._update_cursor_state_from_event(ev)
+                    self._capture_live_task_outcome(ev)
                     self._maybe_finalize(ev)
                 if not idle_label_shown:
                     self._prime_from_active_task()

@@ -472,6 +472,9 @@ def _controller():
     import os
 
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # Don't block on the start_desktop_task outcome-wait in unit tests — tests that
+    # exercise the outcome path return a terminal status on the first poll instead.
+    os.environ.setdefault("ORYNN_LIVE_TASK_WAIT", "0")
     try:
         from PySide6.QtWidgets import QApplication
         from app.widget.textbox_overlay import OverlayController
@@ -928,10 +931,76 @@ def test_live_tool_start_desktop_task_calls_backend():
     res = c._live_tool("start_desktop_task", {"goal": "open notepad and type hi"})
 
     assert res["ok"] is True
+    assert res["status"] == "running"       # didn't finish within the (0s) wait
     paths = [p for _, p, _ in calls]
     assert "/api/tasks/preflight" in paths  # readiness checked before launching
     assert "/api/tasks" in paths            # then the task is actually submitted
     assert c._active_task_running is True
+
+
+def test_live_start_desktop_task_reports_outcome_to_model():
+    """Live waits briefly and returns the REAL outcome so the model can speak it —
+    not just 'started'. The finished result is also remembered for follow-up."""
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {"ok": True}
+            if path.startswith("/api/tasks/"):       # status poll
+                return {"status": "done", "reason": "Notepad is open."}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad"})
+
+    assert res["ok"] is True and res["status"] == "done"
+    assert "Notepad is open." in res["result"]
+    assert c._active_task_running is False          # finished, no longer "busy"
+    assert c._last_task_result["status"] == "done"
+
+    # get_companion_status now surfaces that outcome for "did it work?".
+    status = c._live_tool("get_companion_status", {})
+    assert status["ok"] is True
+    assert status["last_result"]["status"] == "done"
+
+
+def test_live_start_desktop_task_reports_failure_to_model():
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {}
+            if path.startswith("/api/tasks/"):
+                return {"status": "failed", "error": "couldn't find that app"}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad"})
+
+    assert res["ok"] is False and res["status"] == "failed"
+    assert "couldn't find that app" in res["result"]
+    assert c._active_task_running is False
+
+
+def test_live_long_task_outcome_captured_from_poll_event():
+    """A task that outruns the inline wait is finished off by the poll loop's
+    terminal event, so its outcome still reaches get_companion_status."""
+    c = _controller()
+    c._live_task_ids = {"clicky-123": "organize my downloads"}
+    c._active_task_running = True
+
+    c._capture_live_task_outcome({
+        "type": "done", "task_id": "clicky-123", "reason": "Sorted 42 files.",
+    })
+
+    assert c._active_task_running is False
+    assert "clicky-123" not in c._live_task_ids
+    assert c._last_task_result["status"] == "done"
+    assert "Sorted 42 files." in c._last_task_result["summary"]
 
 
 def test_live_tool_start_desktop_task_requires_goal():
