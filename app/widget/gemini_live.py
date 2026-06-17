@@ -62,6 +62,14 @@ def _env_flag(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _live_greeting_enabled() -> bool:
+    """Whether Live says a short hello when it connects (so you know it's on).
+    On by default; set GEMINI_LIVE_GREETING=0 to silence it."""
+    return (os.environ.get("GEMINI_LIVE_GREETING") or "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def live_search_enabled() -> bool:
     """Whether to attach Google Search grounding to the Live session.
 
@@ -151,6 +159,11 @@ class GeminiLiveCompanion:
         self._session: Any = None
         self._lock = threading.Lock()
         self._audio_fail_streak = 0
+        # Session-resumption handle (captured from the server) so a reconnect can
+        # resume the SAME conversation instead of starting fresh. None = new session.
+        self._resume_handle: str | None = None
+        # Greet once per session (not on every reconnect).
+        self._greeted = False
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -316,7 +329,6 @@ class GeminiLiveCompanion:
 
         player = asyncio.create_task(play_audio_loop())
         client = genai.Client(api_key=gemini_api_key())
-        config = self._live_config(types)
 
         retries = 0
         max_retries = 5
@@ -326,6 +338,8 @@ class GeminiLiveCompanion:
             while not self._stop.is_set():
                 if retries > 0:
                     self.callbacks.on_status(f"Live reconnecting ({retries}/{max_retries})...")
+                # Rebuilt each attempt so a reconnect carries the latest resume handle.
+                config = self._live_config(types)
                 try:
                     async with client.aio.live.connect(model=self.model, config=config) as session:
                         self._session = session
@@ -333,6 +347,7 @@ class GeminiLiveCompanion:
                         retries = 0
                         retry_delay = 1.0
                         self.callbacks.on_status("Gemini Live listening")
+                        await self._maybe_greet(session, types)
 
                         # Clear stale audio chunks from mic queue on reconnect
                         while not audio_queue.empty():
@@ -407,6 +422,9 @@ class GeminiLiveCompanion:
             ),
             system_instruction=self.system_instruction,
             tools=tools,
+            # Resume the same conversation across reconnects (handle is None on the
+            # first connect = fresh session; set from session_resumption_update).
+            session_resumption=types.SessionResumptionConfig(handle=self._resume_handle),
         )
 
     async def _send_audio(
@@ -427,6 +445,92 @@ class GeminiLiveCompanion:
                 )
             )
 
+    @staticmethod
+    def _flush_output(output_queue_or_stream: Any) -> None:
+        """Drop everything still queued for the speaker — used on barge-in so Orynn
+        stops talking immediately instead of draining its audio backlog."""
+        if not hasattr(output_queue_or_stream, "get_nowait"):
+            return
+        try:
+            while True:
+                output_queue_or_stream.get_nowait()
+                try:
+                    output_queue_or_stream.task_done()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    async def _maybe_greet(self, session: Any, types: Any) -> None:
+        """Say a short hello on first connect so the user knows Live is listening.
+        Once per session (not on reconnects); silence with GEMINI_LIVE_GREETING=0."""
+        if self._greeted or not _live_greeting_enabled():
+            return
+        self._greeted = True
+        try:
+            await session.send_client_content(
+                turns=[types.Content(role="user", parts=[types.Part(
+                    text="Greet me in one short, friendly spoken sentence so I know "
+                         "you're listening. Don't ask what I need yet."
+                )])],
+                turn_complete=True,
+            )
+        except Exception:
+            pass
+
+    def send_task_update(self, text: str) -> None:
+        """Push a background-task status into the live conversation so the model can
+        proactively narrate a long job finishing ("hey, that download's done").
+        Thread-safe (called from the poll thread); best-effort."""
+        loop = self._loop
+        session = self._session
+        if loop is None or session is None or self._stop.is_set() or not str(text or "").strip():
+            return
+
+        async def _send() -> None:
+            try:
+                from google.genai import types
+                await session.send_client_content(
+                    turns=[types.Content(role="user", parts=[types.Part(text=str(text))])],
+                    turn_complete=True,
+                )
+            except Exception:
+                pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+        except Exception:
+            pass
+
+    def send_screen_image(self, jpeg_bytes: bytes, prompt: str = "") -> bool:
+        """Send a screenshot into the live conversation so the model can SEE the
+        screen (Gemini's own vision — no local OCR needed) and answer about it.
+        Thread-safe; returns True if the send was scheduled."""
+        loop = self._loop
+        session = self._session
+        if loop is None or session is None or self._stop.is_set() or not jpeg_bytes:
+            return False
+
+        async def _send() -> None:
+            try:
+                from google.genai import types
+                parts = [types.Part(inline_data=types.Blob(
+                    data=jpeg_bytes, mime_type="image/jpeg"))]
+                if prompt:
+                    parts.append(types.Part(text=prompt))
+                await session.send_client_content(
+                    turns=[types.Content(role="user", parts=parts)],
+                    turn_complete=True,
+                )
+            except Exception:
+                pass
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), loop)
+            return True
+        except Exception:
+            return False
+
     async def _receive_loop(self, session: Any, output_queue_or_stream: Any, types: Any) -> None:
         while not self._stop.is_set():
             async for message in session.receive():
@@ -443,8 +547,21 @@ class GeminiLiveCompanion:
         output_queue_or_stream: Any,
         types: Any,
     ) -> None:
+        # Remember the latest session-resumption handle so a reconnect resumes this
+        # same conversation rather than starting over.
+        resume = getattr(message, "session_resumption_update", None)
+        if resume is not None and getattr(resume, "resumable", False):
+            handle = getattr(resume, "new_handle", None)
+            if handle:
+                self._resume_handle = handle
+
         content = getattr(message, "server_content", None)
         if content is not None:
+            # Barge-in: the user started talking over Orynn. Drop everything still
+            # queued for the speaker so it stops mid-sentence instead of draining
+            # its backlog and talking over them.
+            if getattr(content, "interrupted", False):
+                self._flush_output(output_queue_or_stream)
             output_finished = False
             inp = getattr(content, "input_transcription", None)
             if inp is not None and getattr(inp, "text", ""):
@@ -570,6 +687,7 @@ def _function_declarations(types: Any) -> list[Any]:
                             "click",
                             "type",
                             "press_keys",
+                            "scroll",
                         ],
                         "description": "The single desktop primitive to run.",
                     },
@@ -598,8 +716,31 @@ def _function_declarations(types: Any) -> list[Any]:
                     "timeout": {"type": "number"},
                     "limit": {"type": "integer"},
                     "cap": {"type": "integer"},
+                    "amount": {
+                        "type": "integer",
+                        "description": "For scroll: how far. Negative scrolls DOWN, "
+                                       "positive scrolls UP (a few notches per ~10).",
+                    },
                 },
                 "required": ["action"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="look_at_screen",
+            description=(
+                "Take a screenshot and actually LOOK at what's on the user's screen "
+                "with your own vision, then answer their question about it. Use this "
+                "for visual things UI inspection can't read — images, photos, videos, "
+                "games, charts, error dialogs, or 'what does this say / what's this'."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "What the user wants to know about the screen.",
+                    }
+                },
             },
         ),
         types.FunctionDeclaration(
@@ -646,8 +787,11 @@ def _default_system_instruction() -> str:
         "emoji, and never read out symbols or tool names.\n"
         "When the user asks you to actually do something on the computer, DON'T "
         "pretend you did it. For a single bounded desktop step, call "
-        "desktop_control: wait/focus/observe/find/click/type/press_keys. Prefer "
-        "UIA names and pass the app/window title whenever you know it. For opening "
+        "desktop_control: wait/focus/observe/find/click/type/press_keys/scroll. Prefer "
+        "UIA names and pass the app/window title whenever you know it. To actually "
+        "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
+        "this say' — call look_at_screen with the question; you'll then see the "
+        "screenshot and can describe it. For opening "
         "apps, browsing, files, or broader multi-step work, say a quick natural "
         "acknowledgement out loud and in the same turn call start_desktop_task "
         "with a clear, specific goal. If the user says stop, cancel, or never "

@@ -94,6 +94,7 @@ LIVE_DESKTOP_ACTION_LABELS = {
     "click": "Clicking control",
     "type": "Typing into control",
     "press_keys": "Pressing shortcut",
+    "scroll": "Scrolling",
 }
 
 LIVE_DESKTOP_ACTIONS = set(LIVE_DESKTOP_ACTION_LABELS)
@@ -1234,6 +1235,15 @@ class OverlayController(QObject):
             result = tools.key(keys)
             self._raise_if_live_cancelled()
             return result
+        if action == "scroll":
+            # Negative scrolls down, positive up (pyautogui clicks; ~a notch per unit).
+            amount = self._live_int(args.get("amount"), -10, -1000, 1000)
+            if app:
+                tools.focus_window(app)
+                self._raise_if_live_cancelled()
+            result = tools.scroll(amount)
+            self._raise_if_live_cancelled()
+            return result
         raise ValueError(f"Unsupported desktop action: {action}")
 
     def _live_desktop_control(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1318,6 +1328,8 @@ class OverlayController(QObject):
             self._active_task_goal = ""
             self._set_label("Stopped", source="live_stop", force=True)
             return {"ok": True, "stopped": stopped, "message": "Stop request accepted."}
+        if name == "look_at_screen":
+            return self._live_look_at_screen(args)
         if name == "get_companion_status":
             try:
                 data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
@@ -1333,6 +1345,34 @@ class OverlayController(QObject):
         self.cursorStateRequested.emit("thinking")
         self._set_label("Unsupported Live tool", source="live_tool", force=True)
         return {"ok": False, "message": f"Unknown tool: {name}"}
+
+    def _live_look_at_screen(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Capture a screenshot and hand it to Live's own vision so it can SEE the
+        screen and answer (no local OCR). Read-only — fine to use mid-task."""
+        live = self._live
+        if live is None or not hasattr(live, "send_screen_image"):
+            return {"ok": False, "message": "Live vision isn't available right now."}
+        question = _clean_text(args.get("question") or "")
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Looking at the screen", source="live_tool", force=True)
+        try:
+            shot = self._live_desktop_tools().screenshot()
+        except Exception as exc:
+            return {"ok": False, "message": f"Couldn't capture the screen: {str(exc)[:160]}"}
+        b64 = getattr(shot, "base64_image", None)
+        if not bool(getattr(shot, "ok", False)) or not b64:
+            return {"ok": False, "message": "Couldn't capture the screen."}
+        try:
+            import base64 as _b64
+            data = _b64.b64decode(b64)
+        except Exception:
+            return {"ok": False, "message": "Couldn't read the screenshot."}
+        prompt = ("Here's a screenshot of the user's screen. "
+                  + (question or "Describe what's on it.")
+                  + " Answer out loud in one or two short, natural sentences.")
+        if not bool(live.send_screen_image(data, prompt)):
+            return {"ok": False, "message": "Couldn't send the screen image."}
+        return {"ok": True, "message": "Looking at the screen now — describe what you see."}
 
     def _live_start_desktop_task(self, args: dict[str, Any]) -> dict[str, Any]:
         goal = _clean_text(args.get("goal") or "")
@@ -1438,8 +1478,23 @@ class OverlayController(QObject):
         et = str(ev.get("type") or "")
         if et not in TERMINAL_TASK_STATES:
             return
+        goal = self._live_task_ids.get(task_id, "")
         summary = _clean_text(ev.get("reason") or ev.get("message") or "")
-        self._finish_live_task(task_id, et, summary, ok=et in ("done", "complete"))
+        ok = et in ("done", "complete")
+        self._finish_live_task(task_id, et, summary, ok=ok)
+        # Proactively tell Live a long job just finished so it can announce it
+        # ("hey, that's done") instead of the user having to ask.
+        live = self._live
+        if live is not None and hasattr(live, "send_task_update"):
+            verb = "finished" if ok else et
+            note = f'Heads up: the background task "{goal or "you started"}" just {verb}.'
+            if summary:
+                note += f" Result: {_short(summary, 200)}"
+            note += " Let the user know in one short, natural sentence."
+            try:
+                live.send_task_update(note)
+            except Exception:
+                pass
 
     def _load_preferences_async(self) -> None:
         def run() -> None:

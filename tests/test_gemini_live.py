@@ -56,6 +56,7 @@ def test_function_declarations_cover_desktop_tools():
         "start_desktop_task",
         "stop_current_task",
         "get_companion_status",
+        "look_at_screen",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")
@@ -67,7 +68,7 @@ def test_function_declarations_cover_desktop_tools():
     desktop = next(d for d in decls if d.name == "desktop_control")
     desktop_schema = desktop.parameters_json_schema
     assert desktop_schema["required"] == ["action"]
-    assert {"find", "click", "type", "press_keys"} <= set(
+    assert {"find", "click", "type", "press_keys", "scroll"} <= set(
         desktop_schema["properties"]["action"]["enum"]
     )
 
@@ -1514,3 +1515,175 @@ def test_resample_audio_invalid():
     # 7 bytes is not a multiple of 2 (int16), causing a ValueError in np.frombuffer, falling back to original bytes.
     assert _resample_audio(b"oddbyte", 16000, 24000) == b"oddbyte"
 
+
+
+# ── New Gemini Live improvements: barge-in, resumption, greeting, scroll,
+#    look-at-screen, proactive task completion ────────────────────────────
+
+def test_flush_output_drains_queue_on_barge_in():
+    import asyncio as aio
+    from app.widget import gemini_live as gl
+
+    q = aio.Queue()
+    for _ in range(5):
+        q.put_nowait(b"x")
+    gl.GeminiLiveCompanion._flush_output(q)
+    assert q.empty()
+
+
+def test_handle_message_flushes_output_on_interruption():
+    import asyncio as aio
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    q = aio.Queue()
+    for _ in range(3):
+        q.put_nowait(b"a")
+
+    class Content:
+        interrupted = True
+        input_transcription = None
+        output_transcription = None
+        model_turn = None
+        turn_complete = False
+
+    class FakeMessage:
+        session_resumption_update = None
+        server_content = Content()
+        tool_call = None
+
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    aio.run(comp._handle_message(object(), FakeMessage(), q, types))
+    assert q.empty()  # barge-in dropped the queued speaker backlog
+
+
+def test_handle_message_captures_session_resumption_handle():
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    class Resume:
+        resumable = True
+        new_handle = "handle-xyz"
+
+    class FakeMessage:
+        session_resumption_update = Resume()
+        server_content = None
+        tool_call = None
+
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    asyncio.run(comp._handle_message(object(), FakeMessage(), None, types))
+    assert comp._resume_handle == "handle-xyz"
+
+
+def test_live_config_carries_resume_handle():
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    comp._resume_handle = "h-2"
+    cfg = comp._live_config(types)
+    assert cfg.session_resumption is not None
+    assert cfg.session_resumption.handle == "h-2"
+
+
+def test_maybe_greet_once_and_respects_env(monkeypatch):
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    class FakeSession:
+        def __init__(self):
+            self.sent = 0
+
+        async def send_client_content(self, turns=None, turn_complete=None):
+            self.sent += 1
+
+    monkeypatch.delenv("GEMINI_LIVE_GREETING", raising=False)
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    s = FakeSession()
+    asyncio.run(comp._maybe_greet(s, types))
+    asyncio.run(comp._maybe_greet(s, types))
+    assert s.sent == 1  # greets exactly once per session
+
+    monkeypatch.setenv("GEMINI_LIVE_GREETING", "0")
+    comp2 = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    s2 = FakeSession()
+    asyncio.run(comp2._maybe_greet(s2, types))
+    assert s2.sent == 0  # silenced
+
+
+def test_live_desktop_control_scroll_routes_to_tools():
+    from app.models import ToolResult
+
+    c = _controller()
+
+    class FakeTools:
+        def __init__(self):
+            self.scrolled = None
+
+        def scroll(self, amount):
+            self.scrolled = amount
+            return ToolResult(ok=True, output=f"Scrolled {amount}")
+
+    ft = FakeTools()
+    c._desktop_tools = ft
+    res = c._live_tool("desktop_control", {"action": "scroll", "amount": -25})
+    assert res["ok"] is True
+    assert ft.scrolled == -25
+
+
+def test_live_look_at_screen_sends_screenshot_to_vision():
+    import base64
+    from app.models import ToolResult
+
+    c = _controller()
+
+    class FakeTools:
+        def screenshot(self):
+            return ToolResult(ok=True, output="shot",
+                              base64_image=base64.b64encode(b"IMGDATA").decode())
+
+    c._desktop_tools = FakeTools()
+
+    class FakeLive:
+        def __init__(self):
+            self.img = None
+            self.prompt = None
+
+        def is_running(self):
+            return True
+
+        def send_screen_image(self, data, prompt=""):
+            self.img = data
+            self.prompt = prompt
+            return True
+
+    fl = FakeLive()
+    c._live = fl
+    res = c._live_tool("look_at_screen", {"question": "what is this error"})
+    assert res["ok"] is True
+    assert fl.img == b"IMGDATA"               # the real screenshot bytes were sent
+    assert "what is this error" in fl.prompt  # with the user's question
+
+
+def test_capture_live_task_outcome_notifies_live_proactively():
+    c = _controller()
+
+    class FakeLive:
+        def __init__(self):
+            self.note = None
+
+        def send_task_update(self, text):
+            self.note = text
+
+    fl = FakeLive()
+    c._live = fl
+    c._live_task_ids = {"clicky-9": "organize my downloads"}
+    c._active_task_running = True
+
+    c._capture_live_task_outcome({
+        "type": "done", "task_id": "clicky-9", "reason": "Sorted 12 files.",
+    })
+
+    assert c._active_task_running is False
+    assert fl.note and "organize my downloads" in fl.note
+    assert "Sorted 12 files." in fl.note
