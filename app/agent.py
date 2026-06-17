@@ -2469,6 +2469,7 @@ class AgentService:
                                         await self._emit(task_id, "status", {"message": f"Working on step {step+1}…"})
                                     if event["type"] == "thought":
                                         thought_text += event["content"]
+                                        await self._emit(task_id, "agent_delta", {"delta": event["content"]})
                                         _now = asyncio.get_running_loop().time()
                                         if _now - _last_reason_emit >= _REASON_MIN_INTERVAL:
                                             _last_reason_emit = _now
@@ -2539,6 +2540,7 @@ class AgentService:
                             )
                             import re
                             _got_first_chunk = False
+                            last_emitted_thought_len = 0
                             async for chunk in stream_gen:
                                 if not _got_first_chunk:
                                     _got_first_chunk = True
@@ -2556,9 +2558,17 @@ class AgentService:
                                         # No <thought> wrapper — stream all pre-action text (e.g. nemotron)
                                         thought_text = re.sub(r'<action.*', '', buffer, flags=re.DOTALL).strip()
                                     if thought_text:
+                                        delta_text = thought_text[last_emitted_thought_len:]
+                                        if delta_text:
+                                            await self._emit(task_id, "agent_delta", {"delta": delta_text})
+                                            last_emitted_thought_len = len(thought_text)
                                         await self._emit(task_id, "reasoning", {"stage": f"Step {step+1}", "summary": "Thinking...", "detail": thought_text, "live": True, "elapsed_seconds": _step_elapsed()})
                                 if "</thought>" in buffer and not in_action:
                                     thought_text = buffer.split("<thought>")[1].split("</thought>")[0]
+                                    delta_text = thought_text[last_emitted_thought_len:]
+                                    if delta_text:
+                                        await self._emit(task_id, "agent_delta", {"delta": delta_text})
+                                        last_emitted_thought_len = len(thought_text)
                                     await self._emit(task_id, "reasoning", {"stage": f"Step {step+1}", "summary": thought_text[:50]+"...", "detail": thought_text, "live": False, "elapsed_seconds": _step_elapsed()})
                                 if "<delegate" in buffer and "</delegate>" in buffer and not in_action:
                                     model_match = re.search(r'<delegate\s+model="([^"]+)">', buffer)

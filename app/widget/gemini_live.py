@@ -32,6 +32,24 @@ def _noop(*_args: Any, **_kwargs: Any) -> None:
     return None
 
 
+def _resample_audio(data: bytes, from_rate: int, to_rate: int) -> bytes:
+    if from_rate == to_rate or not data:
+        return data
+    import numpy as np
+    try:
+        arr = np.frombuffer(data, dtype=np.int16)
+        duration = len(arr) / from_rate
+        num_samples = int(duration * to_rate)
+        if num_samples <= 0:
+            return data
+        x_old = np.linspace(0, duration, len(arr), endpoint=False)
+        x_new = np.linspace(0, duration, num_samples, endpoint=False)
+        arr_new = np.interp(x_new, x_old, arr).astype(np.int16)
+        return arr_new.tobytes()
+    except Exception:
+        return data
+
+
 def gemini_api_key() -> str:
     return (
         os.environ.get("GEMINI_API_KEY")
@@ -183,9 +201,15 @@ class GeminiLiveCompanion:
 
         self._loop = asyncio.get_running_loop()
         audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=24)
+        output_queue: asyncio.Queue[bytes] = asyncio.Queue()
+
+        input_rate = GEMINI_LIVE_INPUT_RATE
+        input_resample = False
 
         def input_callback(indata: Any, _frames: int, _time: Any, _status: Any) -> None:
             chunk = bytes(indata)
+            if input_resample:
+                chunk = _resample_audio(chunk, input_rate, GEMINI_LIVE_INPUT_RATE)
             try:
                 arr = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
                 if arr.size:
@@ -209,45 +233,157 @@ class GeminiLiveCompanion:
             if loop is not None:
                 loop.call_soon_threadsafe(put_chunk)
 
-        input_stream = sd.RawInputStream(
-            samplerate=GEMINI_LIVE_INPUT_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=1600,
-            callback=input_callback,
-        )
-        output_stream = sd.RawOutputStream(
-            samplerate=GEMINI_LIVE_OUTPUT_RATE,
-            channels=1,
-            dtype="int16",
-            blocksize=2400,
-        )
+        try:
+            input_stream = sd.RawInputStream(
+                samplerate=input_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=1600,
+                callback=input_callback,
+            )
+        except Exception:
+            try:
+                device_info = sd.query_devices(kind="input")
+                input_rate = int(device_info["default_samplerate"])
+            except Exception:
+                input_rate = 16000
+            input_resample = (input_rate != GEMINI_LIVE_INPUT_RATE)
+            blocksize = int(input_rate * 0.1)
+            try:
+                input_stream = sd.RawInputStream(
+                    samplerate=input_rate,
+                    channels=1,
+                    dtype="int16",
+                    blocksize=blocksize,
+                    callback=input_callback,
+                )
+            except Exception as exc:
+                self.callbacks.on_error(f"Failed to open microphone stream: {exc}")
+                return
 
+        output_rate = GEMINI_LIVE_OUTPUT_RATE
+        output_resample = False
+        try:
+            output_stream = sd.RawOutputStream(
+                samplerate=output_rate,
+                channels=1,
+                dtype="int16",
+                blocksize=2400,
+            )
+        except Exception:
+            try:
+                device_info = sd.query_devices(kind="output")
+                output_rate = int(device_info["default_samplerate"])
+            except Exception:
+                output_rate = 24000
+            output_resample = (output_rate != GEMINI_LIVE_OUTPUT_RATE)
+            blocksize = int(output_rate * 0.1)
+            try:
+                output_stream = sd.RawOutputStream(
+                    samplerate=output_rate,
+                    channels=1,
+                    dtype="int16",
+                    blocksize=blocksize,
+                )
+            except Exception as exc:
+                input_stream.close()
+                self.callbacks.on_error(f"Failed to open speaker stream: {exc}")
+                return
+
+        async def play_audio_loop() -> None:
+            while not self._stop.is_set():
+                try:
+                    chunk = await output_queue.get()
+                except asyncio.CancelledError:
+                    break
+                if output_resample:
+                    chunk = _resample_audio(chunk, GEMINI_LIVE_OUTPUT_RATE, output_rate)
+                try:
+                    await asyncio.to_thread(output_stream.write, chunk)
+                    self._audio_fail_streak = 0
+                except Exception as exc:
+                    self._audio_fail_streak += 1
+                    if self._audio_fail_streak >= GEMINI_LIVE_MAX_AUDIO_FAILS:
+                        self._stop.set()
+                        self.callbacks.on_error(f"Live audio output failed: {exc}")
+                        break
+                finally:
+                    output_queue.task_done()
+
+        input_stream.start()
+        output_stream.start()
+        self.callbacks.on_status("Gemini Live listening")
+
+        player = asyncio.create_task(play_audio_loop())
         client = genai.Client(api_key=gemini_api_key())
         config = self._live_config(types)
 
-        async with client.aio.live.connect(model=self.model, config=config) as session:
-            self._session = session
-            self._audio_fail_streak = 0
-            input_stream.start()
-            output_stream.start()
-            self.callbacks.on_status("Gemini Live listening")
-            sender = asyncio.create_task(self._send_audio(session, audio_queue, types))
-            try:
-                await self._receive_loop(session, output_stream, types)
-            finally:
-                self._stop.set()
-                sender.cancel()
+        retries = 0
+        max_retries = 5
+        retry_delay = 1.0
+
+        try:
+            while not self._stop.is_set():
+                if retries > 0:
+                    self.callbacks.on_status(f"Live reconnecting ({retries}/{max_retries})...")
                 try:
-                    await session.send_realtime_input(audio_stream_end=True)
+                    async with client.aio.live.connect(model=self.model, config=config) as session:
+                        self._session = session
+                        self._audio_fail_streak = 0
+                        retries = 0
+                        retry_delay = 1.0
+                        self.callbacks.on_status("Gemini Live listening")
+
+                        # Clear stale audio chunks from mic queue on reconnect
+                        while not audio_queue.empty():
+                            try:
+                                audio_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+
+                        sender = asyncio.create_task(self._send_audio(session, audio_queue, types))
+                        try:
+                            await self._receive_loop(session, output_queue, types)
+                        finally:
+                            sender.cancel()
+                            try:
+                                await sender
+                            except asyncio.CancelledError:
+                                pass
+                except Exception as exc:
+                    if self._stop.is_set():
+                        break
+                    retries += 1
+                    if retries > max_retries:
+                        raise exc
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2.0, 10.0)
+        finally:
+            self._stop.set()
+            player.cancel()
+            try:
+                await player
+            except asyncio.CancelledError:
+                pass
+            while not output_queue.empty():
+                try:
+                    output_queue.get_nowait()
+                    output_queue.task_done()
+                except (asyncio.QueueEmpty, ValueError):
+                    break
+
+            if self._session is not None:
+                try:
+                    await self._session.send_realtime_input(audio_stream_end=True)
                 except Exception:
                     pass
-                for stream in (input_stream, output_stream):
-                    try:
-                        stream.stop()
-                        stream.close()
-                    except Exception:
-                        pass
+
+            for stream in (input_stream, output_stream):
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
 
     def _live_config(self, types: Any) -> Any:
         # Our desktop function tools work on the free tier. Google Search grounding
@@ -291,12 +427,12 @@ class GeminiLiveCompanion:
                 )
             )
 
-    async def _receive_loop(self, session: Any, output_stream: Any, types: Any) -> None:
+    async def _receive_loop(self, session: Any, output_queue_or_stream: Any, types: Any) -> None:
         while not self._stop.is_set():
             async for message in session.receive():
                 if self._stop.is_set():
                     return
-                await self._handle_message(session, message, output_stream, types)
+                await self._handle_message(session, message, output_queue_or_stream, types)
                 if self._stop.is_set():
                     return
 
@@ -304,7 +440,7 @@ class GeminiLiveCompanion:
         self,
         session: Any,
         message: Any,
-        output_stream: Any,
+        output_queue_or_stream: Any,
         types: Any,
     ) -> None:
         content = getattr(message, "server_content", None)
@@ -326,20 +462,26 @@ class GeminiLiveCompanion:
                 inline = getattr(part, "inline_data", None)
                 data = getattr(inline, "data", None)
                 if data:
-                    try:
-                        output_stream.write(data)
-                        self._audio_fail_streak = 0
-                    except Exception as exc:
-                        # One glitch (underrun, brief device blip) must NOT end the
-                        # conversation — skip the chunk and keep going. Only give up
-                        # if output fails solidly for a while, and when we do, stop
-                        # the session cleanly (self._stop) so the receive loop unwinds
-                        # and the thread can't be left running after on_error.
-                        self._audio_fail_streak += 1
-                        if self._audio_fail_streak >= GEMINI_LIVE_MAX_AUDIO_FAILS:
-                            self._stop.set()
-                            self.callbacks.on_error(f"Live audio output failed: {exc}")
-                            return
+                    if hasattr(output_queue_or_stream, "put_nowait"):
+                        try:
+                            output_queue_or_stream.put_nowait(data)
+                        except Exception:
+                            pass
+                    elif hasattr(output_queue_or_stream, "write"):
+                        try:
+                            output_queue_or_stream.write(data)
+                            self._audio_fail_streak = 0
+                        except Exception as exc:
+                            # One glitch (underrun, brief device blip) must NOT end the
+                            # conversation — skip the chunk and keep going. Only give up
+                            # if output fails solidly for a while, and when we do, stop
+                            # the session cleanly (self._stop) so the receive loop unwinds
+                            # and the thread can't be left running after on_error.
+                            self._audio_fail_streak += 1
+                            if self._audio_fail_streak >= GEMINI_LIVE_MAX_AUDIO_FAILS:
+                                self._stop.set()
+                                self.callbacks.on_error(f"Live audio output failed: {exc}")
+                                return
             if getattr(content, "turn_complete", False):
                 if not output_finished:
                     self.callbacks.on_output_transcript("", True)

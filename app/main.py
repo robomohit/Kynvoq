@@ -507,6 +507,7 @@ def _load_persisted_tasks() -> Dict[str, TaskRecord]:
             inferred.status = "failed"
             inferred.reason = inferred.reason or "Server restarted while task was active."
             inferred.finished_at = inferred.finished_at or datetime.now(timezone.utc).isoformat()
+            _save_task_record(inferred)
         tasks[task_id] = inferred
 
     result = {task_id: record for task_id, record in tasks.items() if record is not None}
@@ -550,8 +551,23 @@ def _serialize_task_record(record: TaskRecord) -> dict:
     terminal = _is_terminal_status(record.status)
     payload["paused"] = False if terminal else bool(record.paused or record.id in service._paused_tasks)
     payload["server_running"] = _task_is_server_running(record.id)
-    if not terminal and (payload["server_running"] or payload["paused"]):
-        payload["status"] = "paused" if payload["paused"] else "running"
+    
+    is_queued = any(spec["task_id"] == record.id for spec in _queued_task_specs)
+    if not terminal:
+        if payload["server_running"] or payload["paused"] or is_queued:
+            payload["status"] = "paused" if payload["paused"] else ("queued" if is_queued else "running")
+        else:
+            # Transition stale record to failed
+            record.status = "failed"
+            record.reason = record.reason or "Server restarted or task was abandoned."
+            record.finished_at = record.finished_at or datetime.now(timezone.utc).isoformat()
+            record.paused = False
+            _save_task_record(record)
+            
+            payload = record.model_dump()
+            payload["paused"] = False
+            payload["server_running"] = False
+            payload["status"] = "failed"
     return payload
 
 

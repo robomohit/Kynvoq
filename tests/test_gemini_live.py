@@ -1487,3 +1487,30 @@ def test_live_owns_cursor_state_while_running():
     c._update_cursor_state_from_event({"type": "task_created"})
     c._update_cursor_state_from_event({"type": "done"})
     assert states == ["thinking", "idle"]
+
+
+def test_resample_audio():
+    from app.widget.gemini_live import _resample_audio
+    import numpy as np
+
+    # Create a simple mono audio data at 16000Hz (1600 samples of 2 bytes each = 3200 bytes)
+    data = np.arange(1600, dtype=np.int16).tobytes()
+    
+    # Resample to 32000Hz (should double the number of samples to 3200, i.e., 6400 bytes)
+    resampled = _resample_audio(data, 16000, 32000)
+    assert len(resampled) == 6400
+
+    # Resample to 8000Hz (should halve the number of samples to 800, i.e., 1600 bytes)
+    resampled2 = _resample_audio(data, 16000, 8000)
+    assert len(resampled2) == 1600
+
+    # Resampling to same rate should return identical bytes
+    assert _resample_audio(data, 16000, 16000) == data
+
+
+def test_resample_audio_invalid():
+    from app.widget.gemini_live import _resample_audio
+    assert _resample_audio(b"", 16000, 24000) == b""
+    # 7 bytes is not a multiple of 2 (int16), causing a ValueError in np.frombuffer, falling back to original bytes.
+    assert _resample_audio(b"oddbyte", 16000, 24000) == b"oddbyte"
+

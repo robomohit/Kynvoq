@@ -555,6 +555,9 @@
     'openrouter/nvidia/nemotron-3-super-120b-a12b:free': 'Nemotron Super (free)',
     'openrouter/meta-llama/llama-3.3-70b-instruct:free': 'Llama 3.3 70B (free)',
     'openrouter/google/gemma-4-31b-it:free': 'Gemma 4 31B (free)',
+    'openrouter/google/gemma-4-26b-a4b-it:free': 'Gemma 4 26B (free)',
+    'openrouter/nousresearch/hermes-3-llama-3.1-405b:free': 'Hermes 3 Llama 3.1 405B (free)',
+    'openrouter/openai/gpt-oss-120b:free': 'GPT-OSS 120B (free)',
     'claude-3-5-sonnet-20241022': 'Claude 3.5 Sonnet',
     'claude-3-7-sonnet-20250219': 'Claude 3.7 Sonnet',
     'claude-3-opus-20240229': 'Claude 3 Opus',
@@ -590,7 +593,7 @@
   };
 
   const toast = (message, kind = 'info', ttl = 3200) => {
-    if (/^Stream interrupted\. Reconnecting/i.test(String(message || ''))) return null;
+    if (/^(Stream interrupted|Reconnecting|Reconnected|Live stream interrupted)/i.test(String(message || ''))) return null;
     const stack = $('toast-stack');
     if (!stack) return null;
     const existing = Array.from(stack.children).find((node) => node.dataset.message === message);
@@ -806,8 +809,9 @@
   // Minimal, injection-safe markdown renderer for agent replies.
   // HTML is escaped FIRST; only known-safe tags are then inserted.
   const renderMarkdown = (raw) => {
+    raw = String(raw || '').replace(/\r\n/g, '\n');
     const esc = escapeHtml;
-    let text = String(raw || '');
+    let text = raw;
     const blocks = [];
     const stash = (html, kind) => {
       blocks.push(html);
@@ -989,7 +993,7 @@
     el.className = `status-note status-${normalized}`;
     const icon = document.createElement('span');
     icon.className = 'status-note-icon';
-    icon.textContent = normalized === 'error' ? '!' : normalized === 'paused' ? '||' : normalized === 'success' ? 'OK' : 'i';
+    icon.textContent = normalized === 'error' ? '⚠' : normalized === 'paused' ? '⏸' : normalized === 'success' ? '✓' : 'ℹ';
     const copy = document.createElement('span');
     copy.className = 'status-note-copy';
     copy.textContent = text || humanize(normalized);
