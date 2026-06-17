@@ -12,7 +12,14 @@ from typing import Any, Callable
 GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
 GEMINI_LIVE_INPUT_RATE = 16000
 GEMINI_LIVE_OUTPUT_RATE = 24000
-GEMINI_LIVE_TOOL_TIMEOUT = 12.0
+# Outer cap on a tool call. Must stay safely ABOVE the longest bounded desktop
+# action (a wait can run ~9s + focus/observe overhead) — otherwise this fires
+# first, the thread keeps running uncancellably, and the model is told "timed out"
+# while the action is actually still going.
+GEMINI_LIVE_TOOL_TIMEOUT = 15.0
+# A single audio-output glitch (buffer underrun, device blip) must not kill the
+# whole conversation — only give up after this many in a row (~4s of 100ms chunks).
+GEMINI_LIVE_MAX_AUDIO_FAILS = 40
 
 
 StatusCallback = Callable[[str], None]
@@ -125,6 +132,7 @@ class GeminiLiveCompanion:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._session: Any = None
         self._lock = threading.Lock()
+        self._audio_fail_streak = 0
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -220,6 +228,7 @@ class GeminiLiveCompanion:
 
         async with client.aio.live.connect(model=self.model, config=config) as session:
             self._session = session
+            self._audio_fail_streak = 0
             input_stream.start()
             output_stream.start()
             self.callbacks.on_status("Gemini Live listening")
@@ -319,8 +328,18 @@ class GeminiLiveCompanion:
                 if data:
                     try:
                         output_stream.write(data)
+                        self._audio_fail_streak = 0
                     except Exception as exc:
-                        self.callbacks.on_error(f"Live audio output failed: {exc}")
+                        # One glitch (underrun, brief device blip) must NOT end the
+                        # conversation — skip the chunk and keep going. Only give up
+                        # if output fails solidly for a while, and when we do, stop
+                        # the session cleanly (self._stop) so the receive loop unwinds
+                        # and the thread can't be left running after on_error.
+                        self._audio_fail_streak += 1
+                        if self._audio_fail_streak >= GEMINI_LIVE_MAX_AUDIO_FAILS:
+                            self._stop.set()
+                            self.callbacks.on_error(f"Live audio output failed: {exc}")
+                            return
             if getattr(content, "turn_complete", False):
                 if not output_finished:
                     self.callbacks.on_output_transcript("", True)

@@ -343,6 +343,58 @@ def test_handle_message_writes_model_audio_to_output_stream():
     assert written == [b"\x01\x02\x03\x04"]
 
 
+def test_handle_message_tolerates_audio_output_glitches():
+    """A few failed output writes (underrun / brief device blip) must NOT end the
+    conversation. Only a sustained run gives up — once — and then stops the session
+    cleanly (self._stop) so the thread can't be left running after on_error."""
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    class FailingOutput:
+        def write(self, data):
+            raise OSError("device blip")
+
+    class OkOutput:
+        def write(self, data):
+            pass
+
+    class FakePart:
+        class inline_data:
+            data = b"\x01\x02"
+
+    class FakeTurn:
+        parts = [FakePart()]
+
+    class FakeContent:
+        input_transcription = None
+        output_transcription = None
+        model_turn = FakeTurn()
+        turn_complete = False
+
+    class FakeMessage:
+        server_content = FakeContent()
+        tool_call = None
+
+    errors = []
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks(on_error=errors.append))
+
+    # A handful of glitches are absorbed — the conversation keeps going.
+    for _ in range(5):
+        asyncio.run(comp._handle_message(object(), FakeMessage(), FailingOutput(), types))
+    assert errors == [] and not comp._stop.is_set()
+
+    # A good write resets the streak — failures must be CONSECUTIVE to count.
+    asyncio.run(comp._handle_message(object(), FakeMessage(), OkOutput(), types))
+    assert comp._audio_fail_streak == 0
+
+    # A sustained run of glitches finally gives up exactly once, stopping cleanly.
+    for _ in range(gl.GEMINI_LIVE_MAX_AUDIO_FAILS + 10):
+        if comp._stop.is_set():
+            break
+        asyncio.run(comp._handle_message(object(), FakeMessage(), FailingOutput(), types))
+    assert len(errors) == 1 and comp._stop.is_set()
+
+
 def test_handle_message_emits_transcripts():
     """Input/output transcriptions reach the callbacks so the bubble can show them."""
     from google.genai import types

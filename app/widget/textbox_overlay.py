@@ -1147,7 +1147,9 @@ class OverlayController(QObject):
         app = _clean_text(args.get("app") or "")
         title = _clean_text(args.get("title") or app)
         query = _clean_text(args.get("query") or "")
-        timeout = self._live_float(args.get("timeout"), 6.0, 0.5, 10.0)
+        # Cap below GEMINI_LIVE_TOOL_TIMEOUT so the bounded wait always finishes
+        # before the outer tool timeout could fire (no leaked, "timed-out" thread).
+        timeout = self._live_float(args.get("timeout"), 6.0, 0.5, 9.0)
         limit = self._live_int(args.get("limit"), 5, 1, 10)
         cap = self._live_int(args.get("cap"), 90, 20, 220)
 
