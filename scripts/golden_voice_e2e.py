@@ -81,6 +81,19 @@ def _app_handles(needle: str) -> set[int]:
     return found
 
 
+def _foreground_matches(needle: str) -> bool:
+    """True if the foreground window's title contains `needle`. Covers single-instance
+    apps (Settings, Task Manager) that were already open: "open X" correctly surfaces
+    the existing window instead of spawning a new one, so the new-window check alone
+    would be a false negative."""
+    needle = needle.lower()
+    try:
+        import win32gui
+        return needle in win32gui.GetWindowText(win32gui.GetForegroundWindow()).lower()
+    except Exception:
+        return False
+
+
 def _infer_window_needle(phrase: str) -> str:
     """Map a spoken 'open X' command to the substring its window title will contain.
     Returns '' when we can't confidently verify on screen (then we fall back to the
@@ -184,18 +197,31 @@ def _run_phrase_reps(phrase: str, reps: int, port: int, window_needle: str,
 
         status, reason = _poll_terminal(client, task_id, timeout=90.0)
         ms = (time.perf_counter() - t0) * 1000.0
-        opened = (_app_handles(window_needle) - before) if window_needle else set()
+        # Some apps (UWP Paint/Settings) paint their window a beat after the task
+        # returns done. Poll briefly so a slightly-late window isn't a false miss —
+        # but a genuine no-show still fails when the grace window elapses.
+        opened: set[int] = set()
+        surfaced = False
         if window_needle:
-            ok = status == "done" and len(opened) > 0
-            if status == "done" and not opened:
-                reason = reason or f"task said done but no '{window_needle}' window appeared"
+            grace = time.time() + 6.0
+            while True:
+                opened = _app_handles(window_needle) - before
+                surfaced = (not opened) and _foreground_matches(window_needle)
+                if opened or surfaced or time.time() >= grace:
+                    break
+                time.sleep(0.4)
+        if window_needle:
+            ok = status == "done" and (len(opened) > 0 or surfaced)
+            if status == "done" and not ok:
+                reason = reason or f"task said done but no '{window_needle}' window appeared or came to front"
         else:
             ok = status == "done"
+        via = "new-window" if opened else ("surfaced" if surfaced else "-")
         runs.append({"ok": ok, "status": status, "ms": ms,
-                     "reason": reason, "opened": len(opened)})
-        _close_handles(opened)  # only windows THIS rep created
+                     "reason": reason, "opened": len(opened), "via": via})
+        _close_handles(opened)  # only windows THIS rep created (never one already open)
         flag = "ok " if ok else "MISS"
-        log(f"  [rep {rep}] {flag} status={status} {ms/1000:.1f}s opened={len(opened)}"
+        log(f"  [rep {rep}] {flag} status={status} {ms/1000:.1f}s via={via}"
             + (f" — {reason}" if (reason and not ok) else ""))
         time.sleep(0.6)  # let the closed window settle before the next rep
 
