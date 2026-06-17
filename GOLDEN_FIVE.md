@@ -59,8 +59,17 @@ planner, and verifies the result by what appeared on screen (safe window-handle
 attribution — it never touches a window you already had open).
 
 ```
-python scripts/golden_voice_e2e.py --phrase "open notepad" --reps 3   # real planner, ~10-20s/rep
+python scripts/golden_voice_e2e.py --phrase "open notepad" --reps 10    # real planner, ~10-20s/rep
+python scripts/golden_voice_e2e.py --phrase "open calculator" --reps 10
 python scripts/golden_voice_e2e.py --wav me.wav --expect "open notepad"  # STT half, with YOUR voice
+```
+
+End-to-end baseline (2026-06-16, real backend + free gpt-oss planner):
+
+```
+spoken command     pass    median   max   verified by
+open notepad       10/10    12.3s   19.6s  a real Notepad window appeared
+open calculator    10/10    11.7s   18.5s  a real Calculator window appeared
 ```
 
 It is deliberately honest: it does **not** fake STT with a synthetic TTS->Whisper
@@ -74,7 +83,8 @@ with a real recording via `--wav`.
 > the free push-to-talk desktop path was 100% broken. Fixed by raising the cap to
 > 8000 (still under the 10 KB request guard); pinned by
 > `tests/test_voice_and_env.py::test_voice_desktop_payload_fits_task_schema`. After
-> the fix: "open notepad" e2e = 3/3 done, a real window each time (median 13.3s).
+> the fix, at the 10x bar: "open notepad" 10/10 and "open calculator" 10/10, a
+> real window verified on screen every time.
 
 Run it before trusting any change that touches `app/tools.py`,
 `app/widget/textbox_overlay.py`, or the desktop/UIA path. It needs a real Windows

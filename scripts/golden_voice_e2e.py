@@ -272,7 +272,7 @@ def main() -> int:
         else:
             log(f"using backend already running on :{args.port}")
 
-        report = _run_phrase_reps(args.phrase, args.reps, args.port, expect_window, log)
+        report = _run_phrase_reps(args.phrase, args.reps, args.port, window_needle, log)
         out["e2e"] = report
         log("=" * 64)
         log(f"{report['passed']}/{report['total']} passed  "
