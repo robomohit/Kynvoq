@@ -495,5 +495,12 @@ def _default_system_instruction() -> str:
         "conversationally — without using any tool. Ask a short clarifying question "
         "only when you genuinely can't act otherwise. For anything risky or "
         "irreversible (deleting files, sending messages, purchases), check with the "
-        "user before doing it."
+        "user before doing it.\n"
+        "Desktop tasks you launch with start_desktop_task run in the background and "
+        "you won't automatically hear how they end, so if the user asks how it went, "
+        "call get_companion_status to check. Only ONE desktop task can run at a time: "
+        "if you try to act on the computer while one is still running, the tool tells "
+        "you it's busy and names what's in progress — when that happens, say what's "
+        "running and ask whether to stop it (stop_current_task) or wait, instead of "
+        "trying again. Chatting and answering questions are always fine, even mid-task."
     )

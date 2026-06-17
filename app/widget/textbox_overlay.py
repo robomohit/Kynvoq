@@ -402,6 +402,9 @@ class OverlayController(QObject):
         self._tray: Any = None          # QSystemTrayIcon, for completion toasts
         self._effects_enabled = True    # honoured from the show_action_glow pref
         self._active_task_running = False
+        # Goal of the desktop task currently running (if any), so Live can name it
+        # when it refuses to start a second, colliding action on top of it.
+        self._active_task_goal: str = ""
         self._live: Any = None
         self._live_cancel = threading.Event()
         self._live_generation = 0
@@ -770,6 +773,7 @@ class OverlayController(QObject):
         except Exception:
             pass
         self._active_task_running = False
+        self._active_task_goal = ""
         did_stop = bool(stopped or live_was_running or recording_was_active)
         self._set_label("Stopped" if did_stop else "Nothing to stop", source="live_stop", force=True)
 
@@ -1243,9 +1247,47 @@ class OverlayController(QObject):
             return {"ok": False, "message": "Gemini Live session changed."}
         return self._live_tool(name, args)
 
+    def _active_desktop_task(self) -> str | None:
+        """Return the goal of a desktop task that's currently driving the screen, or
+        None. Used to stop a new Live action from colliding with one already running
+        (two agents on one desktop = stolen focus + interleaved keystrokes). The
+        cheap local flag gates the common case; when it says "busy" we confirm once
+        over HTTP so a stale flag can't lock Live out forever."""
+        if not self._active_task_running:
+            return None
+        try:
+            data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
+            tasks = data.get("tasks", []) if isinstance(data, dict) else []
+            if not tasks:
+                self._active_task_running = False
+                self._active_task_goal = ""
+                return None
+        except Exception:
+            pass  # network hiccup — trust the flag and stay safe (assume busy)
+        return self._active_task_goal or "a desktop task"
+
     def _live_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         name = str(name or "")
         args = args if isinstance(args, dict) else {}
+        # Never let Live start a SECOND desktop action while one is already running —
+        # they'd fight over focus and the keyboard and corrupt each other. Surface it
+        # so Live can tell the user and offer to stop it. (stop_current_task and
+        # get_companion_status are intentionally NOT gated — those are how you escape.)
+        if name in ("desktop_control", "start_desktop_task"):
+            active = self._active_desktop_task()
+            if active is not None:
+                self.cursorStateRequested.emit("thinking")
+                self._set_label("Busy: " + _short(active, 90), source="live_tool", force=True)
+                return {
+                    "ok": False,
+                    "busy": True,
+                    "active_task": active,
+                    "message": (
+                        f'A desktop task is already running: "{active}". Do NOT start '
+                        "another action on top of it. Tell the user what's in progress "
+                        "and ask whether to stop it (call stop_current_task) or wait."
+                    ),
+                }
         if name == "desktop_control":
             return self._live_desktop_control(args)
         if name == "start_desktop_task":
@@ -1257,6 +1299,7 @@ class OverlayController(QObject):
                 return {"ok": False, "message": str(exc)[:200]}
             self.cursorStateRequested.emit("idle")
             self._active_task_running = False
+            self._active_task_goal = ""
             self._set_label("Stopped", source="live_stop", force=True)
             return {"ok": True, "stopped": stopped, "message": "Stop request accepted."}
         if name == "get_companion_status":
@@ -1297,6 +1340,7 @@ class OverlayController(QObject):
                     payload["readiness_override"] = True
             self.client.request("POST", "/api/tasks", payload, timeout=20.0)
             self._active_task_running = True
+            self._active_task_goal = _short(goal, 80)
             self.cursorStateRequested.emit("thinking")
             self._set_label("Started: " + _short(goal, 120), source="live_tool", force=True)
             return {
@@ -1413,6 +1457,7 @@ class OverlayController(QObject):
             self._active_task_running = True
         elif t in ("done", "complete", "error", "failed", "cancelled"):
             self._active_task_running = False
+            self._active_task_goal = ""
         else:
             return
         # While Gemini Live drives, it owns the cursor state the same way it owns

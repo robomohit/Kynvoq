@@ -944,6 +944,66 @@ def test_live_tool_stop_acknowledges_even_without_backend_tasks():
     assert states == ["idle"]
 
 
+def test_live_refuses_colliding_desktop_action_while_task_running():
+    """Talking to Live mid-task must NOT start a second desktop action on top of a
+    running one — two agents on one screen steal focus and interleave keystrokes.
+    Live is told it's busy and what's running; stop is never gated (the escape hatch)."""
+    class FakeClient:
+        def __init__(self):
+            self.posted = []
+
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/active-tasks":
+                return {"tasks": [{"id": "running"}]}
+            if path == "/api/tasks":
+                self.posted.append(data)
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    c._active_task_running = True
+    c._active_task_goal = "write a poem in Notepad"
+
+    # A second start_desktop_task is refused — and never POSTed.
+    res = c._live_tool("start_desktop_task", {"goal": "open calculator"})
+    assert res["ok"] is False and res.get("busy") is True
+    assert "write a poem in Notepad" in res["active_task"]
+    assert "stop_current_task" in res["message"]
+    assert c.client.posted == []
+
+    # A bounded desktop_control is refused the same way (no ToolExecutor touched).
+    res2 = c._live_tool("desktop_control", {"action": "click", "query": "Save"})
+    assert res2["ok"] is False and res2.get("busy") is True
+
+    # The escape hatch still works: stop is never gated.
+    c._kill_active_tasks = lambda: 1
+    assert c._live_tool("stop_current_task", {})["ok"] is True
+
+
+def test_live_busy_gate_self_heals_when_task_already_finished():
+    """A stale 'running' flag must not lock Live out forever: the gate confirms over
+    /api/active-tasks, clears the flag when nothing's running, and lets the action go."""
+    class FakeClient:
+        def __init__(self):
+            self.posted = []
+
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/active-tasks":
+                return {"tasks": []}  # nothing actually running anymore
+            if path == "/api/tasks":
+                self.posted.append(data)
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    c._active_task_running = True  # stale
+    c._active_task_goal = "old task"
+
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad"})
+    assert res["ok"] is True
+    assert c.client.posted  # the new task was submitted, not blocked
+
+
 def test_stop_hotkey_worker_reports_stopped_when_live_only():
     class FakeLive:
         def __init__(self):
