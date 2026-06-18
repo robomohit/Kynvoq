@@ -578,3 +578,30 @@ def test_qt_shell_final_answer_reaches_companion_plain_and_short():
     assert "final_label = _plain_companion_text(clean) or \"Done\"" in block
     assert 'self._set_capsule_state("done", final_label)' in block
     assert "Done — result ready" not in block
+
+
+def test_force_utf8_stdio_is_crash_proof():
+    """A unicode log line (em/non-breaking hyphen, emoji from model text) must never
+    crash a print on the Windows cp1252 console. The reconfigure helper sets
+    utf-8/replace and swallows any failure (e.g. a stream that can't reconfigure)."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    try:
+        from app.widget import textbox_overlay as t
+    except Exception:
+        import pytest
+        pytest.skip("PySide6 not importable in this environment")
+
+    calls = []
+
+    class FakeStream:
+        def reconfigure(self, **kw):
+            calls.append(kw)
+
+    class BadStream:
+        def reconfigure(self, **kw):
+            raise OSError("cannot reconfigure")
+
+    # Must not raise even when one stream refuses to reconfigure.
+    t._force_utf8_stdio([FakeStream(), BadStream()])
+    assert {"encoding": "utf-8", "errors": "replace"} in calls

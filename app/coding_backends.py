@@ -108,7 +108,7 @@ class ClaudeCodeBackend(CodingBackend):
         try:
             proc = subprocess.run(
                 [exe, "--version"],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
             )
             version = (proc.stdout or proc.stderr or "").strip()
             return {
@@ -130,6 +130,7 @@ class ClaudeCodeBackend(CodingBackend):
             proc = subprocess.run(
                 cmd,
                 capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 cwd=repo_path or None,
                 timeout=SUBMIT_TIMEOUT_SECONDS,
             )

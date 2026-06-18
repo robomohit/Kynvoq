@@ -2,12 +2,24 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
 import queue
 import threading
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
+
+# Eager import heavy libraries to avoid slow initial voice hotkey response
+try:
+    import numpy as np
+    import sounddevice as sd
+    from google import genai
+    from google.genai import types
+except ImportError:
+    pass
 
 
 GEMINI_LIVE_MODEL = "gemini-3.1-flash-live-preview"
@@ -21,6 +33,38 @@ GEMINI_LIVE_TOOL_TIMEOUT = 15.0
 # A single audio-output glitch (buffer underrun, device blip) must not kill the
 # whole conversation — only give up after this many in a row (~4s of 100ms chunks).
 GEMINI_LIVE_MAX_AUDIO_FAILS = 40
+# Maximum retry delay capped at 30 seconds for connection robustness.
+GEMINI_LIVE_MAX_RETRY_DELAY = 30.0
+
+_DEBUG_SESSION = "eec63b"
+_DEBUG_LOG = (
+    Path(__file__).resolve().parents[2].parent / "Ai_computer" / "debug-eec63b.log"
+)
+
+
+def _agent_debug_log(
+    hypothesis_id: str,
+    location: str,
+    message: str,
+    data: dict[str, Any] | None = None,
+) -> None:
+    # region agent log
+    try:
+        payload = {
+            "sessionId": _DEBUG_SESSION,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+            "runId": "pre-fix",
+        }
+        _DEBUG_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+    # endregion
 
 
 StatusCallback = Callable[[str], None]
@@ -338,13 +382,12 @@ class GeminiLiveCompanion:
         client = genai.Client(api_key=gemini_api_key())
 
         retries = 0
-        max_retries = 5
         retry_delay = 1.0
 
         try:
             while not self._stop.is_set():
                 if retries > 0:
-                    self.callbacks.on_status(f"Live reconnecting ({retries}/{max_retries})...")
+                    self.callbacks.on_status(f"Live reconnecting (attempt {retries})...")
                 # Rebuilt each attempt so a reconnect carries the latest resume handle.
                 config = self._live_config(types)
                 try:
@@ -363,6 +406,9 @@ class GeminiLiveCompanion:
                             except asyncio.QueueEmpty:
                                 break
 
+                        # Clear stale audio chunks from speaker (output) queue on reconnect
+                        self._flush_output(output_q)
+
                         sender = asyncio.create_task(self._send_audio(session, audio_queue, types))
                         try:
                             await self._receive_loop(session, output_q, types)
@@ -376,10 +422,26 @@ class GeminiLiveCompanion:
                     if self._stop.is_set():
                         break
                     retries += 1
-                    if retries > max_retries:
-                        raise exc
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2.0, 10.0)
+                    # region agent log
+                    _agent_debug_log(
+                        "D",
+                        "gemini_live.py:_run:reconnect",
+                        "live connection dropped, retrying",
+                        {
+                            "attempt": retries,
+                            "retry_delay": retry_delay,
+                            "error": str(exc)[:160],
+                            "has_resume_handle": bool(self._resume_handle),
+                        },
+                    )
+                    # endregion
+
+                    # Responsive sleep loop
+                    slept = 0.0
+                    while slept < retry_delay and not self._stop.is_set():
+                        await asyncio.sleep(0.1)
+                        slept += 0.1
+                    retry_delay = min(retry_delay * 2.0, GEMINI_LIVE_MAX_RETRY_DELAY)
         finally:
             self._stop.set()
             try:
@@ -606,10 +668,41 @@ class GeminiLiveCompanion:
                 if not output_finished:
                     self.callbacks.on_output_transcript("", True)
                 self.callbacks.on_status("Gemini Live listening")
+                if not getattr(getattr(message, "tool_call", None), "function_calls", None):
+                    # region agent log
+                    _agent_debug_log(
+                        "A",
+                        "gemini_live.py:_handle_message:turn_complete",
+                        "turn finished without tool_call in same message",
+                        {
+                            "had_output_transcript": bool(
+                                getattr(
+                                    getattr(content, "output_transcription", None),
+                                    "text",
+                                    "",
+                                )
+                            ),
+                            "interrupted": bool(getattr(content, "interrupted", False)),
+                        },
+                    )
+                    # endregion
 
         tool_call = getattr(message, "tool_call", None)
         calls = getattr(tool_call, "function_calls", None) if tool_call else None
         if calls:
+            # region agent log
+            _agent_debug_log(
+                "A",
+                "gemini_live.py:_handle_message:tool_call",
+                "model tool_call received",
+                {
+                    "tools": [
+                        str(getattr(call, "name", "") or "")
+                        for call in calls
+                    ],
+                },
+            )
+            # endregion
             responses = []
             for call in calls:
                 name = str(getattr(call, "name", "") or "")
@@ -636,6 +729,14 @@ class GeminiLiveCompanion:
         if self._stop.is_set():
             return {"ok": False, "message": "Gemini Live was stopped."}
         self.callbacks.on_status(f"Gemini Live tool: {name}")
+        # region agent log
+        _agent_debug_log(
+            "E",
+            "gemini_live.py:_execute_tool:entry",
+            "executing local tool handler",
+            {"tool": name, "arg_keys": sorted(args.keys())},
+        )
+        # endregion
         try:
             if inspect.iscoroutinefunction(handler):
                 result = await asyncio.wait_for(
@@ -655,14 +756,46 @@ class GeminiLiveCompanion:
             if self._stop.is_set():
                 return {"ok": False, "message": "Gemini Live was stopped."}
             if isinstance(result, dict):
+                # region agent log
+                _agent_debug_log(
+                    "E",
+                    "gemini_live.py:_execute_tool:exit",
+                    "tool handler finished",
+                    {"tool": name, "ok": bool(result.get("ok", True))},
+                )
+                # endregion
                 return result
+            # region agent log
+            _agent_debug_log(
+                "E",
+                "gemini_live.py:_execute_tool:exit",
+                "tool handler finished",
+                {"tool": name, "ok": True},
+            )
+            # endregion
             return {"ok": True, "result": result}
         except asyncio.TimeoutError:
+            # region agent log
+            _agent_debug_log(
+                "E",
+                "gemini_live.py:_execute_tool:timeout",
+                "tool handler timed out",
+                {"tool": name},
+            )
+            # endregion
             return {
                 "ok": False,
                 "message": f"Tool timed out after {GEMINI_LIVE_TOOL_TIMEOUT:.0f}s.",
             }
         except Exception as exc:
+            # region agent log
+            _agent_debug_log(
+                "E",
+                "gemini_live.py:_execute_tool:error",
+                "tool handler raised",
+                {"tool": name, "error": str(exc)[:160]},
+            )
+            # endregion
             return {"ok": False, "message": str(exc)[:300]}
 
 
@@ -779,6 +912,23 @@ def _function_declarations(types: Any) -> list[Any]:
                 "properties": {},
             },
         ),
+        types.FunctionDeclaration(
+            name="web_search",
+            description=(
+                "Search the web for real-time information, weather, news, facts, or questions. "
+                "Call this directly in the same turn instead of starting a desktop task."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The search query to look up.",
+                    }
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
 
@@ -794,8 +944,9 @@ def _default_system_instruction() -> str:
         "UIA names and pass the app/window title whenever you know it. To actually "
         "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
         "this say' — call look_at_screen with the question; you'll then see the "
-        "screenshot and can describe it. For opening "
-        "apps, browsing, files, or broader multi-step work, say a quick natural "
+        "screenshot and can describe it. For searching the web or checking facts, news, "
+        "weather, or real-time info, call web_search directly in the same turn. For opening "
+        "apps, files, or broader multi-step work, say a quick natural "
         "acknowledgement out loud and in the same turn call start_desktop_task "
         "with a clear, specific goal. If the user says stop, cancel, or never "
         "mind, call stop_current_task right away and confirm you stopped.\n"

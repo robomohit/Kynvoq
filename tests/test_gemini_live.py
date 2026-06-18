@@ -57,6 +57,7 @@ def test_function_declarations_cover_desktop_tools():
         "stop_current_task",
         "get_companion_status",
         "look_at_screen",
+        "web_search",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")

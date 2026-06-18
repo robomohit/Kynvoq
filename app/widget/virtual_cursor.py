@@ -511,43 +511,12 @@ class VirtualCursorOverlay(QWidget):
         self._cursor_visible_until = self._now_ms() + self.CURSOR_DECAY_MS
 
     def _move_cursor_to(self, x: int, y: int) -> None:
-        """Start a new bezier-curved animation from the current pos to (x,y).
-        The control point is offset perpendicular to the line so the path
-        looks like a hand-drawn arc rather than a straight ruler line."""
-        # If cursor hasn't been on screen yet, snap to target without travel
-        if self._cursor_x < 0:
-            self._cursor_x, self._cursor_y = x, y
-            self._p0 = self._p2 = self._p1 = (x, y)
-            self._anim_t = 1.0
-            return
-
-        self._p0 = (self._cursor_x, self._cursor_y)
-        self._p2 = (x, y)
-        dx, dy = x - self._cursor_x, y - self._cursor_y
-        dist = math.hypot(dx, dy)
-
-        # Quadratic bezier control point: midpoint offset perpendicular,
-        # with arc magnitude scaled to distance (15-25% of distance). The
-        # sign is chosen so arcs lean slightly upward (feels more deliberate).
-        mx, my = (self._cursor_x + x) / 2, (self._cursor_y + y) / 2
-        if dist > 4:
-            # Perpendicular unit vector (rotate 90deg ccw → upward bias)
-            px, py = -dy / dist, dx / dist
-            # Lean upward on screen → ensure py is negative (or zero)
-            if py > 0:
-                px, py = -px, -py
-            arc = min(0.22 * dist, 90)  # cap arc so big jumps don't loop
-            self._p1 = (mx + px * arc, my + py * arc)
-        else:
-            self._p1 = (mx, my)
-
-        # Travel time scales with distance, with sensible bounds
-        self._anim_duration_ms = int(min(
-            self.TRAVEL_MAX_MS,
-            self.TRAVEL_BASE_MS + dist * self.TRAVEL_PER_PX
-        ))
-        self._anim_elapsed_ms = 0
-        self._anim_t = 0.0
+        """Snap the cursor instantly to (x, y) without travel delay."""
+        self._cursor_x, self._cursor_y = x, y
+        self._p0 = self._p2 = self._p1 = (x, y)
+        self._anim_t = 1.0
+        self._anim_elapsed_ms = self._anim_duration_ms
+        self._trail.clear()
 
     @staticmethod
     def _ease_in_out_cubic(t: float) -> float:
@@ -720,40 +689,11 @@ class VirtualCursorOverlay(QWidget):
         p.fillRect(self.rect(), Qt.transparent)
         p.setCompositionMode(QPainter.CompositionMode_SourceOver)
 
-        # 1. Trail breadcrumbs — small dots fading out behind the cursor
-        for i, (tx, ty, age) in enumerate(self._trail):
-            # Older dots are smaller + dimmer. Newest at end.
-            life = max(0.0, 1.0 - age / 600.0)
-            recency = (i + 1) / max(1, len(self._trail))  # 0..1
-            radius = 2.5 + 1.5 * recency * life
-            alpha = int(110 * recency * life)
-            if alpha < 4:
-                continue
-            col = QColor(RIPPLE_COLOR); col.setAlpha(alpha)
-            p.setBrush(QBrush(col))
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(QPoint(tx, ty), int(radius), int(radius))
+        # 1. Trail breadcrumbs — disabled to keep UI clean and snap-instant
+        pass
 
-        # 2. Ripples (under the cursor, on click sites)
-        for r in self._ripples:
-            prog = r.progress()
-            # Two concentric expanding rings for a richer click feel
-            for ring_offset, ring_alpha_mul in ((0.0, 1.0), (0.18, 0.55)):
-                rp = max(0.0, prog - ring_offset)
-                if rp <= 0 or rp > 1: continue
-                radius = 8 + rp * 56
-                alpha = int(170 * (1 - rp) * ring_alpha_mul)
-                if alpha < 4: continue
-                col = QColor(RIPPLE_COLOR); col.setAlpha(alpha)
-                p.setPen(QPen(col, 2.2))
-                p.setBrush(Qt.NoBrush)
-                p.drawEllipse(QPoint(r.x, r.y), int(radius), int(radius))
-            # Inner solid dot
-            inner_alpha = int(170 * (1 - prog) ** 2)
-            ic = QColor(RIPPLE_COLOR); ic.setAlpha(inner_alpha)
-            p.setBrush(QBrush(ic))
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(QPoint(r.x, r.y), 7, 7)
+        # 2. Ripples (under the cursor, on click sites) — removed per user request
+        pass
 
         # 3. Carets (typing indicator)
         for c in self._carets:
@@ -773,43 +713,14 @@ class VirtualCursorOverlay(QWidget):
                 p.drawText(rect.adjusted(8, 0, -8, 0),
                            Qt.AlignVCenter | Qt.AlignLeft, c.text)
 
-        # 3a. App-edge glow — brand-colour border around the whole target app
+        # 3a. App-edge glow — disabled per user request
         now0 = self._now_ms()
-        if self._app_glow is not None:
-            self._paint_app_glow(p, self._app_glow, now0)
 
-        # 3b. UIA spotlights — focus ring tracing a real control's bounds
-        for s in self._spotlights:
-            self._paint_spotlight(p, s, now0)
+        # 3b. UIA spotlights — disabled per user request
 
-        # 4. Cursor + soft accent glow halo. The action cursor now shows DURING
-        # UIA spotlights too, so the buddy is seen flying to / sitting on the
-        # control (Clicky fly-to-target), with the ring marking exact bounds.
+        # 4. Cursor pointer and action label — disabled per user request to only show ripple
         now = self._now_ms()
-        action_visible = (now < self._cursor_visible_until
-                          and self._cursor_x >= 0)
-        if action_visible:
-            cx, cy = self._cursor_x, self._cursor_y
-            # Flight "swoop": the cursor grows toward the arc apex and its glow
-            # swells mid-flight, settling on landing (Clicky-style).
-            flight = self._flight_scale()
-            glow_r = int(self.GLOW_RADIUS * (0.7 + 0.6 * flight))
-            grad = QRadialGradient(cx, cy + 4, max(1, glow_r))
-            g0 = QColor(RIPPLE_COLOR); g0.setAlpha(int(120 * min(1.0, flight)))
-            g1 = QColor(RIPPLE_COLOR); g1.setAlpha(0)
-            grad.setColorAt(0.0, g0)
-            grad.setColorAt(1.0, g1)
-            p.setBrush(QBrush(grad))
-            p.setPen(Qt.NoPen)
-            p.drawEllipse(QPoint(cx, cy + 4), glow_r, glow_r)
-
-            # Cursor with combined click-pulse + flight-apex scale.
-            scale = self._click_pulse_scale(now) * flight
-            self._paint_cursor(p, cx, cy, scale=scale)
-
-            # Action label pill — fades in/out under the cursor
-            self._paint_action_label(p, cx, cy, now)
-        elif self._companion_enabled and self._companion_display_pos.x() >= 0:
+        if self._companion_enabled and self._companion_display_pos.x() >= 0:
             has_target_overlay = bool(self._spotlights or self._ripples
                                       or self._carets)
             if not has_target_overlay:

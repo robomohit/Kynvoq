@@ -392,12 +392,14 @@ def _git_commit_file(file_path: str, workspace: Path, action_type: str, task_id:
         subject = f"[ai-computer] {action_type}: {os.path.basename(file_path)}"
         msg = f"{subject}\n\ntask: {task_id[:8]}" if task_id else subject
         commit = subprocess.run(
-            ["git", "commit", "-m", msg], cwd=str(ws), capture_output=True, text=True, check=False
+            ["git", "commit", "-m", msg], cwd=str(ws), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False
         )
         if commit.returncode != 0:
             return None
         rev = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ws), capture_output=True, text=True, check=False
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ws), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False
         )
         return rev.stdout.strip() or None
     except Exception:

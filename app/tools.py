@@ -1571,7 +1571,7 @@ class ToolExecutor:
                 return ToolResult(ok=True, output=f"Created directory: {target}")
             if self._looks_like_gui_launch(command):
                 return self._launch_gui_command(command, self.workspace)
-            res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120, cwd=self.workspace)
+            res = subprocess.run(command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=self.workspace)
             return ToolResult(ok=res.returncode == 0, output=f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         except subprocess.TimeoutExpired:
             return ToolResult(ok=False, output="Command timed out after 120 seconds.")
@@ -1640,6 +1640,8 @@ class ToolExecutor:
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=60,
                 cwd=self._bash_cwd,
             )
@@ -1938,6 +1940,7 @@ class ToolExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 cwd=str(self.workspace),
                 errors="replace",
             )
@@ -2572,7 +2575,7 @@ class ToolExecutor:
 
         def _run(cmd, label):
             try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=15, cwd=str(self.workspace))
+                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=str(self.workspace))
                 out = (r.stdout + r.stderr).strip()
                 if r.returncode == 0:
                     results.append(f"[{label}] ✓ clean")
@@ -2629,6 +2632,7 @@ class ToolExecutor:
         try:
             r = subprocess.run(
                 argv, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=30, cwd=str(self.workspace)
             )
             out = (r.stdout + r.stderr).strip()
@@ -2653,7 +2657,7 @@ class ToolExecutor:
         elif command.strip().lower().startswith("pytest"):
             command = f"python -m {command.strip()}"
         try:
-            r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120, cwd=cwd)
+            r = subprocess.run(command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=cwd)
             out = (r.stdout + r.stderr).strip()
             # Parse pytest summary line
             summary_match = re.search(r"((\d+ passed).*?((\d+ failed).*?)?(\d+ error)?.*?in [\d.]+s)", out)

@@ -7,6 +7,13 @@ import os
 import sys
 from pathlib import Path
 
+# UTF-8 stdio so a unicode log line can't crash a print on the Windows cp1252 console.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[1]
 os.chdir(ROOT)
 if str(ROOT) not in sys.path:

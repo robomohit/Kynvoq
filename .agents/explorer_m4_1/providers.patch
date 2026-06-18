@@ -1,0 +1,408 @@
+--- app/providers.py
++++ app/providers.py
+@@ -1269,10 +1269,35 @@
+                 {"role": "user", "content": prompt},
+
+             ],
+
+         }
+
+-        resp = self._http_client.post(f"{self._ollama_base_url}/api/chat", json=payload)
+
+-        resp.raise_for_status()
+
+-        data = resp.json()
+
+-        return str((data.get("message") or {}).get("content") or data.get("response") or "")
+
++        last_err = None
+
++        for attempt in range(3):
+
++            try:
+
++                resp = self._http_client.post(f"{self._ollama_base_url}/api/chat", json=payload)
+
++                resp.raise_for_status()
+
++                data = resp.json()
+
++                return str((data.get("message") or {}).get("content") or data.get("response") or "")
+
++            except httpx.HTTPStatusError as e:
+
++                last_err = e
+
++                status_code = e.response.status_code
+
++                if status_code in (402, 408, 429) or (500 <= status_code < 600):
+
++                    delay = 2 ** attempt
+
++                    _log.warning(
+
++                        "Ollama API HTTP error %d: %s. Retrying in %ds... (Attempt %d/3)",
+
++                        status_code, e, delay, attempt + 1
+
++                    )
+
++                    time.sleep(delay)
+
++                    continue
+
++                raise
+
++            except httpx.TransportError as e:
+
++                last_err = e
+
++                delay = 2 ** attempt
+
++                _log.warning(
+
++                    "Ollama API connection/timeout error: %s. Retrying in %ds... (Attempt %d/3)",
+
++                    e, delay, attempt + 1
+
++                )
+
++                time.sleep(delay)
+
++                continue
+
++        raise last_err or RuntimeError("All API retries exhausted")
+
+ 
+
+     def _chat_anthropic(self, system: str, prompt: str, screenshot_b64: Optional[str] = None) -> str:
+
+         if not self._anthropic_key:
+
+@@ -1314,15 +1339,26 @@
+                 return text_blocks[0] if text_blocks else ""
+
+             except httpx.HTTPStatusError as e:
+
+                 last_err = e
+
+-                if e.response.status_code in (402, 429) or e.response.status_code >= 500:
+
+-                    time.sleep(2 ** attempt)
+
++                status_code = e.response.status_code
+
++                if status_code in (402, 408, 429) or (500 <= status_code < 600):
+
++                    delay = 2 ** attempt
+
++                    _log.warning(
+
++                        "Anthropic API HTTP error %d: %s. Retrying in %ds... (Attempt %d/3)",
+
++                        status_code, e, delay, attempt + 1
+
++                    )
+
++                    time.sleep(delay)
+
+                     continue
+
+                 raise
+
+             except httpx.TransportError as e:
+
+                 # Connection/read-timeout error (e.g. a dead pooled connection or a
+
+                 # slow free model). Retry rather than let it hang or crash the task.
+
+                 last_err = e
+
+-                time.sleep(2 ** attempt)
+
++                delay = 2 ** attempt
+
++                _log.warning(
+
++                    "Anthropic API connection/timeout error: %s. Retrying in %ds... (Attempt %d/3)",
+
++                    e, delay, attempt + 1
+
++                )
+
++                time.sleep(delay)
+
+                 continue
+
+         raise last_err or RuntimeError("All API retries exhausted")
+
+ 
+
+@@ -1357,15 +1393,26 @@
+                 return _extract_chat_message_text(data)
+
+             except httpx.HTTPStatusError as e:
+
+                 last_err = e
+
+-                if e.response.status_code in (402, 429) or e.response.status_code >= 500:
+
+-                    time.sleep(2 ** attempt)
+
++                status_code = e.response.status_code
+
++                if status_code in (402, 408, 429) or (500 <= status_code < 600):
+
++                    delay = 2 ** attempt
+
++                    _log.warning(
+
++                        "OpenAI API HTTP error %d: %s. Retrying in %ds... (Attempt %d/3)",
+
++                        status_code, e, delay, attempt + 1
+
++                    )
+
++                    time.sleep(delay)
+
+                     continue
+
+                 raise
+
+             except httpx.TransportError as e:
+
+                 # Connection/read-timeout error (e.g. a dead pooled connection or a
+
+                 # slow free model). Retry rather than let it hang or crash the task.
+
+                 last_err = e
+
+-                time.sleep(2 ** attempt)
+
++                delay = 2 ** attempt
+
++                _log.warning(
+
++                    "OpenAI API connection/timeout error: %s. Retrying in %ds... (Attempt %d/3)",
+
++                    e, delay, attempt + 1
+
++                )
+
++                time.sleep(delay)
+
+                 continue
+
+         raise last_err or RuntimeError("All API retries exhausted")
+
+ 
+
+@@ -1419,7 +1466,12 @@
+                             if not is_last_model:
+
+                                 break
+
+                             if attempt < 2:
+
+-                                time.sleep(2 ** (attempt + 1))
+
++                                delay = 2 ** (attempt + 1)
+
++                                _log.warning(
+
++                                    "OpenRouter soft error (%s): %s. Retrying in %ds... (Attempt %d/3)",
+
++                                    current_model, err_msg, delay, attempt + 1
+
++                                )
+
++                                time.sleep(delay)
+
+                                 continue
+
+                             raise RuntimeError(f"OpenRouter error: {err_msg}")
+
+                         if "choices" not in resp_json:
+
+@@ -1427,10 +1479,16 @@
+                         return _extract_chat_message_text(resp_json)
+
+                     except httpx.HTTPStatusError as e:
+
+                         last_err = e
+
+-                        if e.response.status_code in (402, 429) or e.response.status_code >= 500:
+
++                        status_code = e.response.status_code
+
++                        if status_code in (402, 408, 429) or (500 <= status_code < 600):
+
+                             if not is_last_model:
+
+                                 break  # fail fast to next model
+
+-                            time.sleep(2 ** (attempt + 1))
+
++                            delay = 2 ** (attempt + 1)
+
++                            _log.warning(
+
++                                "OpenRouter API HTTP error %d (%s): %s. Retrying in %ds... (Attempt %d/3)",
+
++                                status_code, current_model, e, delay, attempt + 1
+
++                            )
+
++                            time.sleep(delay)
+
+                             continue
+
+                         break
+
+                     except httpx.TransportError as e:
+
+@@ -1441,7 +1499,12 @@
+                         if not is_last_model:
+
+                             break
+
+                         if attempt < 2:
+
+-                            time.sleep(2 ** (attempt + 1))
+
++                            delay = 2 ** (attempt + 1)
+
++                            _log.warning(
+
++                                "OpenRouter API connection/timeout error (%s): %s. Retrying in %ds... (Attempt %d/3)",
+
++                                current_model, e, delay, attempt + 1
+
++                            )
+
++                            time.sleep(delay)
+
+                             continue
+
+                         break
+
+ 
+
+@@ -1580,15 +1643,26 @@
+                     return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+             except httpx.HTTPStatusError as e:
+
+                 last_err = e
+
+-                if e.response.status_code in (402, 429) or e.response.status_code >= 500:
+
+-                    time.sleep(2 ** attempt)
+
++                status_code = e.response.status_code
+
++                if status_code in (402, 408, 429) or (500 <= status_code < 600):
+
++                    delay = 2 ** attempt
+
++                    _log.warning(
+
++                        "Google API HTTP error %d: %s. Retrying in %ds... (Attempt %d/3)",
+
++                        status_code, e, delay, attempt + 1
+
++                    )
+
++                    time.sleep(delay)
+
+                     continue
+
+                 raise
+
+             except httpx.TransportError as e:
+
+                 # Connection/read-timeout error (e.g. a dead pooled connection or a
+
+                 # slow free model). Retry rather than let it hang or crash the task.
+
+                 last_err = e
+
+-                time.sleep(2 ** attempt)
+
++                delay = 2 ** attempt
+
++                _log.warning(
+
++                    "Google API connection/timeout error: %s. Retrying in %ds... (Attempt %d/3)",
+
++                    e, delay, attempt + 1
+
++                )
+
++                time.sleep(delay)
+
+                 continue
+
+         raise last_err or RuntimeError("All API retries exhausted")
+
+ 
+
+@@ -1623,15 +1697,26 @@
+                     return _extract_chat_message_text(resp.json())
+
+             except httpx.HTTPStatusError as e:
+
+                 last_err = e
+
+-                if e.response.status_code in (402, 429) or e.response.status_code >= 500:
+
+-                    time.sleep(2 ** attempt)
+
++                status_code = e.response.status_code
+
++                if status_code in (402, 408, 429) or (500 <= status_code < 600):
+
++                    delay = 2 ** attempt
+
++                    _log.warning(
+
++                        "Groq API HTTP error %d: %s. Retrying in %ds... (Attempt %d/3)",
+
++                        status_code, e, delay, attempt + 1
+
++                    )
+
++                    time.sleep(delay)
+
+                     continue
+
+                 raise
+
+             except httpx.TransportError as e:
+
+                 # Connection/read-timeout error (e.g. a dead pooled connection or a
+
+                 # slow free model). Retry rather than let it hang or crash the task.
+
+                 last_err = e
+
+-                time.sleep(2 ** attempt)
+
++                delay = 2 ** attempt
+
++                _log.warning(
+
++                    "Groq API connection/timeout error: %s. Retrying in %ds... (Attempt %d/3)",
+
++                    e, delay, attempt + 1
+
++                )
+
++                time.sleep(delay)
+
+                 continue
+
+         raise last_err or RuntimeError("All API retries exhausted")
+
+ 
+

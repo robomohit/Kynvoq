@@ -5,6 +5,16 @@ import uvicorn
 import time
 import os
 import sys
+
+# Force UTF-8 stdio BEFORE importing the app, so model text or a unicode log line
+# (em / non-breaking hyphens, smart quotes, emoji) can never crash a print on the
+# Windows cp1252 console (UnicodeEncodeError).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 from app.main import app
 
 PORT = int(os.getenv("ORYNN_PORT") or os.getenv("AI_COMPUTER_PORT", "8000"))

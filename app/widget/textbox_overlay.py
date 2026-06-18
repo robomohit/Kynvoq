@@ -305,6 +305,17 @@ VOICE_BREVITY = (
 )
 
 
+def _force_utf8_stdio(streams: Any = None) -> None:
+    """Make stdout/stderr UTF-8 with errors='replace' so model text (smart quotes,
+    em / non-breaking hyphens, emoji) can NEVER crash a print on the Windows cp1252
+    console — a UnicodeEncodeError in a log line must not take down a thread."""
+    for s in (streams if streams is not None else (sys.stdout, sys.stderr)):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+
 def build_task_payload(goal: str) -> dict[str, Any]:
     mode = _detect_mode(goal)
     # A pure "open/launch/switch to <known app>" command runs the deterministic
@@ -414,6 +425,7 @@ class OverlayController(QObject):
         # Goal of the desktop task currently running (if any), so Live can name it
         # when it refuses to start a second, colliding action on top of it.
         self._active_task_goal: str = ""
+        self._consecutive_failures = 0
         # Tasks Live launched (task_id -> short goal), so when one finishes we can
         # feed the outcome back to the conversation instead of losing it.
         self._live_task_ids: dict[str, str] = {}
@@ -1318,6 +1330,8 @@ class OverlayController(QObject):
             return self._live_desktop_control(args)
         if name == "start_desktop_task":
             return self._live_start_desktop_task(args)
+        if name == "web_search":
+            return self._live_web_search(args)
         if name == "stop_current_task":
             try:
                 stopped = self._kill_active_tasks()
@@ -1419,6 +1433,33 @@ class OverlayController(QObject):
         # hand back "still working" and surface later via get_companion_status.
         return self._await_task_outcome(task_id, goal)
 
+    def _live_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = _clean_text(args.get("query") or "")
+        if not query:
+            return {"ok": False, "message": "Missing search query."}
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Searching: " + _short(query, 60), source="live_tool", force=True)
+        try:
+            tools = self._live_desktop_tools()
+            result = tools.web_search(query)
+            self._raise_if_live_cancelled()
+            # If the tool returned a ToolResult, extract output
+            if hasattr(result, "ok") and hasattr(result, "output"):
+                return {"ok": result.ok, "output": result.output}
+            if isinstance(result, dict):
+                return result
+            return {"ok": True, "result": result}
+        except InterruptedError as exc:
+            message = str(exc)[:200] or "Gemini Live was stopped."
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Stopped", source="live_stop", force=True)
+            return {"ok": False, "message": message}
+        except Exception as exc:
+            message = str(exc)[:200] or "Search failed."
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Search failed", source="live_tool", force=True)
+            return {"ok": False, "message": message}
+
     def _await_task_outcome(self, task_id: str, goal: str) -> dict[str, Any]:
         budget = self._live_float(os.getenv("ORYNN_LIVE_TASK_WAIT"), LIVE_TASK_RESULT_WAIT, 0.0, 30.0)
         deadline = time.monotonic() + budget
@@ -1515,8 +1556,36 @@ class OverlayController(QObject):
 
         threading.Thread(target=run, daemon=True).start()
 
+    def _sync_state_with_active_tasks(self) -> None:
+        try:
+            data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
+            tasks = data.get("tasks", []) if isinstance(data, dict) else []
+            if tasks:
+                self._active_task_running = True
+                first_task = tasks[0]
+                goal = first_task.get("goal") or ""
+                self._active_task_goal = _short(_strip_hardening(goal), 80)
+                if not self._live_is_running():
+                    self.cursorStateRequested.emit("thinking")
+            else:
+                self._active_task_running = False
+                self._active_task_goal = ""
+                if not self._live_is_running():
+                    self.cursorStateRequested.emit("idle")
+        except Exception as exc:
+            print(f"[clicky] Failed to sync state with active tasks: {exc}", flush=True)
+            raise exc
+
     def _poll_loop(self) -> None:
         idle_label_shown = False
+        self._consecutive_failures = 0
+
+        # Initial startup sync
+        try:
+            self._sync_state_with_active_tasks()
+        except Exception:
+            self._consecutive_failures = 1
+
         while not self._stop.is_set():
             try:
                 data = self.client.request(
@@ -1524,9 +1593,24 @@ class OverlayController(QObject):
                     f"/api/overlay/events?since={self._cursor}&limit=80",
                     timeout=4.0,
                 )
+
+                # Check if we recovered from 3+ consecutive failures
+                if self._consecutive_failures >= 3:
+                    try:
+                        self._sync_state_with_active_tasks()
+                    except Exception:
+                        raise
+
+                self._consecutive_failures = 0
+
                 events = data.get("events", []) if isinstance(data, dict) else []
                 if isinstance(data, dict):
-                    self._cursor = max(self._cursor, int(data.get("cursor") or 0))
+                    server_cursor = int(data.get("cursor") or 0)
+                    if server_cursor < self._cursor:
+                        # Server restarted or global events reset
+                        self._cursor = server_cursor
+                    else:
+                        self._cursor = max(self._cursor, server_cursor)
                 for ev in events:
                     if not isinstance(ev, dict):
                         continue
@@ -1561,6 +1645,12 @@ class OverlayController(QObject):
                 # last activity (handled in the overlay's morph), so no explicit
                 # "revert to ready" is needed here.
             except Exception:
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= 3:
+                    self._active_task_running = False
+                    self._active_task_goal = ""
+                    if not self._live_is_running():
+                        self.cursorStateRequested.emit("idle")
                 if not idle_label_shown:
                     self._set_label("Waiting for Orynn", source="system_wait")
                     idle_label_shown = True
@@ -1876,6 +1966,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdio()  # a unicode log line must never crash the overlay (cp1252)
     # Best-effort: load .env so GROQ_API_KEY is present even when this overlay is
     # launched standalone (run_desktop already loads it for the spawned child).
     try:
