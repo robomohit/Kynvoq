@@ -1066,6 +1066,121 @@ def test_live_long_task_outcome_captured_from_poll_event():
     assert "Sorted 42 files." in c._last_task_result["summary"]
 
 
+class _FakeLive:
+    """Stand-in for the Gemini Live companion: looks running and records the
+    progress notes the narration loop pushes into the conversation."""
+    def __init__(self):
+        self.running = True
+        self.updates = []
+
+    def is_running(self):
+        return self.running
+
+    def send_task_update(self, text):
+        self.updates.append(text)
+
+
+def test_live_narration_speaks_humanized_milestone():
+    """A milestone from a Live-launched task is pushed into the conversation as a
+    short, humanized spoken note (brief §6)."""
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {"t1": "open cursor and click new agent"}
+    c._live_narration_last = 0.0
+
+    c._maybe_narrate_to_live({
+        "type": "action_start", "task_id": "t1",
+        "action_type": "uia_click", "args_summary": "New Agent",
+    })
+
+    assert len(live.updates) == 1
+    assert "clicking New Agent" in live.updates[0]
+    assert "uia_click" not in live.updates[0]  # never a raw tool name
+
+
+def test_live_narration_throttles_rapid_milestones():
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {"t1": "x"}
+    c._live_narration_last = 0.0
+
+    c._maybe_narrate_to_live({
+        "type": "action_start", "task_id": "t1",
+        "action_type": "uia_click", "args_summary": "First",
+    })
+    c._maybe_narrate_to_live({
+        "type": "action_start", "task_id": "t1",
+        "action_type": "uia_click", "args_summary": "Second",
+    })
+
+    assert len(live.updates) == 1  # the second is suppressed by the interval
+    assert "First" in live.updates[0]
+
+
+def test_live_narration_ignores_tasks_live_did_not_launch():
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {}
+    c._live_narration_last = 0.0
+
+    c._maybe_narrate_to_live({
+        "type": "action_start", "task_id": "other",
+        "action_type": "uia_click", "args_summary": "X",
+    })
+
+    assert live.updates == []
+
+
+def test_live_narration_skips_terminal_events():
+    """Completion is announced once by _capture_live_task_outcome — the narration
+    loop must not also speak terminal events."""
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {"t1": "x"}
+    c._live_narration_last = 0.0
+
+    c._maybe_narrate_to_live({"type": "done", "task_id": "t1", "reason": "all good"})
+
+    assert live.updates == []
+
+
+def test_live_narration_never_echoes_typed_text():
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {"t1": "x"}
+    c._live_narration_last = 0.0
+
+    c._maybe_narrate_to_live({
+        "type": "action_start", "task_id": "t1",
+        "action_type": "uia_type", "args_summary": "my secret password",
+    })
+
+    assert len(live.updates) == 1
+    assert "secret" not in live.updates[0]
+    assert "typing that in" in live.updates[0]
+
+
+def test_live_narration_disabled_with_zero_interval(monkeypatch):
+    monkeypatch.setenv("ORYNN_LIVE_NARRATE_INTERVAL", "0")
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {"t1": "x"}
+    c._live_narration_last = 0.0
+
+    c._maybe_narrate_to_live({
+        "type": "action_start", "task_id": "t1",
+        "action_type": "uia_click", "args_summary": "X",
+    })
+
+    assert live.updates == []
+
+
 def test_live_tool_start_desktop_task_requires_goal():
     c = _controller()
 

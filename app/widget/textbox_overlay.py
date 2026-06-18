@@ -138,6 +138,11 @@ LIVE_TOOL_LABEL_HOLD_SECONDS = 1.6
 LIVE_TASK_RESULT_WAIT = 6.0
 TERMINAL_TASK_STATES = {"done", "complete", "error", "failed", "cancelled"}
 
+# Minimum gap between spoken mid-task progress notes pushed into the Live
+# conversation, so a busy task doesn't machine-gun the user with narration
+# (brief §6.4 silence rules). Override with ORYNN_LIVE_NARRATE_INTERVAL; 0 disables.
+LIVE_NARRATE_INTERVAL = 3.5
+
 _LIVE_LABEL_SOURCES = {
     "live_status",
     "live_input",
@@ -443,6 +448,11 @@ class OverlayController(QObject):
         # The most recent finished Live task's outcome, surfaced via
         # get_companion_status so Live can answer "did it work?" for longer jobs.
         self._last_task_result: dict[str, Any] | None = None
+        # Mid-task voice narration (brief §6): while a Live-launched task runs, feed
+        # throttled, humanized milestones into the conversation so Live can speak
+        # progress ("clicking New Agent") instead of going silent after the ack.
+        self._live_narration_last = 0.0
+        self._live_narration_text = ""
         self._live: Any = None
         self._live_cancel = threading.Event()
         # Wake-word mode: a background listener wakes Live on "Orynn" and lets it
@@ -1551,6 +1561,10 @@ class OverlayController(QObject):
             self._active_task_running = True
             self._active_task_goal = _short(goal, 80)
             self._live_task_ids[task_id] = self._active_task_goal
+            # Start the narration clock at launch so the first spoken milestone is
+            # spaced one interval after the verbal ack (no talking over ourselves).
+            self._live_narration_last = time.monotonic()
+            self._live_narration_text = ""
             self.cursorStateRequested.emit("thinking")
             self._set_label("Started: " + _short(goal, 120), source="live_tool", force=True)
         except urllib.error.HTTPError as exc:
@@ -1714,6 +1728,70 @@ class OverlayController(QObject):
             except Exception:
                 pass
 
+    def _narration_phrase_for_event(self, ev: dict[str, Any]) -> str:
+        """A short, speech-friendly milestone for a running task, or "" if this event
+        isn't worth saying out loud. Humanized — never raw tool names, and never
+        echoes typed text aloud (it could be private) (brief §6.2)."""
+        et = str(ev.get("type") or "")
+        if et == "control_profile":
+            app = _clean_text(ev.get("window_title") or ev.get("app") or "")
+            return f"working in {_short(app, 40)}" if app else ""
+        if et == "action_result" and ev.get("ok") is False:
+            return "that didn't work, trying another way"
+        if et != "action_start":
+            return ""
+        action = str(ev.get("action_type") or ev.get("name") or "").lower()
+        target = _clean_text(ev.get("args_summary") or ev.get("target") or "")
+        short_target = _short(target, 40) if target and len(target) <= 40 else ""
+        if action in ("uia_click", "click", "left_click", "mouse_click", "double_click"):
+            return f"clicking {short_target}".strip() if short_target else "clicking that"
+        if action in ("uia_type", "keyboard_type", "type_with_delay", "type"):
+            return "typing that in"  # never read the typed text aloud
+        if action in ("focus_window", "wait_for_window"):
+            return f"opening {short_target}".strip() if short_target else "switching windows"
+        if action == "run_command":
+            return "running a command"
+        if action in ("write_file", "edit_file"):
+            return "editing a file"
+        if action in ("scroll", "mouse_scroll", "screenshot", "get_screenshot"):
+            return ""  # too minor / noisy to narrate
+        base = ACTION_LABELS.get(action, action.replace("_", " ").strip())
+        return base.lower() if base else ""
+
+    def _maybe_narrate_to_live(self, ev: dict[str, Any]) -> None:
+        """Push a throttled, humanized progress milestone into the Live conversation
+        so it can narrate a running task out loud (brief §6). Only fires for tasks
+        Live itself launched, only while Live is connected, and at most once per
+        ORYNN_LIVE_NARRATE_INTERVAL. Terminal events are left to
+        _capture_live_task_outcome so completion isn't announced twice."""
+        if not self._live_is_running():
+            return
+        task_id = str(ev.get("task_id") or "")
+        if task_id not in self._live_task_ids:
+            return
+        interval = self._live_float(
+            os.getenv("ORYNN_LIVE_NARRATE_INTERVAL"), LIVE_NARRATE_INTERVAL, 0.0, 30.0
+        )
+        if interval <= 0:
+            return  # narration disabled
+        phrase = self._narration_phrase_for_event(ev)
+        if not phrase or phrase == self._live_narration_text:
+            return
+        now = time.monotonic()
+        if now - self._live_narration_last < interval:
+            return
+        live = self._live
+        if live is None or not hasattr(live, "send_task_update"):
+            return
+        note = (f"Quick progress note while you work: {phrase}. Say it to the user in "
+                "one short, natural sentence, and don't repeat yourself.")
+        try:
+            live.send_task_update(note)
+        except Exception:
+            return
+        self._live_narration_last = now
+        self._live_narration_text = phrase
+
     def _load_preferences_async(self) -> None:
         def run() -> None:
             try:
@@ -1813,6 +1891,7 @@ class OverlayController(QObject):
                             self._set_label(label, source=self._label_source_for_event(ev))
                             idle_label_shown = True
                     self._update_cursor_state_from_event(ev)
+                    self._maybe_narrate_to_live(ev)
                     self._capture_live_task_outcome(ev)
                     self._maybe_finalize(ev)
                 if not idle_label_shown:
