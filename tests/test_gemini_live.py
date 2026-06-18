@@ -1334,6 +1334,23 @@ def test_live_autoroute_default_upgrades_click():
     assert "/api/tasks" in calls
 
 
+def test_consent_gate_keyword_boundaries():
+    """The consent gate must catch outward/irreversible verbs without nagging on
+    benign goals — reading email is fine, sending/replying is not."""
+    from app.widget.textbox_overlay import OverlayController
+
+    needs = OverlayController._goal_needs_consent
+    # Benign — reading/opening/typing/searching never asks.
+    for g in ["check my email", "open my email", "open notepad and type hello",
+              "search the web for cats", "take a screenshot", "scroll down"]:
+        assert needs(g) is False, g
+    # Disruptive / outward-facing — always asks.
+    for g in ["send the email to John", "reply to John in slack", "submit the form",
+              "delete my downloads", "buy the item", "restart cursor",
+              "format the c drive"]:
+        assert needs(g) is True, g
+
+
 def test_live_tool_start_desktop_task_requires_goal():
     c = _controller()
 

@@ -155,7 +155,7 @@ LIVE_CONSENT_RE = re.compile(
     r"delete|deletes|deleting|uninstall|uninstalls|uninstalling|"
     r"format|formats|formatting|wipe|wipes|wiping|erase|erases|erasing|"
     r"send|sends|sending|submit|submits|submitting|post|posts|posting|"
-    r"publish|publishes|publishing|email|emails|emailing|"
+    r"publish|publishes|publishing|reply|replies|replying|"
     r"pay|pays|paying|purchase|purchases|purchasing|buy|buys|buying|"
     r"checkout|transfer|transfers|transferring|"
     r"relaunch|relaunches|relaunching|restart|restarts|restarting|"
