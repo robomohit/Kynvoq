@@ -1597,18 +1597,20 @@ def test_maybe_greet_once_and_respects_env(monkeypatch):
         async def send_client_content(self, turns=None, turn_complete=None):
             self.sent += 1
 
+    # OFF by default (no startup turn, no echo-feed): no greeting.
     monkeypatch.delenv("GEMINI_LIVE_GREETING", raising=False)
     comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
     s = FakeSession()
     asyncio.run(comp._maybe_greet(s, types))
-    asyncio.run(comp._maybe_greet(s, types))
-    assert s.sent == 1  # greets exactly once per session
+    assert s.sent == 0
 
-    monkeypatch.setenv("GEMINI_LIVE_GREETING", "0")
+    # Opt in -> greets exactly once per session (not on reconnects).
+    monkeypatch.setenv("GEMINI_LIVE_GREETING", "1")
     comp2 = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
     s2 = FakeSession()
     asyncio.run(comp2._maybe_greet(s2, types))
-    assert s2.sent == 0  # silenced
+    asyncio.run(comp2._maybe_greet(s2, types))
+    assert s2.sent == 1
 
 
 def test_live_desktop_control_scroll_routes_to_tools():

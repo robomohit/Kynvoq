@@ -50,6 +50,24 @@ def _resample_audio(data: bytes, from_rate: int, to_rate: int) -> bytes:
         return data
 
 
+class _SpeakerWriter:
+    """Writes model audio straight to the speaker (resampling to the device rate
+    only if needed). Synchronous on purpose: it paces the receive loop to real time
+    so audio plays with near-zero latency and Gemini's echo-cancellation timing
+    stays correct — instead of buffering a whole reply in an unbounded queue."""
+
+    def __init__(self, stream: Any, from_rate: int, to_rate: int) -> None:
+        self._stream = stream
+        self._from = int(from_rate)
+        self._to = int(to_rate)
+        self._resample = self._from != self._to
+
+    def write(self, data: bytes) -> None:
+        if self._resample:
+            data = _resample_audio(data, self._from, self._to)
+        self._stream.write(data)
+
+
 def gemini_api_key() -> str:
     return (
         os.environ.get("GEMINI_API_KEY")
@@ -63,11 +81,10 @@ def _env_flag(name: str) -> bool:
 
 
 def _live_greeting_enabled() -> bool:
-    """Whether Live says a short hello when it connects (so you know it's on).
-    On by default; set GEMINI_LIVE_GREETING=0 to silence it."""
-    return (os.environ.get("GEMINI_LIVE_GREETING") or "1").strip().lower() not in (
-        "0", "false", "no", "off",
-    )
+    """Whether Live says a short hello when it connects. OFF by default — it adds a
+    spoken turn on startup and can feed the echo loop (the model hearing its own
+    greeting). Opt in with GEMINI_LIVE_GREETING=1."""
+    return _env_flag("GEMINI_LIVE_GREETING")
 
 
 def live_search_enabled() -> bool:
@@ -214,7 +231,6 @@ class GeminiLiveCompanion:
 
         self._loop = asyncio.get_running_loop()
         audio_queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=24)
-        output_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
         input_rate = GEMINI_LIVE_INPUT_RATE
         input_resample = False
@@ -303,31 +319,13 @@ class GeminiLiveCompanion:
                 self.callbacks.on_error(f"Failed to open speaker stream: {exc}")
                 return
 
-        async def play_audio_loop() -> None:
-            while not self._stop.is_set():
-                try:
-                    chunk = await output_queue.get()
-                except asyncio.CancelledError:
-                    break
-                if output_resample:
-                    chunk = _resample_audio(chunk, GEMINI_LIVE_OUTPUT_RATE, output_rate)
-                try:
-                    await asyncio.to_thread(output_stream.write, chunk)
-                    self._audio_fail_streak = 0
-                except Exception as exc:
-                    self._audio_fail_streak += 1
-                    if self._audio_fail_streak >= GEMINI_LIVE_MAX_AUDIO_FAILS:
-                        self._stop.set()
-                        self.callbacks.on_error(f"Live audio output failed: {exc}")
-                        break
-                finally:
-                    output_queue.task_done()
-
         input_stream.start()
         output_stream.start()
         self.callbacks.on_status("Gemini Live listening")
 
-        player = asyncio.create_task(play_audio_loop())
+        # Synchronous, back-pressured speaker (resamples only if the device needs it)
+        # — low latency + correct echo timing, no unbounded buffering.
+        output_writer = _SpeakerWriter(output_stream, GEMINI_LIVE_OUTPUT_RATE, output_rate)
         client = genai.Client(api_key=gemini_api_key())
 
         retries = 0
@@ -358,7 +356,7 @@ class GeminiLiveCompanion:
 
                         sender = asyncio.create_task(self._send_audio(session, audio_queue, types))
                         try:
-                            await self._receive_loop(session, output_queue, types)
+                            await self._receive_loop(session, output_writer, types)
                         finally:
                             sender.cancel()
                             try:
@@ -375,18 +373,6 @@ class GeminiLiveCompanion:
                     retry_delay = min(retry_delay * 2.0, 10.0)
         finally:
             self._stop.set()
-            player.cancel()
-            try:
-                await player
-            except asyncio.CancelledError:
-                pass
-            while not output_queue.empty():
-                try:
-                    output_queue.get_nowait()
-                    output_queue.task_done()
-                except (asyncio.QueueEmpty, ValueError):
-                    break
-
             if self._session is not None:
                 try:
                     await self._session.send_realtime_input(audio_stream_end=True)
