@@ -12,7 +12,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 _log = logging.getLogger(__name__)
 
@@ -972,6 +972,68 @@ def _normalize_hierarchical_plan(payload: Any) -> Any:
     return normalized
 
 
+def _execute_with_retry(
+    request_fn: Callable[[], httpx.Response],
+    log_prefix: str,
+    max_attempts: int = 3,
+    base_delay: float = 2.0,
+) -> httpx.Response:
+    """Execute an HTTP request function with unified retry logic and exponential backoff.
+
+    Catches rate limit errors (HTTP 429), timeouts (HTTP 408), temporary server failures (HTTP 5xx),
+    and network/transport exceptions (httpx.TransportError).
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = request_fn()
+            
+            # Check for soft errors in JSON response if it's OpenRouter/Groq
+            try:
+                resp_json = resp.json()
+                if isinstance(resp_json, dict) and "error" in resp_json:
+                    err_msg = resp_json["error"].get("message", str(resp_json["error"]))
+                    # Soft error is raised as status error so it can be retried or escalated
+                    raise httpx.HTTPStatusError(
+                        message=f"Soft API Error: {err_msg}",
+                        request=resp.request,
+                        response=resp
+                    )
+            except (ValueError, KeyError, TypeError) as e:
+                if "Soft API Error" in str(e):
+                    raise e
+                pass
+
+            if resp.status_code in (408, 429) or resp.status_code >= 500:
+                resp.raise_for_status()
+
+            return resp
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            last_err = e
+            status_code = "transport_error"
+            if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                status_code = str(e.response.status_code)
+                # If it's a hard status error that we don't retry (not 408, 429, and not 5xx)
+                # and not a soft API error we raised ourselves
+                if e.response.status_code not in (408, 429) and e.response.status_code < 500:
+                    if "Soft API Error" not in str(e):
+                        raise e
+
+            if attempt == max_attempts:
+                break
+
+            delay = base_delay ** attempt
+            _log.warning(
+                "%s failed (status=%s, attempt %d/%d). Retrying in %.1fs... Error: %s",
+                log_prefix, status_code, attempt, max_attempts, delay, str(e)
+            )
+            time.sleep(delay)
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("HTTP request failed after max attempts")
+
+
 def _extract_chat_message_text(payload: Dict[str, Any]) -> str:
     """Extract assistant text from OpenAI-compatible chat responses."""
     choices = payload.get("choices")
@@ -1401,49 +1463,25 @@ class PlannerProvider:
                 payload = {"model": current_model, "messages": messages}
 
                 is_last_model = (current_model == models_to_try[-1])
-                for attempt in range(3 if is_last_model else 1):
-                    try:
-                        resp = self._http_client.post(
+                try:
+                    resp = _execute_with_retry(
+                        lambda: self._http_client.post(
                             "https://openrouter.ai/api/v1/chat/completions",
                             headers={"Authorization": f"Bearer {self._openrouter_key}"},
                             json=payload,
-                        )
-                        if resp.status_code != 200:
-                            print(f"OPENROUTER ERROR ({current_model}):", resp.text)
-                        resp.raise_for_status()
-                        resp_json = resp.json()
-                        if "error" in resp_json:
-                            err_msg = resp_json["error"].get("message", str(resp_json["error"]))
-                            print(f"OPENROUTER SOFT ERROR ({current_model}): {err_msg}")
-                            # Rate/quota error on non-final model → skip to next model immediately
-                            if not is_last_model:
-                                break
-                            if attempt < 2:
-                                time.sleep(2 ** (attempt + 1))
-                                continue
-                            raise RuntimeError(f"OpenRouter error: {err_msg}")
-                        if "choices" not in resp_json:
-                            raise RuntimeError(f"Unexpected OpenRouter response: {str(resp_json)[:200]}")
-                        return _extract_chat_message_text(resp_json)
-                    except httpx.HTTPStatusError as e:
-                        last_err = e
-                        if e.response.status_code in (402, 429) or e.response.status_code >= 500:
-                            if not is_last_model:
-                                break  # fail fast to next model
-                            time.sleep(2 ** (attempt + 1))
-                            continue
-                        break
-                    except httpx.TransportError as e:
-                        # Connection/timeout error (dead pooled connection, slow free
-                        # model, network blip). Fail over to the next model, or back
-                        # off and retry on the last — never bubble up as a 5-min hang.
-                        last_err = e
-                        if not is_last_model:
-                            break
-                        if attempt < 2:
-                            time.sleep(2 ** (attempt + 1))
-                            continue
-                        break
+                        ),
+                        log_prefix=f"OpenRouter call ({current_model})",
+                        max_attempts=3 if is_last_model else 1
+                    )
+                    resp_json = resp.json()
+                    if "choices" not in resp_json:
+                        raise RuntimeError(f"Unexpected OpenRouter response: {str(resp_json)[:200]}")
+                    return _extract_chat_message_text(resp_json)
+                except (httpx.HTTPStatusError, httpx.TransportError, RuntimeError) as e:
+                    last_err = e
+                    if not is_last_model:
+                        # Fail over to next model
+                        continue
 
                 # If we reach here, this model failed all retries or hit a hard error.
                 # The loop will continue to the next model in models_to_try.
@@ -1610,30 +1648,22 @@ class PlannerProvider:
         ]
         payload = {"model": model, "max_tokens": 4096, "messages": messages}
         
-        last_err = None
-        for attempt in range(3):
-            try:
+        try:
+            def run():
                 with _build_llm_http_client() as client:
-                    resp = client.post(
+                    return client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {self._groq_key}"},
                         json=payload,
                     )
-                    resp.raise_for_status()
-                    return _extract_chat_message_text(resp.json())
-            except httpx.HTTPStatusError as e:
-                last_err = e
-                if e.response.status_code in (402, 429) or e.response.status_code >= 500:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise
-            except httpx.TransportError as e:
-                # Connection/read-timeout error (e.g. a dead pooled connection or a
-                # slow free model). Retry rather than let it hang or crash the task.
-                last_err = e
-                time.sleep(2 ** attempt)
-                continue
-        raise last_err or RuntimeError("All API retries exhausted")
+            resp = _execute_with_retry(
+                run,
+                log_prefix=f"Groq call ({model})",
+                max_attempts=3
+            )
+            return _extract_chat_message_text(resp.json())
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            raise RuntimeError(f"Groq API call failed: {e}") from e
 
     # Fallback model chain: when a provider 429s, try the next one
     _FALLBACK_MODELS = [

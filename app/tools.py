@@ -905,10 +905,15 @@ class ToolExecutor:
         )
 
     def mouse_move(self, x: int, y: int, sw=1280, sh=800):
+        if self.has_isolated_target():
+            return self._mouse_move_isolated(x, y, sw, sh)
         import pyautogui
         rx, ry = self._scale(x, y, sw, sh)
-        # Smooth, human-like movement
-        pyautogui.moveTo(rx, ry, duration=0.6, tween=pyautogui.easeInOutQuad)
+        screen_w, screen_h = pyautogui.size()
+        rx = max(0, min(rx, screen_w - 1))
+        ry = max(0, min(ry, screen_h - 1))
+        # Instant movement
+        pyautogui.moveTo(rx, ry)
         return ToolResult(
             ok=True,
             output=f"Moved mouse to {rx}, {ry}",
@@ -945,9 +950,10 @@ class ToolExecutor:
         # The marker window is destroyed before the click — no interference.
         _flash_pointer(rx, ry)
         try:
-            pyautogui.moveTo(rx, ry, duration=0.4, tween=pyautogui.easeInOutQuad)
-            time.sleep(0.1)
-            pyautogui.click(button=button, clicks=clicks, interval=0.1)
+            # Instant movement
+            pyautogui.moveTo(rx, ry)
+            time.sleep(0.01)
+            pyautogui.click(button=button, clicks=clicks, interval=0.05)
             self._note_synthetic_input()
         except Exception as e:
             # Screen locked, fail-safe triggered, no display, etc. — report it
@@ -3769,6 +3775,37 @@ class ToolExecutor:
         )
         # Post-action verification: did the click visibly change UI state?
         verified = self._verify_clicked(before)
+        if verified is not True:
+            # Active self-healing click retries:
+            # Bring window to foreground, scroll control into view, and retry via pyautogui
+            try:
+                from .widget.desktop_features import _find_uia_control, _uia_pattern
+                import pyautogui
+                if app:
+                    self.focus_window(app)
+                    time.sleep(0.08)
+                ctrl, info_ctrl = _find_uia_control(query, app)
+                if ctrl is not None:
+                    try:
+                        sip = _uia_pattern(ctrl, "ScrollItemPattern")
+                        if sip is not None:
+                            sip.ScrollIntoView()
+                            time.sleep(0.05)
+                    except Exception:
+                        pass
+                    rect = ctrl.BoundingRectangle
+                    has_rect = rect.right > rect.left and rect.bottom > rect.top
+                    if has_rect:
+                        x = (rect.left + rect.right) // 2
+                        y = (rect.top + rect.bottom) // 2
+                        pyautogui.click(x, y)
+                        from .widget.desktop_features import note_synthetic_input
+                        note_synthetic_input()
+                        # Re-verify the click outcome
+                        verified = self._verify_clicked(before)
+            except Exception:
+                pass
+
         data["verified"] = verified
         if isinstance(data.get("overlay"), dict):
             data["overlay"]["verified"] = verified
