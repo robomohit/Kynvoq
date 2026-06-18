@@ -530,6 +530,10 @@ class OverlayController(QObject):
                 pass
 
     # ── Wake-word mode ───────────────────────────────────────────────────────
+    @staticmethod
+    def _wake_word_display() -> str:
+        return (os.getenv("ORYNN_WAKE_WORD") or "Orynn").strip().title() or "Orynn"
+
     def start_wake_listener(self) -> None:
         """Run Live as a wake-word agent: stay asleep, listening LOCALLY (offline,
         no cloud streaming) for 'Orynn', then connect Live; sleep again after idle.
@@ -539,7 +543,7 @@ class OverlayController(QObject):
         self._wake_stop.clear()
         self._wake_thread = threading.Thread(target=self._wake_loop, daemon=True)
         self._wake_thread.start()
-        self._set_label("Say “Orynn” to wake me", source="system", force=True)
+        self._set_label(f"Say “{self._wake_word_display()}” to wake me", source="system", force=True)
 
     def stop_wake_listener(self) -> None:
         self._wake_stop.set()
@@ -600,7 +604,7 @@ class OverlayController(QObject):
         self._live = None
         self._set_live_owns_bubble(False)
         self.cursorStateRequested.emit("idle")
-        self._set_label("Asleep — say “Orynn” to wake me", source="live_stop", force=True)
+        self._set_label(f"Asleep — say “{self._wake_word_display()}” to wake me", source="live_stop", force=True)
 
     def _set_label(
         self,
