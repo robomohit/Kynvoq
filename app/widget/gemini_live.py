@@ -122,6 +122,23 @@ def live_autostart_enabled() -> bool:
     return _env_flag("ORYNN_LIVE_AUTOSTART")
 
 
+def live_wake_enabled() -> bool:
+    """Wake-word mode: Live stays asleep (mic listened to LOCALLY/offline, no cloud
+    streaming) until you say the wake word ('Orynn'), then it connects; it sleeps
+    again after a stretch of silence. Opt in with ORYNN_LIVE_WAKE=1. This is the
+    privacy/quota-friendly way to run Live as your always-available agent."""
+    return _env_flag("ORYNN_LIVE_WAKE")
+
+
+def live_idle_sleep_seconds() -> float:
+    """How long Live stays connected with no user speech before it sleeps back to
+    wake-word listening (wake mode only). Default 60s; override ORYNN_LIVE_IDLE."""
+    try:
+        return max(10.0, float(os.environ.get("ORYNN_LIVE_IDLE") or "60"))
+    except Exception:
+        return 60.0
+
+
 def live_search_enabled() -> bool:
     """Whether to attach Google Search grounding to the Live session.
 

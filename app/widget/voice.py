@@ -633,3 +633,54 @@ def listen(timeout: float = 8.0) -> str:
     if out is not None:
         return (out or "").strip()
     return _listen_sapi(timeout)
+
+
+# Common ways a general recognizer mangles the made-up name "Orynn" (it isn't a
+# dictionary word, so Whisper/WinRT guess at it). Used for wake-word matching.
+_WAKE_VARIANTS = {
+    "orynn", "oryn", "orinn", "orin", "oren", "oran", "orrin",
+    "auryn", "aurin", "oryan",
+}
+
+
+def matches_wake_word(transcript: str, wake: str = "") -> bool:
+    """True if the transcript contains the wake word (default 'Orynn'), tolerant of
+    how a general recognizer mishears a made-up name. Set ORYNN_WAKE_WORD to a word
+    your recognizer hears reliably if 'Orynn' is flaky."""
+    import re
+    import difflib
+
+    wake = (wake or os.environ.get("ORYNN_WAKE_WORD") or "orynn").lower().strip()
+    text = (transcript or "").lower()
+    if not text or not wake:
+        return False
+    if wake in text:
+        return True
+    variants = _WAKE_VARIANTS if wake == "orynn" else {wake}
+    for w in re.findall(r"[a-z']+", text):
+        if w in variants:
+            return True
+        if difflib.SequenceMatcher(None, w, wake).ratio() >= 0.82:
+            return True
+    return False
+
+
+def listen_for_wake(timeout: float = 5.0) -> str:
+    """One utterance for wake-word listening. Prefers OFFLINE recognizers (WinRT,
+    then SAPI) so ambient listening costs no Groq quota and stays local; only falls
+    back to Groq if no offline engine works. Returns a lowercase transcript ('' if
+    nothing was said or no engine is available)."""
+    try:
+        out = _listen_winrt(timeout)
+        if out is not None:
+            return (out or "").strip().lower()
+    except Exception:
+        pass
+    try:
+        out = _listen_sapi(timeout)
+        if out:
+            return out.strip().lower()
+    except Exception:
+        pass
+    out = _listen_groq(timeout)
+    return (out or "").strip().lower() if out is not None else ""

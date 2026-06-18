@@ -605,3 +605,34 @@ def test_force_utf8_stdio_is_crash_proof():
     # Must not raise even when one stream refuses to reconfigure.
     t._force_utf8_stdio([FakeStream(), BadStream()])
     assert {"encoding": "utf-8", "errors": "replace"} in calls
+
+
+def test_matches_wake_word():
+    from app.widget import voice
+
+    # Wakes on the name and its common recognizer-mishears.
+    assert voice.matches_wake_word("hey orynn")
+    assert voice.matches_wake_word("Orynn, open notepad")
+    assert voice.matches_wake_word("oren are you there")
+    assert voice.matches_wake_word("hey orin can you help")
+    # Does NOT wake on unrelated speech (ambient conversation / TV).
+    assert not voice.matches_wake_word("hey google what's the weather")
+    assert not voice.matches_wake_word("turn on the lights")
+    assert not voice.matches_wake_word("")
+    # Custom wake word is honoured exactly.
+    assert voice.matches_wake_word("hey computer", wake="computer")
+    assert not voice.matches_wake_word("hey orynn", wake="computer")
+
+
+def test_live_wake_mode_env(monkeypatch):
+    from app.widget import gemini_live as gl
+
+    monkeypatch.delenv("ORYNN_LIVE_WAKE", raising=False)
+    assert gl.live_wake_enabled() is False
+    monkeypatch.setenv("ORYNN_LIVE_WAKE", "1")
+    assert gl.live_wake_enabled() is True
+    # Idle-sleep window is clamped to a sane minimum.
+    monkeypatch.setenv("ORYNN_LIVE_IDLE", "5")
+    assert gl.live_idle_sleep_seconds() == 10.0
+    monkeypatch.setenv("ORYNN_LIVE_IDLE", "90")
+    assert gl.live_idle_sleep_seconds() == 90.0

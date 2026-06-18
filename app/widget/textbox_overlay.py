@@ -434,6 +434,12 @@ class OverlayController(QObject):
         self._last_task_result: dict[str, Any] | None = None
         self._live: Any = None
         self._live_cancel = threading.Event()
+        # Wake-word mode: a background listener wakes Live on "Orynn" and lets it
+        # sleep again after idle. _live_last_activity tracks the last user speech so
+        # the session sleeps back to local wake-listening instead of streaming forever.
+        self._wake_stop = threading.Event()
+        self._wake_thread: threading.Thread | None = None
+        self._live_last_activity = 0.0
         self._live_generation = 0
         self._live_error_generation: int | None = None
         self._desktop_tools: Any = None
@@ -522,6 +528,79 @@ class OverlayController(QObject):
                 ov.set_companion_text_locked(bool(owns))
             except Exception:
                 pass
+
+    # ── Wake-word mode ───────────────────────────────────────────────────────
+    def start_wake_listener(self) -> None:
+        """Run Live as a wake-word agent: stay asleep, listening LOCALLY (offline,
+        no cloud streaming) for 'Orynn', then connect Live; sleep again after idle.
+        Safe to call once at startup."""
+        if self._wake_thread and self._wake_thread.is_alive():
+            return
+        self._wake_stop.clear()
+        self._wake_thread = threading.Thread(target=self._wake_loop, daemon=True)
+        self._wake_thread.start()
+        self._set_label("Say “Orynn” to wake me", source="system", force=True)
+
+    def stop_wake_listener(self) -> None:
+        self._wake_stop.set()
+
+    def _wake_matches(self, text: str) -> bool:
+        try:
+            from . import voice
+            return bool(voice.matches_wake_word(text))
+        except Exception:
+            return False
+
+    def _wake_loop(self) -> None:
+        from .gemini_live import live_idle_sleep_seconds
+        while not self._stop.is_set() and not self._wake_stop.is_set():
+            if self._live_is_running():
+                # Live is active — don't fight it for the mic; just enforce idle-sleep.
+                self._maybe_sleep_live(live_idle_sleep_seconds())
+                self._stop.wait(1.0)
+                continue
+            try:
+                from . import voice
+                text = voice.listen_for_wake(timeout=5.0)
+            except Exception:
+                self._stop.wait(1.0)
+                continue
+            if self._stop.is_set() or self._wake_stop.is_set():
+                break
+            if text and self._wake_matches(text) and not self._live_is_running():
+                try:
+                    from . import voice
+                    voice.cue("start")
+                except Exception:
+                    pass
+                self._live_last_activity = time.monotonic()
+                self._toggle_live()  # starts Live (safe from this worker thread)
+
+    def _maybe_sleep_live(self, idle_seconds: float) -> None:
+        """Put Live back to sleep (→ wake-listening) after a stretch of no user speech,
+        so a wake-mode session never streams forever."""
+        if not self._live_is_running():
+            return
+        last = self._live_last_activity or time.monotonic()
+        if (time.monotonic() - last) < idle_seconds:
+            return
+        live = self._live
+        try:
+            from . import voice
+            voice.cue("stop")
+        except Exception:
+            pass
+        self._next_live_generation()
+        self._live_cancel.set()
+        if live is not None:
+            try:
+                live.stop()
+            except Exception:
+                pass
+        self._live = None
+        self._set_live_owns_bubble(False)
+        self.cursorStateRequested.emit("idle")
+        self._set_label("Asleep — say “Orynn” to wake me", source="live_stop", force=True)
 
     def _set_label(
         self,
@@ -844,6 +923,7 @@ class OverlayController(QObject):
             if live.start():
                 self._live_cancel.clear()
                 self._reset_live_buffers()
+                self._live_last_activity = time.monotonic()
                 self._set_live_owns_bubble(True)
                 self.cursorStateRequested.emit("listening")
                 self._set_label("Starting Gemini Live...", source="live_status", force=True)
@@ -872,6 +952,8 @@ class OverlayController(QObject):
     def _live_input_transcript(self, text: str, finished: bool, generation: int | None = None) -> None:
         if not self._live_generation_current(generation):
             return
+        # The user spoke — refresh activity so wake-mode's idle-sleep timer resets.
+        self._live_last_activity = time.monotonic()
         chunk = text or ""
         if not chunk and not finished:
             return
@@ -2067,11 +2149,18 @@ def main(argv: list[str] | None = None) -> int:
     # user can just talk (no hotkey). Opt-in via ORYNN_LIVE_AUTOSTART; falls back to
     # push-to-talk silently if Live is unavailable (no key / no audio).
     try:
-        from .gemini_live import live_autostart_enabled, live_available
-        if live_autostart_enabled() and live_available():
-            controller._toggle_live()
+        from .gemini_live import (
+            live_autostart_enabled, live_wake_enabled, live_available,
+        )
+        if live_available():
+            if live_wake_enabled():
+                # Asleep until you say "Orynn" — local/offline listening, no cloud
+                # streaming until woken (privacy + free-tier friendly).
+                controller.start_wake_listener()
+            elif live_autostart_enabled():
+                controller._toggle_live()  # always-on hot mic from launch
     except Exception as exc:
-        print(f"[clicky] Live autostart skipped: {exc}", flush=True)
+        print(f"[clicky] Live autostart/wake skipped: {exc}", flush=True)
     return int(app.exec())
 
 
