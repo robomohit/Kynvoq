@@ -1615,6 +1615,34 @@ def test_maybe_greet_once_and_respects_env(monkeypatch):
     assert s2.sent == 1
 
 
+def test_handle_message_go_away_schedules_graceful_reconnect():
+    """When the server sends go_away (session duration limit), exit cleanly and
+    reconnect with the resume handle instead of aborting with 1008."""
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    class FakeGoAway:
+        time_left = "30s"
+
+    class FakeMessage:
+        server_content = None
+        tool_call = None
+        go_away = FakeGoAway()
+
+    class FakeSession:
+        audio_stream_end = False
+
+        async def send_realtime_input(self, audio_stream_end=False, **_kwargs):
+            if audio_stream_end:
+                self.audio_stream_end = True
+
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    session = FakeSession()
+    asyncio.run(comp._handle_message(session, FakeMessage(), None, types))
+    assert comp._go_away_reconnect is True
+    assert session.audio_stream_end is True
+
+
 def test_live_desktop_control_scroll_routes_to_tools():
     from app.models import ToolResult
 

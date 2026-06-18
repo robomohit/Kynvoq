@@ -233,6 +233,9 @@ class GeminiLiveCompanion:
         self._resume_handle: str | None = None
         # Greet once per session (not on every reconnect).
         self._greeted = False
+        # Set when the server sends go_away so we exit the receive loop cleanly
+        # (instead of waiting for a 1008 abort when the session duration expires).
+        self._go_away_reconnect = False
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -627,6 +630,18 @@ class GeminiLiveCompanion:
                 if self._stop.is_set():
                     return
                 await self._handle_message(session, message, output_queue_or_stream, types)
+                if self._go_away_reconnect:
+                    self._go_away_reconnect = False
+                    self.callbacks.on_status("Gemini Live reconnecting")
+                    # region agent log
+                    _agent_debug_log(
+                        "D",
+                        "gemini_live.py:_receive_loop:go_away",
+                        "exiting receive loop for graceful go_away reconnect",
+                        {"has_resume_handle": bool(self._resume_handle)},
+                    )
+                    # endregion
+                    return
                 if self._stop.is_set():
                     return
 
@@ -746,6 +761,22 @@ class GeminiLiveCompanion:
                 )
             if responses:
                 await session.send_tool_response(function_responses=responses)
+
+        go_away = getattr(message, "go_away", None)
+        if go_away is not None and not self._stop.is_set():
+            # region agent log
+            _agent_debug_log(
+                "D",
+                "gemini_live.py:_handle_message:go_away",
+                "go_away received, scheduling graceful reconnect",
+                {"time_left": str(getattr(go_away, "time_left", "") or "")[:40]},
+            )
+            # endregion
+            try:
+                await session.send_realtime_input(audio_stream_end=True)
+            except Exception:
+                pass
+            self._go_away_reconnect = True
 
     async def _execute_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         handler = self.callbacks.on_tool
