@@ -747,7 +747,6 @@ def test_live_tool_desktop_control_type_upgrades_to_full_agent():
             "query": "search box",
             "text": "hello",
             "app": "Notepad",
-            "submit": True,
         },
     )
 
@@ -758,8 +757,30 @@ def test_live_tool_desktop_control_type_upgrades_to_full_agent():
     assert "hello" in goal
     assert "search box" in goal
     assert "Notepad" in goal
-    assert "submit" in goal.lower()
     assert c._active_task_running is True
+
+
+def test_live_type_with_submit_carries_submit_and_needs_consent():
+    """submit=true puts an explicit submit step in the goal — and because submitting
+    a form is disruptive, that goal is gated for spoken consent (brief §7.2)."""
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("a submit must not run without consent")
+
+    c = _controller()
+    c.client = FakeClient()
+    goal = c._goal_from_desktop_control(
+        "type", {"query": "search box", "text": "hi", "app": "Notepad", "submit": True}
+    )
+    assert "submit" in goal.lower()
+
+    res = c._live_tool(
+        "desktop_control",
+        {"action": "type", "query": "search box", "text": "hi",
+         "app": "Notepad", "submit": True},
+    )
+    assert res["ok"] is False
+    assert res.get("needs_consent") is True
 
 
 def test_live_tool_desktop_control_type_requires_non_empty_text():
@@ -1181,6 +1202,88 @@ def test_live_narration_disabled_with_zero_interval(monkeypatch):
     assert live.updates == []
 
 
+def test_live_disruptive_goal_requires_spoken_consent():
+    """A disruptive goal must not spawn an autonomous task until the user says yes
+    out loud — the glue refuses and asks Live to confirm (brief §7.3)."""
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("must not spawn a disruptive task without consent")
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool(
+        "start_desktop_task",
+        {"goal": "delete all the files in my downloads folder"},
+    )
+
+    assert res["ok"] is False
+    assert res.get("needs_consent") is True
+    assert c._active_task_running is False
+
+
+def test_live_disruptive_goal_proceeds_after_consent():
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool(
+        "start_desktop_task",
+        {"goal": "send the email to John", "confirmed": True},
+    )
+
+    assert res["ok"] is True
+    assert "/api/tasks" in calls
+    assert c._active_task_running is True
+
+
+def test_live_benign_goal_skips_consent():
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad and type hello"})
+
+    assert res["ok"] is True
+    assert "/api/tasks" in calls
+
+
+def test_live_auto_upgraded_click_on_delete_requires_consent():
+    """Auto-upgraded click/type route through the same gate, so clicking a Delete
+    control still asks for consent first."""
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("a delete click must not run without consent")
+
+    class FakeTools:
+        def uia_click(self, *a, **k):
+            raise AssertionError("must not click directly")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool(
+        "desktop_control",
+        {"action": "click", "query": "Delete", "app": "File Explorer"},
+    )
+
+    assert res["ok"] is False
+    assert res.get("needs_consent") is True
+
+
 def test_live_tool_start_desktop_task_requires_goal():
     c = _controller()
 
@@ -1202,7 +1305,7 @@ def test_live_tool_start_desktop_task_blocks_on_preflight():
 
     c = _controller()
     c.client = FakeClient()
-    res = c._live_tool("start_desktop_task", {"goal": "format the C drive"})
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad"})
     assert res["ok"] is False
     assert "setup" in res["message"].lower()
 

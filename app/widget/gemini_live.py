@@ -952,7 +952,14 @@ def _function_declarations(types: Any) -> list[Any]:
                     "goal": {
                         "type": "string",
                         "description": "The exact desktop task Orynn should carry out.",
-                    }
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Set to true ONLY after the user has verbally "
+                                       "agreed to a disruptive action (deleting, sending, "
+                                       "submitting, paying, formatting, relaunching an app). "
+                                       "Leave unset otherwise.",
+                    },
                 },
                 "required": ["goal"],
             },
@@ -1039,8 +1046,11 @@ def _default_system_instruction() -> str:
         "If they're just chatting or asking a question, simply answer — briefly and "
         "conversationally — without using any tool. Ask a short clarifying question "
         "only when you genuinely can't act otherwise. For anything risky or "
-        "irreversible (deleting files, sending messages, purchases), check with the "
-        "user before doing it.\n"
+        "irreversible — deleting files, sending a message, submitting a form, paying, "
+        "or relaunching an app — ask the user out loud to confirm first. If "
+        "start_desktop_task comes back saying it needs consent, that's your cue: ask "
+        "them plainly, and only if they clearly say yes call start_desktop_task again "
+        "with the same goal and confirmed set to true; if they say no, drop it.\n"
         "When start_desktop_task returns it tells you the result: if status is "
         "'done' or 'failed', tell the user what actually happened; if it's still "
         "'running' it was a longer job, so say you've started it and you'll keep "

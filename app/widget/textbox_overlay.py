@@ -143,6 +143,28 @@ TERMINAL_TASK_STATES = {"done", "complete", "error", "failed", "cancelled"}
 # (brief §6.4 silence rules). Override with ORYNN_LIVE_NARRATE_INTERVAL; 0 disables.
 LIVE_NARRATE_INTERVAL = 3.5
 
+# Disruptive / hard-to-undo intents that must get spoken user consent before Live
+# spawns an autonomous task to do them (brief §7.2): deleting, sending/submitting,
+# paying, formatting/uninstalling, and relaunching/restarting apps (the electron
+# relaunch case). Live-spawned tasks run autonomously with no dashboard approval
+# popup, so this voice gate is the only thing standing between "open Notepad" and
+# "send that email" — keep it focused on genuinely outward-facing or irreversible
+# verbs to avoid nagging on benign goals. Matched with word boundaries.
+LIVE_CONSENT_RE = re.compile(
+    r"\b("
+    r"delete|deletes|deleting|uninstall|uninstalls|uninstalling|"
+    r"format|formats|formatting|wipe|wipes|wiping|erase|erases|erasing|"
+    r"send|sends|sending|submit|submits|submitting|post|posts|posting|"
+    r"publish|publishes|publishing|email|emails|emailing|"
+    r"pay|pays|paying|purchase|purchases|purchasing|buy|buys|buying|"
+    r"checkout|transfer|transfers|transferring|"
+    r"relaunch|relaunches|relaunching|restart|restarts|restarting|"
+    r"reboot|reboots|rebooting|shutdown|"
+    r"shut\s*down|sign\s*out|log\s*out|factory\s*reset"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _LIVE_LABEL_SOURCES = {
     "live_status",
     "live_input",
@@ -1532,10 +1554,33 @@ class OverlayController(QObject):
             return {"ok": False, "message": "Couldn't send the screen image."}
         return {"ok": True, "message": "Looking at the screen now — describe what you see."}
 
+    @staticmethod
+    def _goal_needs_consent(goal: str) -> bool:
+        """True when a goal looks disruptive / hard to undo and so needs a spoken
+        yes before Live runs it autonomously (brief §7.2)."""
+        return bool(LIVE_CONSENT_RE.search(goal or ""))
+
     def _live_start_desktop_task(self, args: dict[str, Any]) -> dict[str, Any]:
         goal = _clean_text(args.get("goal") or "")
         if not goal:
             return {"ok": False, "message": "Missing goal."}
+        # Voice consent gate: a Live task runs autonomously (no approval popup), so
+        # anything disruptive needs an explicit spoken yes first. Live asks out loud,
+        # then re-calls with confirmed=true once the user agrees (brief §7.3).
+        if self._goal_needs_consent(goal) and not self._live_bool(args.get("confirmed")):
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Needs your OK", source="live_tool", force=True)
+            return {
+                "ok": False,
+                "needs_consent": True,
+                "message": (
+                    "This could change or send something that's hard to undo "
+                    f'("{_short(goal, 90)}"). Do NOT do it yet. Ask the user out loud '
+                    "to confirm; only if they clearly say yes, call start_desktop_task "
+                    "again with the same goal and confirmed set to true. If they say "
+                    "no, drop it and tell them you won't."
+                ),
+            }
         payload = build_task_payload(goal)
         task_id = str(payload.get("task_id") or "")
         try:
