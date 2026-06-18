@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import os
+import queue
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -48,24 +49,6 @@ def _resample_audio(data: bytes, from_rate: int, to_rate: int) -> bytes:
         return arr_new.tobytes()
     except Exception:
         return data
-
-
-class _SpeakerWriter:
-    """Writes model audio straight to the speaker (resampling to the device rate
-    only if needed). Synchronous on purpose: it paces the receive loop to real time
-    so audio plays with near-zero latency and Gemini's echo-cancellation timing
-    stays correct — instead of buffering a whole reply in an unbounded queue."""
-
-    def __init__(self, stream: Any, from_rate: int, to_rate: int) -> None:
-        self._stream = stream
-        self._from = int(from_rate)
-        self._to = int(to_rate)
-        self._resample = self._from != self._to
-
-    def write(self, data: bytes) -> None:
-        if self._resample:
-            data = _resample_audio(data, self._from, self._to)
-        self._stream.write(data)
 
 
 def gemini_api_key() -> str:
@@ -323,9 +306,35 @@ class GeminiLiveCompanion:
         output_stream.start()
         self.callbacks.on_status("Gemini Live listening")
 
-        # Synchronous, back-pressured speaker (resamples only if the device needs it)
-        # — low latency + correct echo timing, no unbounded buffering.
-        output_writer = _SpeakerWriter(output_stream, GEMINI_LIVE_OUTPUT_RATE, output_rate)
+        # Dedicated playback thread: drains model audio from a thread-safe queue and
+        # writes it to the speaker. Writing must happen OFF the asyncio loop (writing
+        # from the event-loop thread goes silent here) — and a real dedicated thread
+        # (not asyncio.to_thread's shared pool) keeps it smooth: no pool jitter /
+        # underruns, and it never blocks the receive loop. Resamples only if needed.
+        output_q: "queue.Queue" = queue.Queue()
+
+        def playback_worker() -> None:
+            while not self._stop.is_set():
+                try:
+                    chunk = output_q.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    break
+                if output_resample:
+                    chunk = _resample_audio(chunk, GEMINI_LIVE_OUTPUT_RATE, output_rate)
+                try:
+                    output_stream.write(chunk)
+                    self._audio_fail_streak = 0
+                except Exception as exc:
+                    self._audio_fail_streak += 1
+                    if self._audio_fail_streak >= GEMINI_LIVE_MAX_AUDIO_FAILS:
+                        self._stop.set()
+                        self.callbacks.on_error(f"Live audio output failed: {exc}")
+                        break
+
+        player = threading.Thread(target=playback_worker, name="orynn-live-audio", daemon=True)
+        player.start()
         client = genai.Client(api_key=gemini_api_key())
 
         retries = 0
@@ -356,7 +365,7 @@ class GeminiLiveCompanion:
 
                         sender = asyncio.create_task(self._send_audio(session, audio_queue, types))
                         try:
-                            await self._receive_loop(session, output_writer, types)
+                            await self._receive_loop(session, output_q, types)
                         finally:
                             sender.cancel()
                             try:
@@ -373,6 +382,14 @@ class GeminiLiveCompanion:
                     retry_delay = min(retry_delay * 2.0, 10.0)
         finally:
             self._stop.set()
+            try:
+                output_q.put_nowait(None)  # wake the playback thread so it exits
+            except Exception:
+                pass
+            try:
+                player.join(timeout=1.0)
+            except Exception:
+                pass
             if self._session is not None:
                 try:
                     await self._session.send_realtime_input(audio_stream_end=True)
