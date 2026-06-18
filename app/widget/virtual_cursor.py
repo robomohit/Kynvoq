@@ -369,12 +369,22 @@ class VirtualCursorOverlay(QWidget):
         if len(text) > 220:
             text = text[:217].rstrip() + "..."
         if text != self._companion_label:
+            now = self._now_ms()
+            # Only replay the pop-in (fade + scale) when the bubble is actually
+            # (re)appearing. If it's already on screen, this is a streaming update —
+            # just swap the text. Resetting alpha/scale on every streamed chunk is
+            # what made a growing reply flash/blink until streaming stopped.
+            appearing = (
+                self._companion_bubble_alpha < 0.25
+                or (now - self._companion_label_set_ms) > self.COMPANION_IDLE_HIDE_MS
+            )
             self._companion_label = text
-            self._companion_label_set_ms = self._now_ms()
-            self._companion_bubble_alpha = 0.0
-            # Subtle pop-in: start near full size so it eases in gently rather
-            # than springing from tiny (which read as "slop").
-            self._companion_bubble_scale = 0.88
+            self._companion_label_set_ms = now
+            if appearing:
+                self._companion_bubble_alpha = 0.0
+                # Subtle pop-in: start near full size so it eases in gently rather
+                # than springing from tiny (which read as "slop").
+                self._companion_bubble_scale = 0.88
         if self._companion_enabled:
             if not self.isVisible():
                 self._ensure_visible()

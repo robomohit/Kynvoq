@@ -111,3 +111,29 @@ def test_companion_text_lock_blocks_cursor_actions_not_authoritative():
     ov.set_companion_text_locked(False)
     ov.show_uia(1, 2, 3, 4, label="Clicked OK", kind="click")
     assert ov._companion_label == "Clicked OK"
+
+
+def test_streaming_updates_do_not_restart_popin():
+    """A growing/streamed reply must NOT restart the fade+scale pop-in on every
+    chunk — that made the bubble flash/blink until streaming stopped."""
+    ov = _overlay()
+    ov._companion_enabled = True
+    ov.set_companion_label("Sure,")
+    ov._companion_bubble_alpha = 1.0   # bubble fully shown (mid-reply)
+    ov._companion_bubble_scale = 1.0
+    for chunk in ("Sure, here's", "Sure, here's the", "Sure, here's the answer"):
+        ov.set_companion_label(chunk)
+        assert ov._companion_bubble_alpha == 1.0   # no fade restart -> no flash
+        assert ov._companion_bubble_scale == 1.0
+
+
+def test_reappearing_bubble_replays_popin():
+    """When the bubble had faded out, a new label DOES replay the gentle pop-in."""
+    ov = _overlay()
+    ov._companion_enabled = True
+    ov._companion_label = "old"
+    ov._companion_bubble_alpha = 0.1   # faded
+    ov._companion_bubble_scale = 1.0
+    ov.set_companion_label("a fresh message")
+    assert ov._companion_bubble_alpha == 0.0
+    assert ov._companion_bubble_scale == 0.88

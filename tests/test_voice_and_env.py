@@ -607,9 +607,11 @@ def test_force_utf8_stdio_is_crash_proof():
     assert {"encoding": "utf-8", "errors": "replace"} in calls
 
 
-def test_matches_wake_word():
+def test_matches_wake_word(monkeypatch):
     from app.widget import voice
 
+    # Pin the default wake word (ignore any ORYNN_WAKE_WORD from a loaded .env).
+    monkeypatch.delenv("ORYNN_WAKE_WORD", raising=False)
     # Wakes on the name and its common recognizer-mishears.
     assert voice.matches_wake_word("hey orynn")
     assert voice.matches_wake_word("Orynn, open notepad")
