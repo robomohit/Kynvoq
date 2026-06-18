@@ -58,6 +58,7 @@ def test_function_declarations_cover_desktop_tools():
         "get_companion_status",
         "look_at_screen",
         "web_search",
+        "run_terminal",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")
@@ -1690,3 +1691,50 @@ def test_capture_live_task_outcome_notifies_live_proactively():
     assert c._active_task_running is False
     assert fl.note and "organize my downloads" in fl.note
     assert "Sorted 12 files." in fl.note
+
+
+def test_live_run_terminal_runs_safe_command():
+    """run_terminal executes a normal command and hands the output back to Live."""
+    from app.models import ToolResult
+
+    c = _controller()
+    calls = []
+
+    class FakeTools:
+        def run_command(self, cmd):
+            calls.append(cmd)
+            return ToolResult(ok=True, output="On branch main\nnothing to commit")
+
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("run_terminal", {"command": "git status"})
+    assert res["ok"] is True
+    assert "On branch main" in res["output"]
+    assert calls == ["git status"]
+
+
+def test_live_run_terminal_hard_blocks_destructive_command():
+    """A catastrophic command must be refused BEFORE it runs — same hard-block guard
+    the desktop agent uses. run_command must never be called."""
+    c = _controller()
+    calls = []
+
+    class FakeTools:
+        def run_command(self, cmd):
+            calls.append(cmd)
+            from app.models import ToolResult
+            return ToolResult(ok=True, output="boom")
+
+    c._desktop_tools = FakeTools()
+    for danger in ("rm -rf /", "format c:", "shutdown /s"):
+        res = c._live_tool("run_terminal", {"command": danger})
+        assert res["ok"] is False and res.get("blocked") is True
+    assert calls == []  # nothing destructive ever executed
+
+
+def test_live_autostart_enabled_env(monkeypatch):
+    from app.widget import gemini_live as gl
+
+    monkeypatch.delenv("ORYNN_LIVE_AUTOSTART", raising=False)
+    assert gl.live_autostart_enabled() is False  # off by default (privacy + quota)
+    monkeypatch.setenv("ORYNN_LIVE_AUTOSTART", "1")
+    assert gl.live_autostart_enabled() is True

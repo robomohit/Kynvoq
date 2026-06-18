@@ -114,6 +114,14 @@ def _live_greeting_enabled() -> bool:
     return _env_flag("GEMINI_LIVE_GREETING")
 
 
+def live_autostart_enabled() -> bool:
+    """Whether Gemini Live starts automatically on launch — the 'main agent'
+    experience where you just talk, no hotkey. OFF by default because it holds the
+    mic open from boot and streams continuously (privacy + free-tier quota); opt in
+    with ORYNN_LIVE_AUTOSTART=1. Falls back to push-to-talk if Live is unavailable."""
+    return _env_flag("ORYNN_LIVE_AUTOSTART")
+
+
 def live_search_enabled() -> bool:
     """Whether to attach Google Search grounding to the Live session.
 
@@ -897,6 +905,27 @@ def _function_declarations(types: Any) -> list[Any]:
             },
         ),
         types.FunctionDeclaration(
+            name="run_terminal",
+            description=(
+                "Run a single shell/terminal command on the user's Windows PC and "
+                "get its output back — for quick things like git status, listing or "
+                "reading files, checking versions, pip/npm, python scripts. Prefer "
+                "this for short commands; use start_desktop_task for long-running or "
+                "multi-step work. Destructive commands (deleting/formatting/shutdown) "
+                "are blocked for safety."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The exact shell command to run.",
+                    }
+                },
+                "required": ["command"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="stop_current_task",
             description="Stop or cancel currently running Orynn desktop tasks.",
             parameters_json_schema={
@@ -945,7 +974,10 @@ def _default_system_instruction() -> str:
         "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
         "this say' — call look_at_screen with the question; you'll then see the "
         "screenshot and can describe it. For searching the web or checking facts, news, "
-        "weather, or real-time info, call web_search directly in the same turn. For opening "
+        "weather, or real-time info, call web_search directly in the same turn. For a "
+        "quick shell command (git status, listing/reading files, versions, running a "
+        "script) call run_terminal and read back the result; destructive commands are "
+        "blocked. For opening "
         "apps, files, or broader multi-step work, say a quick natural "
         "acknowledgement out loud and in the same turn call start_desktop_task "
         "with a clear, specific goal. If the user says stop, cancel, or never "

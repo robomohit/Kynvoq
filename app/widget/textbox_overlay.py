@@ -1344,6 +1344,8 @@ class OverlayController(QObject):
             return {"ok": True, "stopped": stopped, "message": "Stop request accepted."}
         if name == "look_at_screen":
             return self._live_look_at_screen(args)
+        if name == "run_terminal":
+            return self._live_run_terminal(args)
         if name == "get_companion_status":
             try:
                 data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
@@ -1432,6 +1434,49 @@ class OverlayController(QObject):
         # not just "started" — most commands finish within the window. Longer jobs
         # hand back "still working" and surface later via get_companion_status.
         return self._await_task_outcome(task_id, goal)
+
+    def _live_run_terminal(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run one shell command for Live and hand back its output. Catastrophic
+        commands (rm -rf /, format, mkfs, shutdown, …) are hard-blocked using the
+        SAME guard as the desktop agent; the check fails SAFE (blocks) if it errors."""
+        command = _clean_text(args.get("command") or "")
+        if not command:
+            return {"ok": False, "message": "Missing command."}
+        try:
+            from app.models import Action, ActionType
+            from app.safety import SafetyManager
+            decision = SafetyManager().evaluate(
+                Action(id="live-terminal", type=ActionType.run_command, args={"command": command}),
+                safe_mode=False,
+            )
+            blocked = bool(getattr(decision, "requires_approval", False))
+            block_reason = getattr(decision, "reason", "") or "blocked for safety"
+        except Exception:
+            blocked, block_reason = True, "safety check unavailable"
+        if blocked:
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Blocked unsafe command", source="live_tool", force=True)
+            return {"ok": False, "blocked": True,
+                    "message": (f"That command is blocked for safety ({block_reason}). "
+                                "Do not run it — tell the user it's not allowed.")}
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Running: " + _short(command, 70), source="live_tool", force=True)
+        try:
+            result = self._live_desktop_tools().run_command(command)
+            self._raise_if_live_cancelled()
+        except InterruptedError:
+            self.cursorStateRequested.emit("idle")
+            self._set_label("Stopped", source="live_stop", force=True)
+            return {"ok": False, "message": "Stopped."}
+        except Exception as exc:
+            return {"ok": False, "message": str(exc)[:200]}
+        ok = bool(getattr(result, "ok", False))
+        output = str(getattr(result, "output", "") or "")
+        self.cursorStateRequested.emit("listening")
+        self._set_label(("Ran: " if ok else "Failed: ") + _short(command, 70),
+                        source="live_tool", force=True)
+        return {"ok": ok, "output": output[:1500],
+                "message": "Command finished — tell the user the result briefly."}
 
     def _live_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         query = _clean_text(args.get("query") or "")
@@ -2017,6 +2062,16 @@ def main(argv: list[str] | None = None) -> int:
             "Couldn't register the global hotkeys (Ctrl+Shift+Space to talk, "
             "Ctrl+Shift+L for Live). Try launching Orynn as administrator.",
         )
+
+    # "Live as the main agent": optionally auto-start Gemini Live on launch so the
+    # user can just talk (no hotkey). Opt-in via ORYNN_LIVE_AUTOSTART; falls back to
+    # push-to-talk silently if Live is unavailable (no key / no audio).
+    try:
+        from .gemini_live import live_autostart_enabled, live_available
+        if live_autostart_enabled() and live_available():
+            controller._toggle_live()
+    except Exception as exc:
+        print(f"[clicky] Live autostart skipped: {exc}", flush=True)
     return int(app.exec())
 
 
