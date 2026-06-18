@@ -81,7 +81,19 @@ async def _lifespan(application):
             await asyncio.sleep(300)
             _prune_sessions()
 
-    global _telegram_task, _discord_task, _automation_task, _session_prune_task
+    async def _queue_watchdog_loop():
+        """Keep the task queue self-healing: periodically reap stuck/zombie/runaway
+        tasks and re-drain queued work, so a hung task can never permanently wedge
+        the queue (which would make every future task hang forever as 'queued')."""
+        while True:
+            await asyncio.sleep(_WATCHDOG_INTERVAL)
+            try:
+                _reap_stuck_tasks()
+                _start_next_queued_task()
+            except Exception as exc:
+                _lifespan_log.warning("queue watchdog tick failed: %s", exc)
+
+    global _telegram_task, _discord_task, _automation_task, _session_prune_task, _queue_watchdog_task
     await _init_mcp()
     def _external_submit(*, goal: str, task_id: Optional[str] = None, source: str = "external") -> TaskRecord:
         return _submit_managed_task(goal=goal, task_id=task_id, source=source)
@@ -89,6 +101,7 @@ async def _lifespan(application):
     _telegram_task = asyncio.create_task(start_telegram(service, submit_task=_external_submit))
     _discord_task = asyncio.create_task(start_discord(service, submit_task=_external_submit))
     _session_prune_task = asyncio.create_task(_prune_sessions_loop())
+    _queue_watchdog_task = asyncio.create_task(_queue_watchdog_loop())
 
     from .automation import get_registry as _get_auto_registry, poll_and_fire as _poll_and_fire
 
@@ -105,7 +118,7 @@ async def _lifespan(application):
 
     yield
     # Shutdown: cancel integrations and automation poller, then clean up background browsers
-    for _t in (_telegram_task, _discord_task, _automation_task, _session_prune_task):
+    for _t in (_telegram_task, _discord_task, _automation_task, _session_prune_task, _queue_watchdog_task):
         if _t and not _t.done():
             _t.cancel()
             try:
@@ -261,6 +274,7 @@ _telegram_task: Optional[asyncio.Task] = None
 _discord_task: Optional[asyncio.Task] = None
 _automation_task: Optional[asyncio.Task] = None
 _session_prune_task: Optional[asyncio.Task] = None
+_queue_watchdog_task: Optional[asyncio.Task] = None
 
 def _prune_sessions(now: Optional[datetime] = None) -> None:
     now = now or datetime.now(timezone.utc)
@@ -575,6 +589,10 @@ _tasks = _load_persisted_tasks()
 
 _MAX_IN_MEMORY_TASKS = 200  # keep at most this many completed tasks in _tasks dict
 _MAX_ACTIVE_TASKS = int(os.environ.get("ORYNN_MAX_ACTIVE_TASKS") or os.environ.get("AI_COMPUTER_MAX_ACTIVE_TASKS", "5"))
+# Queue watchdog: how often to reap stuck tasks + re-drain the queue, and the hard
+# ceiling past which a single task is force-failed so it can't wedge a slot forever.
+_WATCHDOG_INTERVAL = float(os.environ.get("ORYNN_WATCHDOG_INTERVAL") or "5")
+_TASK_MAX_RUNTIME = float(os.environ.get("ORYNN_TASK_MAX_RUNTIME") or "900")
 _queued_task_specs: List[Dict[str, Any]] = []
 
 
@@ -639,9 +657,60 @@ def _start_task_from_spec(spec: Dict[str, Any]) -> TaskRecord:
     return record
 
 
+def _count_active_tasks() -> int:
+    """Concurrency slots GENUINELY in use. A task counts only if its coroutine is
+    still running AND its record isn't already terminal — so a task that finalized
+    but whose coroutine hasn't unwound (or got wedged in cleanup) can never hold a
+    slot hostage. This is what stops a few stuck tasks from deadlocking the queue so
+    every future task hangs forever as 'queued'."""
+    n = 0
+    for tid, task in service._active_tasks.items():
+        if task.done():
+            continue
+        rec = _tasks.get(tid)
+        if rec is not None and _is_terminal_status(rec.status):
+            continue
+        n += 1
+    return n
+
+
+def _reap_stuck_tasks() -> None:
+    """Self-healing housekeeping so the task queue can NEVER permanently deadlock:
+    free slots held by finished, zombie (finalized-but-still-alive), or runaway
+    (past the hard runtime ceiling) tasks. Safe to call repeatedly."""
+    now = datetime.now(timezone.utc)
+    for tid, task in list(service._active_tasks.items()):
+        try:
+            if task.done():
+                service._active_tasks.pop(tid, None)
+                continue
+            rec = _tasks.get(tid)
+            # Finalized but the coroutine is still alive -> zombie: cancel + drop.
+            if rec is not None and _is_terminal_status(rec.status):
+                task.cancel()
+                service._active_tasks.pop(tid, None)
+                continue
+            # Running past the hard ceiling -> a genuine hang: force-fail it so it
+            # can never wedge a slot forever.
+            if rec is not None and rec.created_at:
+                try:
+                    age = (now - datetime.fromisoformat(rec.created_at)).total_seconds()
+                except Exception:
+                    age = 0.0
+                if age > _TASK_MAX_RUNTIME:
+                    task.cancel()
+                    rec.status = "failed"
+                    rec.reason = rec.reason or f"Reaped: exceeded max runtime ({_TASK_MAX_RUNTIME:.0f}s)."
+                    rec.finished_at = now.isoformat()
+                    _save_task_record(rec)
+                    service._active_tasks.pop(tid, None)
+        except Exception as exc:
+            _lifespan_log.warning("reap of task %s failed: %s", tid, exc)
+
+
 def _start_next_queued_task() -> None:
-    active_count = lambda: sum(1 for task in service._active_tasks.values() if not task.done())
-    while _queued_task_specs and active_count() < _MAX_ACTIVE_TASKS:
+    _reap_stuck_tasks()  # free any leaked/zombie slots before deciding capacity
+    while _queued_task_specs and _count_active_tasks() < _MAX_ACTIVE_TASKS:
         spec = _queued_task_specs.pop(0)
         rec = _tasks.get(spec["task_id"])
         if rec and rec.status != "queued":
@@ -1352,7 +1421,7 @@ def _submit_managed_task(
         "thinking_budget": thinking_budget,
         "source": source,
     }
-    active_count = sum(1 for task in service._active_tasks.values() if not task.done())
+    active_count = _count_active_tasks()
     if active_count >= _MAX_ACTIVE_TASKS:
         context = AgentContext(
             goal=goal,
@@ -2077,7 +2146,7 @@ async def create_task(body: TaskIn):
         raise HTTPException(status_code=409, detail=f"Task '{body.task_id}' already exists and is still active")
     if existing and existing.status in {"done", "failed", "cancelled", "complete"}:
         raise HTTPException(status_code=409, detail=f"Task '{body.task_id}' already exists")
-    active = len(service._active_tasks)
+    active = _count_active_tasks()
 
     model_selection = _select_model_for_task(body.goal, body.mode or "auto", body.model)
     selected_model = model_selection.get("selected_model") or ""
