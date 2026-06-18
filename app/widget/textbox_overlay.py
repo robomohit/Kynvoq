@@ -99,6 +99,17 @@ LIVE_DESKTOP_ACTION_LABELS = {
 
 LIVE_DESKTOP_ACTIONS = set(LIVE_DESKTOP_ACTION_LABELS)
 
+# The "acting" verbs that actually manipulate app UI. Live must NOT drive these as
+# bounded one-shots — that's the weak-action / mouse-hijack path the product brief
+# (Front Desk + Back Office §5.2) wants gone. When Live calls desktop_control with
+# one of these, the glue layer HARD-ROUTES it to the full agent (start_desktop_task)
+# with a clear goal instead of clicking/typing directly. The remaining desktop_control
+# actions stay atomic on the Live path: read-only inspection (observe/find/wait) plus
+# genuinely one-shot input (focus_window/wait_for_window/press_keys/scroll). Removing
+# the acting verbs from Live also structurally prevents the find→click step-chaining
+# that produced weak multi-step automation.
+LIVE_UPGRADE_ACTIONS = {"click", "type"}
+
 LIVE_BLOCKED_KEY_COMBOS = {
     "alt+f4",
     "alt+tab",
@@ -1344,8 +1355,43 @@ class OverlayController(QObject):
             return result
         raise ValueError(f"Unsupported desktop action: {action}")
 
+    def _goal_from_desktop_control(self, action: str, args: dict[str, Any]) -> str:
+        """Turn a low-level desktop_control click/type call into a clear natural-language
+        goal for the full agent, so a hard-routed action reads like an instruction the
+        back office can plan around (brief §5.2 "convert to a clear goal string")."""
+        app = _clean_text(args.get("app") or args.get("title") or "")
+        query = _clean_text(args.get("query") or "")
+        in_app = f" in {app}" if app else ""
+        if action == "click":
+            target = f'the "{query}" control' if query else "the requested control"
+            return f"Click {target}{in_app}."
+        if action == "type":
+            text = str(args.get("text") or "").strip()
+            field = f'the "{query}" field' if query else "the focused field"
+            goal = f'Type "{text}" into {field}{in_app}.'
+            if self._live_bool(args.get("submit")):
+                goal += " Then submit it."
+            return goal
+        return ""
+
     def _live_desktop_control(self, args: dict[str, Any]) -> dict[str, Any]:
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
+        # Hard route: clicking/typing in app UI is real desktop work, so hand it to the
+        # full agent instead of doing a weak one-shot from Live (brief §5.2 auto-upgrade).
+        if action in LIVE_UPGRADE_ACTIONS:
+            query = _clean_text(args.get("query") or "")
+            if action == "click" and not query:
+                self.cursorStateRequested.emit("thinking")
+                self._set_label("Missing target to click", source="live_tool", force=True)
+                return {"ok": False, "action": action, "message": "Missing query for click."}
+            if action == "type" and not str(args.get("text") or "").strip():
+                self.cursorStateRequested.emit("thinking")
+                self._set_label("Missing text for type.", source="live_tool", force=True)
+                return {"ok": False, "action": action, "message": "Missing text for type."}
+            goal = self._goal_from_desktop_control(action, args)
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Handing to Orynn agent", source="live_tool", force=True)
+            return self._live_start_desktop_task({"goal": goal})
         if action not in LIVE_DESKTOP_ACTIONS:
             self.cursorStateRequested.emit("thinking")
             self._set_label("Unsupported desktop action", source="live_tool", force=True)

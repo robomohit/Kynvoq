@@ -718,47 +718,61 @@ def test_live_tool_desktop_control_routes_to_uia_find_and_visuals():
     assert overlays and overlays[0]["overlay"]["target"] == "Text editor"
 
 
-def test_live_tool_desktop_control_routes_to_uia_type():
-    from app.models import ToolResult
-
+def test_live_tool_desktop_control_type_upgrades_to_full_agent():
+    """Typing into an app is real desktop work, so Live hard-routes it to the full
+    agent (start_desktop_task) instead of a weak one-shot uia_type (brief §5.2). The
+    built goal carries the text, the field, the app, and the submit intent."""
     calls = []
 
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append((method, path, data))
+            if path == "/api/tasks/preflight":
+                return {"blocked": False, "issues": []}
+            if path == "/api/tasks":
+                return {"ok": True}
+            return {}
+
     class FakeTools:
-        def uia_type(self, query, text, app="", clear_first=False, submit=False):
-            calls.append((query, text, app, clear_first, submit))
-            return ToolResult(
-                ok=True,
-                output="Typed into 'Text editor' via ValuePattern",
-                data={"target": "Text editor"},
-            )
+        def uia_type(self, *args, **kwargs):
+            raise AssertionError("type must route to the full agent, not uia_type")
 
     c = _controller()
+    c.client = FakeClient()
     c._desktop_tools = FakeTools()
-    labels = []
-    c.labelRequested.connect(lambda s: labels.append(s))
     res = c._live_tool(
         "desktop_control",
         {
             "action": "type",
-            "query": "Text editor",
+            "query": "search box",
             "text": "hello",
             "app": "Notepad",
-            "clear_first": True,
-            "submit": "false",
+            "submit": True,
         },
     )
 
     assert res["ok"] is True
-    assert calls == [("Text editor", "hello", "Notepad", True, False)]
-    assert labels == ["Typing into control", "Typed into Text editor"]
+    paths = [p for _, p, _ in calls]
+    assert "/api/tasks/preflight" in paths and "/api/tasks" in paths
+    goal = next(d for _, p, d in calls if p == "/api/tasks")["goal"]
+    assert "hello" in goal
+    assert "search box" in goal
+    assert "Notepad" in goal
+    assert "submit" in goal.lower()
+    assert c._active_task_running is True
 
 
 def test_live_tool_desktop_control_type_requires_non_empty_text():
+    class FakeClient:
+        def request(self, *args, **kwargs):
+            raise AssertionError("empty type text should not spawn a task")
+
     class FakeTools:
         def uia_type(self, *args, **kwargs):
             raise AssertionError("empty type text should not touch UIA")
 
     c = _controller()
+    c.client = FakeClient()
     c._desktop_tools = FakeTools()
     labels = []
     c.labelRequested.connect(lambda s: labels.append(s))
@@ -776,7 +790,53 @@ def test_live_tool_desktop_control_type_requires_non_empty_text():
 
     assert res["ok"] is False
     assert "missing text" in res["message"].lower()
-    assert labels == ["Typing into control", "Missing text for type."]
+    assert labels == ["Missing text for type."]
+
+
+def test_live_tool_desktop_control_click_upgrades_to_full_agent():
+    """Clicking in an app is real desktop work — Live hard-routes it to the full agent
+    rather than a weak one-shot uia_click that hijacks the mouse (brief §5.2)."""
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append((method, path, data))
+            if path == "/api/tasks/preflight":
+                return {"blocked": False, "issues": []}
+            if path == "/api/tasks":
+                return {"ok": True}
+            return {}
+
+    class FakeTools:
+        def uia_click(self, *args, **kwargs):
+            raise AssertionError("click must route to the full agent, not uia_click")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool(
+        "desktop_control",
+        {"action": "click", "query": "New Agent", "app": "Cursor"},
+    )
+
+    assert res["ok"] is True
+    goal = next(d for _, p, d in calls if p == "/api/tasks")["goal"]
+    assert "New Agent" in goal
+    assert "Cursor" in goal
+    assert c._active_task_running is True
+
+
+def test_live_tool_desktop_control_click_requires_target():
+    class FakeClient:
+        def request(self, *args, **kwargs):
+            raise AssertionError("a click with no target should not spawn a task")
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool("desktop_control", {"action": "click", "app": "Cursor"})
+
+    assert res["ok"] is False
+    assert "missing query" in res["message"].lower()
 
 
 def test_live_tool_desktop_control_observe_label_is_human_not_raw_map():

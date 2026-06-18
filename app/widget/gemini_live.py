@@ -860,10 +860,12 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="desktop_control",
             description=(
-                "Run one bounded, local Orynn desktop action using safe Windows "
-                "UI Automation/window tools. Prefer observe/find/wait before "
-                "click/type. Use start_desktop_task for launching apps or broader "
-                "multi-step jobs."
+                "Run ONE bounded, local Orynn desktop action using safe Windows "
+                "UI Automation/window tools. Use this only for read-only inspection "
+                "(observe/find/wait) and atomic input (focus_window/wait_for_window/"
+                "press_keys/scroll). For actually clicking or typing in an app, use "
+                "start_desktop_task instead — if you call click or type here they are "
+                "automatically handed to the full agent anyway."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -939,7 +941,10 @@ def _function_declarations(types: Any) -> list[Any]:
             name="start_desktop_task",
             description=(
                 "Start an Orynn desktop task for actions that require using "
-                "the user's computer, apps, files, browser, mouse, or keyboard."
+                "the user's computer, apps, files, browser, mouse, or keyboard. "
+                "This is the default for any app UI interaction — clicking buttons, "
+                "filling fields, opening apps, and multi-step chores all go here, "
+                "not through desktop_control."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1016,19 +1021,20 @@ def _default_system_instruction() -> str:
         "would: short, natural sentences, contractions, no lists or markdown, no "
         "emoji, and never read out symbols or tool names.\n"
         "When the user asks you to actually do something on the computer, DON'T "
-        "pretend you did it. For a single bounded desktop step, call "
-        "desktop_control: wait/focus/observe/find/click/type/press_keys/scroll. Prefer "
-        "UIA names and pass the app/window title whenever you know it. To actually "
+        "pretend you did it. Anytime it means clicking, typing, opening an app, "
+        "filling something in, or any multi-step chore, say a quick natural "
+        "acknowledgement out loud and in the same turn call start_desktop_task with "
+        "a clear, specific goal — that's the full agent that actually does the work "
+        "and tells you what happened. Use desktop_control only for quick read-only "
+        "checks (observe/find/wait to see what's on a window) or a single atomic "
+        "input like a keyboard shortcut (press_keys) or a scroll. To actually "
         "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
         "this say' — call look_at_screen with the question; you'll then see the "
         "screenshot and can describe it. For searching the web or checking facts, news, "
         "weather, or real-time info, call web_search directly in the same turn. For a "
         "quick shell command (git status, listing/reading files, versions, running a "
         "script) call run_terminal and read back the result; destructive commands are "
-        "blocked. For opening "
-        "apps, files, or broader multi-step work, say a quick natural "
-        "acknowledgement out loud and in the same turn call start_desktop_task "
-        "with a clear, specific goal. If the user says stop, cancel, or never "
+        "blocked. If the user says stop, cancel, or never "
         "mind, call stop_current_task right away and confirm you stopped.\n"
         "If they're just chatting or asking a question, simply answer — briefly and "
         "conversationally — without using any tool. Ask a short clarifying question "
