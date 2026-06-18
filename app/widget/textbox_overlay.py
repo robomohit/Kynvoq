@@ -1406,11 +1406,21 @@ class OverlayController(QObject):
             return goal
         return ""
 
+    @staticmethod
+    def _live_upgrade_actions() -> set[str]:
+        """Which desktop_control actions hard-route to the full agent. Defaults to the
+        acting verbs (click/type); ORYNN_LIVE_AUTOROUTE=off restores the legacy direct
+        one-shot clicks for users who prefer them (brief §12 auto-route pref)."""
+        mode = str(os.getenv("ORYNN_LIVE_AUTOROUTE", "") or "").strip().lower()
+        if mode in ("off", "0", "false", "no", "none"):
+            return set()
+        return set(LIVE_UPGRADE_ACTIONS)
+
     def _live_desktop_control(self, args: dict[str, Any]) -> dict[str, Any]:
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
         # Hard route: clicking/typing in app UI is real desktop work, so hand it to the
         # full agent instead of doing a weak one-shot from Live (brief §5.2 auto-upgrade).
-        if action in LIVE_UPGRADE_ACTIONS:
+        if action in self._live_upgrade_actions():
             query = _clean_text(args.get("query") or "")
             if action == "click" and not query:
                 self.cursorStateRequested.emit("thinking")

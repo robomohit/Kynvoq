@@ -1284,6 +1284,56 @@ def test_live_auto_upgraded_click_on_delete_requires_consent():
     assert res.get("needs_consent") is True
 
 
+def test_live_autoroute_off_restores_direct_click(monkeypatch):
+    """ORYNN_LIVE_AUTOROUTE=off opts out of the hard route, so Live does the old
+    direct one-shot uia_click instead of spawning a task (brief §12 pref)."""
+    from app.models import ToolResult
+
+    monkeypatch.setenv("ORYNN_LIVE_AUTOROUTE", "off")
+    clicked = []
+
+    class FakeTools:
+        def uia_click(self, query, app=""):
+            clicked.append((query, app))
+            return ToolResult(ok=True, output="Clicked", data={})
+
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("autoroute=off must not spawn a task")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("desktop_control", {"action": "click", "query": "OK", "app": "Dialog"})
+
+    assert res["ok"] is True
+    assert clicked == [("OK", "Dialog")]
+
+
+def test_live_autoroute_default_upgrades_click():
+    """With no override, click still hard-routes to the full agent (Phase 1 default)."""
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            return {}
+
+    class FakeTools:
+        def uia_click(self, *a, **k):
+            raise AssertionError("default autoroute must hand off, not click directly")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("desktop_control", {"action": "click", "query": "New Agent", "app": "Cursor"})
+
+    assert res["ok"] is True
+    assert "/api/tasks" in calls
+
+
 def test_live_tool_start_desktop_task_requires_goal():
     c = _controller()
 
