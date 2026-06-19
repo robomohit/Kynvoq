@@ -1379,7 +1379,7 @@ class OverlayController(QObject):
             if time.monotonic() >= deadline:
                 return result
 
-    def _run_live_desktop_action(self, action: str, args: dict[str, Any]) -> Any:
+    def _run_live_desktop_action(self, action: str, args: dict[str, Any], *, fast_invoke_only: bool = False) -> Any:
         self._raise_if_live_cancelled()
         tools = self._live_desktop_tools()
         app = _clean_text(args.get("app") or "")
@@ -1428,7 +1428,9 @@ class OverlayController(QObject):
         if action == "click":
             if not query:
                 raise ValueError("Missing query for click.")
-            result = tools.uia_click(query, app)
+            # Live's fast path forbids the pixel-click tier so a click either lands
+            # cleanly via UIA (no mouse) or fails fast and escalates to the agent.
+            result = tools.uia_click(query, app, allow_pixel_fallback=not fast_invoke_only)
             self._raise_if_live_cancelled()
             return result
         if action == "type":
@@ -1500,16 +1502,18 @@ class OverlayController(QObject):
         return set(LIVE_UPGRADE_ACTIONS)
 
     def _desktop_control_route(self, args: dict[str, Any]) -> dict[str, Any] | None:
-        """Model-path routing for a desktop_control click/type. Try the FAST direct UIA
-        primitive first — instant (~1-4s), no agent spin-up, no enable_desktop_control
-        prompt, no mouse-jump (UIA invoke). It's the same path the Golden Five proves
-        10/10. Only if it can't do it (control missing / Electron-locked / mouse
-        fallback failed) escalate to the full agent, which can electron_unlock, retry,
-        and run a sequence. Returns None for non-acting actions (observe/find/wait/
-        focus/press_keys/scroll) so they run as bounded primitives unchanged. The model
-        sends genuinely multi-step / app-launch / vague work to start_desktop_task
-        directly, so it never reaches here. Lives at the MODEL boundary only — the
-        deterministic gateway (Golden Five, push-to-talk) calls _live_tool directly."""
+        """Model-path routing for a desktop_control click/type. Try a FAST UIA-only
+        attempt first — instant (~1-4s), no agent spin-up, no enable_desktop_control
+        prompt, and genuinely no mouse-jump (the pixel-click tier is disabled, so a
+        click lands via an accessibility pattern or not at all). Escalate to the full
+        agent only when that can't do it cleanly (no invoke pattern / Electron-locked /
+        the click didn't visibly land) — that's where electron_unlock, pixel-clicking
+        with the user's awareness, retries, and sequences live. Returns None for
+        non-acting actions (observe/find/wait/focus/press_keys/scroll) so they run as
+        bounded primitives unchanged. The model sends genuinely multi-step / app-launch
+        / vague work to start_desktop_task directly, so it never reaches here. Lives at
+        the MODEL boundary only — the deterministic gateway (Golden Five, push-to-talk)
+        calls _live_tool directly and keeps its pixel fallback."""
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
         if action not in self._live_fast_then_escalate_actions():
             return None
@@ -1538,19 +1542,32 @@ class OverlayController(QObject):
                     "with the same goal and confirmed set to true. If they say no, drop it."
                 ),
             }
-        # FAST path: the direct UIA primitive (same code the Golden Five proves 10/10).
-        fast = self._live_desktop_control(args)
-        if isinstance(fast, dict) and fast.get("ok"):
+        # FAST path: UIA-only (no pixel fallback), so a click either lands cleanly via
+        # an accessibility pattern — instant, no mouse-jump — or fails fast. A click
+        # that "worked" only by stealing the mouse is exactly the flaky Electron case,
+        # so we never let that count as success here.
+        fast = self._live_desktop_control(args, fast_invoke_only=True)
+        if isinstance(fast, dict) and fast.get("ok") and not self._fast_result_is_soft_fail(fast):
             return fast
-        # The fast click couldn't do it (missing control / Electron-locked) → escalate
-        # to the back office for a reliable retry. Live's spoken narration owns the
-        # bubble while it drives, so don't flash a raw handoff status over it.
+        # Couldn't do it cleanly (no invoke pattern / Electron-locked / click didn't
+        # visibly land) → escalate to the back office, which can electron_unlock,
+        # pixel-click with the user's awareness, and retry. Live's spoken narration
+        # owns the bubble while it drives, so don't flash a raw handoff status over it.
         self.cursorStateRequested.emit("thinking")
         if not self._live_is_running():
             self._set_label("Trying the full agent", source="live_tool", force=True)
         return self._live_tool("start_desktop_task", {"goal": goal})
 
-    def _live_desktop_control(self, args: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _fast_result_is_soft_fail(fast: dict[str, Any]) -> bool:
+        """A fast action returned ok=True but shouldn't be trusted as done: post-action
+        verification explicitly said the UI didn't change (verified is False). Escalate
+        those so the agent can do it for real. (Mouse-fallback successes can't reach
+        here — the fast path runs UIA-only.)"""
+        data = fast.get("data") if isinstance(fast.get("data"), dict) else {}
+        return data.get("verified") is False
+
+    def _live_desktop_control(self, args: dict[str, Any], *, fast_invoke_only: bool = False) -> dict[str, Any]:
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
         if action not in LIVE_DESKTOP_ACTIONS:
             self.cursorStateRequested.emit("thinking")
@@ -1559,7 +1576,7 @@ class OverlayController(QObject):
         self.cursorStateRequested.emit("thinking")
         self._set_label(LIVE_DESKTOP_ACTION_LABELS[action], source="live_tool", force=True)
         try:
-            result = self._run_live_desktop_action(action, args)
+            result = self._run_live_desktop_action(action, args, fast_invoke_only=fast_invoke_only)
             return self._live_tool_result(action, result)
         except InterruptedError as exc:
             message = str(exc)[:200] or "Gemini Live was stopped."

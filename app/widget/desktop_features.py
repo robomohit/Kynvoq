@@ -1866,12 +1866,17 @@ def _try_background_setvalue(ctrl, text: str, clear_first: bool) -> bool:
         return False
 
 
-def invoke_ui_element(query: str, app_hint: str = "") -> dict:
+def invoke_ui_element(query: str, app_hint: str = "", allow_pixel_fallback: bool = True) -> dict:
     """Activate a control by name without a pixel click. Order of attempts:
     scroll it into view (Electron virtualized lists), then InvokePattern (a
     real button/menu activation), then SelectionItemPattern (servers/channels/
     list items), and finally a coordinate click if the control has a real rect.
     Works on offscreen/0-size Electron controls that a pixel click can't hit.
+
+    allow_pixel_fallback=False stops before the coordinate-click tier (which steals
+    the real mouse) and returns ok=False instead — used by Live's fast path so a
+    single click either lands cleanly via UIA or escalates to the full agent, never
+    surprising the user by hijacking the mouse.
     """
     ctrl, info = _find_uia_control(query, app_hint)
     if ctrl is None:
@@ -1921,6 +1926,10 @@ def invoke_ui_element(query: str, app_hint: str = "") -> dict:
         pass
     # 3. Coordinate click â€” only if the control now has a real on-screen rect.
     #    This is the one tier that steals the real mouse, so be polite about it.
+    if not allow_pixel_fallback:
+        return {"ok": False, "method": "needs_pixel_fallback",
+                "error": f"'{target}' has no clean UIA invoke/toggle/select pattern; "
+                         "a mouse click would be needed", "found_at": info, "rect": rect}
     try:
         import pyautogui
         if rect["width"] > 0 and rect["height"] > 0:

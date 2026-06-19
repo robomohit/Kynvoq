@@ -3747,16 +3747,19 @@ class ToolExecutor:
                 pass
         return ToolResult(ok=ok, output=out, data=data)
 
-    def uia_click(self, query: str, app: str = ""):
+    def uia_click(self, query: str, app: str = "", allow_pixel_fallback: bool = True):
         from .widget.desktop_features import invoke_ui_element
         self._clear_uia_find_cache()
         before = self._click_snapshot()
-        res = invoke_ui_element(query, app)
+        res = invoke_ui_element(query, app, allow_pixel_fallback=allow_pixel_fallback)
         if not res.get("ok"):
-            # Auto-fallback: try OCR pixel-click before giving up to the model.
-            ocr_result = self._ocr_click_fallback(query, app)
-            if ocr_result is not None:
-                return ocr_result
+            # Auto-fallback: try OCR pixel-click before giving up to the model — unless
+            # the caller forbade pixel fallback (Live's fast path wants UIA-only so it
+            # can escalate cleanly instead of hijacking the mouse).
+            if allow_pixel_fallback:
+                ocr_result = self._ocr_click_fallback(query, app)
+                if ocr_result is not None:
+                    return ocr_result
             app_rect = self._app_rect_payload(app)
             data = dict(res)
             data["overlay"] = _overlay_payload(
@@ -3795,9 +3798,10 @@ class ToolExecutor:
         )
         # Post-action verification: did the click visibly change UI state?
         verified = self._verify_clicked(before)
-        if verified is not True:
+        if verified is not True and allow_pixel_fallback:
             # Active self-healing click retries:
             # Bring window to foreground, scroll control into view, and retry via pyautogui
+            # (a real mouse click — skipped when the caller forbade pixel fallback).
             try:
                 from .widget.desktop_features import _find_uia_control, _uia_pattern
                 import pyautogui

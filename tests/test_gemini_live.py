@@ -679,7 +679,7 @@ def test_stale_live_tool_callback_does_not_touch_desktop():
     c._live_generation = 3
 
     class FakeTools:
-        def uia_click(self, query, app=""):
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
             raise AssertionError("stale Live callback should not execute tools")
 
     c._desktop_tools = FakeTools()
@@ -836,9 +836,10 @@ def test_model_click_uses_fast_path_no_agent():
     clicked = []
 
     class FakeTools:
-        def uia_click(self, query, app=""):
-            clicked.append((query, app))
-            return ToolResult(ok=True, output="Activated 'OK' via invoke_pattern", data={})
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
+            clicked.append((query, app, allow_pixel_fallback))
+            return ToolResult(ok=True, output="Activated 'OK' via invoke_pattern",
+                              data={"method": "invoke_pattern"})
 
     class FakeClient:
         def request(self, *a, **k):
@@ -852,8 +853,42 @@ def test_model_click_uses_fast_path_no_agent():
     )
 
     assert res["ok"] is True
-    assert clicked == [("OK", "Dialog")]
+    # The fast attempt is UIA-only (no pixel fallback) so it can never hijack the mouse.
+    assert clicked == [("OK", "Dialog", False)]
     assert c._active_task_running is False
+
+
+def test_model_click_escalates_when_click_unverified():
+    """A fast click that returns ok=True but whose post-verification says nothing
+    changed (verified False) is a soft fail — escalate to the agent rather than
+    falsely declaring success."""
+    from app.models import ToolResult
+
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {"ok": True}
+            return {}
+
+    class FakeTools:
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
+            return ToolResult(ok=True, output="invoked, but unconfirmed",
+                              data={"method": "invoke_pattern", "verified": False})
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "click", "query": "Continue", "app": "App"}
+    )
+
+    assert "/api/tasks" in calls  # escalated because the click didn't visibly land
+    assert c._active_task_running is True
 
 
 def test_model_click_escalates_to_agent_on_fast_failure():
@@ -874,7 +909,7 @@ def test_model_click_escalates_to_agent_on_fast_failure():
             return {}
 
     class FakeTools:
-        def uia_click(self, query, app=""):
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
             return ToolResult(ok=False, output="No UIA match for 'New Agent' (app may be locked).", data={})
 
     c = _controller()
@@ -944,7 +979,7 @@ def test_deterministic_gateway_click_stays_direct_uia():
     calls = []
 
     class FakeTools:
-        def uia_click(self, query, app=""):
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
             calls.append((query, app))
             return ToolResult(ok=True, output="Clicked", data={})
 
@@ -1493,7 +1528,7 @@ def test_live_autoroute_off_disables_escalation(monkeypatch):
     monkeypatch.setenv("ORYNN_LIVE_AUTOROUTE", "off")
 
     class FakeTools:
-        def uia_click(self, query, app=""):
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
             return ToolResult(ok=False, output="No UIA match (locked).", data={})
 
     class FakeClient:

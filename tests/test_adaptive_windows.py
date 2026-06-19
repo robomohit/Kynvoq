@@ -639,7 +639,7 @@ def test_tool_executor_uia_find_cache_clears_after_click(monkeypatch, workspace)
     monkeypatch.setattr(
         desktop_features,
         "invoke_ui_element",
-        lambda query, app: {
+        lambda query, app, **kw: {
             "ok": True,
             "method": "invoke_pattern",
             "target": query,
