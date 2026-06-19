@@ -667,6 +667,9 @@ class GeminiLiveCompanion:
             # its backlog and talking over them.
             if getattr(content, "interrupted", False):
                 self._flush_output(output_queue_or_stream)
+                # Barge-in starts a fresh user turn — close the previous input turn so
+                # the new utterance doesn't append onto the last one's transcript.
+                self.callbacks.on_input_transcript("", True)
             output_finished = False
             inp = getattr(content, "input_transcription", None)
             if inp is not None and getattr(inp, "text", ""):
@@ -707,6 +710,11 @@ class GeminiLiveCompanion:
             if getattr(content, "turn_complete", False):
                 if not output_finished:
                     self.callbacks.on_output_transcript("", True)
+                # Close the input turn too. Gemini rarely sets finished=True on input
+                # transcription, so without an explicit turn-boundary finalize the
+                # bubble's "Hearing:" buffer concatenates every past utterance. Empty
+                # text + finished = silent finalize (no re-render of the old input).
+                self.callbacks.on_input_transcript("", True)
                 self.callbacks.on_status("Gemini Live listening")
                 if not getattr(getattr(message, "tool_call", None), "function_calls", None):
                     # region agent log

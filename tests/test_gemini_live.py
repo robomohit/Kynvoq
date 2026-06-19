@@ -470,6 +470,30 @@ def test_handle_message_turn_complete_finishes_live_reply():
     assert statuses == ["Gemini Live listening"]
 
 
+def test_handle_message_turn_complete_finalizes_input_turn():
+    """turn_complete must also close the INPUT turn (empty + finished) so the next
+    utterance's transcript starts fresh instead of concatenating onto the last."""
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    inputs = []
+    cbs = gl.GeminiLiveCallbacks(on_input_transcript=lambda t, fin: inputs.append((t, fin)))
+
+    class FakeContent:
+        input_transcription = None
+        output_transcription = None
+        model_turn = None
+        turn_complete = True
+
+    class FakeMessage:
+        server_content = FakeContent()
+        tool_call = None
+
+    comp = gl.GeminiLiveCompanion(cbs)
+    asyncio.run(comp._handle_message(object(), FakeMessage(), None, types))
+    assert ("", True) in inputs  # input turn was finalized at the boundary
+
+
 def _controller():
     """Build an OverlayController in a headless Qt app, or skip if PySide6 is absent."""
     import os
@@ -1766,6 +1790,33 @@ def test_live_turn_complete_resets_reply_buffer():
     c._live_output_transcript("", True)  # turn_complete boundary from Gemini Live
     c._live_output_transcript("Second answer", True)
     assert labels == ["First answer", "Second answer"]
+
+
+def test_live_input_transcript_resets_across_turns_on_finalize():
+    """Gemini rarely flags INPUT transcription finished, so the input turn is closed by
+    a turn-boundary finalize (empty text + finished). The next utterance must start a
+    fresh buffer, not concatenate past turns (the 'Hello.I need help...Ah!' bug)."""
+    c = _controller()
+    labels = []
+    c.labelRequested.connect(lambda s: labels.append(s))
+
+    c._live_input_transcript("hello there", False)       # turn 1 (no finished flag)
+    c._live_input_transcript("", True)                   # turn boundary -> silent close
+    c._live_input_transcript("what time is it", False)   # turn 2: brand-new utterance
+
+    assert labels == ["Hearing: hello there", "Hearing: what time is it"]
+    assert "hello there" not in labels[-1]
+
+
+def test_input_turn_finalize_does_not_rerender():
+    """The empty turn-boundary finalize must NOT flash the old input over the reply —
+    it only flips the done flag."""
+    c = _controller()
+    labels = []
+    c._live_input_transcript("an earlier question", False)
+    c.labelRequested.connect(lambda s: labels.append(s))
+    c._live_input_transcript("", True)  # finalize
+    assert labels == []  # nothing re-rendered
 
 
 def test_live_listening_status_does_not_overwrite_fresh_reply():

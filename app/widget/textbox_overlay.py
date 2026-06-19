@@ -1053,7 +1053,15 @@ class OverlayController(QObject):
         # The user spoke — refresh activity so wake-mode's idle-sleep timer resets.
         self._live_last_activity = time.monotonic()
         chunk = text or ""
-        if not chunk and not finished:
+        # Turn-boundary finalize: Gemini rarely flags INPUT transcription as finished,
+        # so the caller closes the turn at turn_complete with an empty finished signal.
+        # Just mark the turn done so the NEXT utterance starts a fresh buffer — without
+        # re-rendering the old input over the reply. Without this the bubble concatenates
+        # every past turn ("Hello.I need help...Ah! What does this page say?Ah!...").
+        if finished and not chunk:
+            self._live_input_done = True
+            return
+        if not chunk:
             return
         if self._live_input_done:
             self._live_input_buffer = ""
