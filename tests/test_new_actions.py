@@ -428,6 +428,42 @@ def test_validate_action_args_allows_empty_string_content(workspace):
     assert res is None
 
 
+def test_guess_launch_title_maps_uri_schemes(workspace):
+    """ms-settings: and friends open a window whose title isn't the scheme — map them
+    so the launch waits for the real window instead of falsely failing (#6). Windows
+    drive paths must NOT be mistaken for URI schemes."""
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+    assert t._guess_launch_target_title("start ms-settings:") == "Settings"
+    assert t._guess_launch_target_title("start ms-settings:bluetooth") == "Settings"
+    assert t._guess_launch_target_title("start ms-photos:") == "Photos"
+    # Unknown scheme/URL → no title (don't block on a wait that can't match).
+    assert t._guess_launch_target_title("start https://example.com") == ""
+    # A drive-letter path is not a scheme.
+    assert t._guess_launch_target_title("explorer C:\\Users") != "C"
+    # Plain known apps still resolve.
+    assert t._guess_launch_target_title("start notepad") == "Notepad"
+
+
+def test_windows_translate_command():
+    """Bare POSIX commands the model emits map to Windows equivalents; complex
+    commands (pipes/redirects/chaining) are left untouched (#10 / QA: ls on Windows)."""
+    import os
+    tr = ToolExecutor._windows_translate_command
+    if os.name != "nt":
+        import pytest as _pt
+        _pt.skip("Windows-only translation")
+    assert tr("ls") == "dir"
+    assert tr("ls -la") == "dir"
+    assert tr("ls -la C:/Users") == "dir C:/Users"
+    assert tr("cat notes.txt") == "type notes.txt"
+    assert tr("pwd") == "cd"
+    assert tr("which python") == "where python"
+    # Anything with a pipe/redirect/chain is preserved verbatim.
+    assert tr("ls | findstr foo") == "ls | findstr foo"
+    assert tr("dir /b") == "dir /b"
+    assert tr("python build.py") == "python build.py"
+
+
 def test_safety_bash():
     s = SafetyManager()
     dec = s.evaluate(Action(id="2", type=ActionType.bash, args={"command": "echo hi"}))

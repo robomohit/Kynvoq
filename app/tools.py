@@ -820,7 +820,24 @@ class ToolExecutor:
             if match:
                 target = (match.group("target") or "").strip().strip('"').strip("'")
                 break
-        if not target or re.match(r"^[a-z]+://", target, flags=re.IGNORECASE):
+        if not target:
+            return ""
+        # Windows URI launchers (ms-settings:, etc.) open an app whose window title is
+        # NOT the scheme — so waiting for a "ms-settings" window always failed even
+        # though Settings opened. Map known schemes to their real window title; for an
+        # unknown scheme/URL we can't guess a title, so don't block on a wait (#6).
+        scheme = re.match(r"^([a-z][a-z0-9.+-]*):(?!\\|/[^/])", target, flags=re.IGNORECASE)
+        uri_titles = {
+            "ms-settings": "Settings",
+            "ms-clock": "Clock",
+            "ms-calculator": "Calculator",
+            "calculator": "Calculator",
+            "ms-photos": "Photos",
+            "ms-availablenetworks": "Network",
+        }
+        if scheme:
+            return uri_titles.get(scheme.group(1).lower(), "")
+        if re.match(r"^[a-z]+://", target, flags=re.IGNORECASE):
             return ""
         base = Path(target.rstrip(":")).stem or target.rstrip(":")
         alias = {
@@ -1561,6 +1578,33 @@ class ToolExecutor:
             return ToolResult(ok=True, output=f"{launch_output}\n{wait_result.output}", data=wait_result.data)
         return ToolResult(ok=False, output=f"{launch_output}\n{wait_result.output}")
 
+    @staticmethod
+    def _windows_translate_command(command: str) -> str:
+        """Map a few bare POSIX commands the model reaches for to their Windows
+        equivalents, so 'list the files' (which Live often emits as `ls`) doesn't fail
+        on cmd.exe. Only rewrites a SIMPLE single command — anything with a pipe,
+        redirect, or chaining is left untouched so we never mangle a real command."""
+        if os.name != "nt":
+            return command
+        s = command.strip()
+        if not s or any(ch in s for ch in ("|", "&", ";", ">", "<", "`")) or "$(" in s:
+            return command
+        parts = s.split()
+        head = parts[0].lower()
+        rest = parts[1:]
+        if head == "ls":
+            paths = [p for p in rest if not p.startswith("-")]
+            return ("dir " + " ".join(paths)).strip()
+        if head == "cat" and rest:
+            return "type " + " ".join(rest)
+        if head == "pwd":
+            return "cd"
+        if head == "clear":
+            return "cls"
+        if head == "which" and rest:
+            return "where " + " ".join(rest)
+        return command
+
     def run_command(self, command: str):
         try:
             import re
@@ -1571,12 +1615,18 @@ class ToolExecutor:
                 return ToolResult(ok=True, output=f"Created directory: {target}")
             if self._looks_like_gui_launch(command):
                 return self._launch_gui_command(command, self.workspace)
+            command = self._windows_translate_command(command)
             res = subprocess.run(command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=self.workspace)
+            # A non-zero exit with no stderr (e.g. `dir` of a missing path on cmd) used
+            # to surface as a bare "STDERR:\n" — give the model a concrete reason (#7).
+            if res.returncode != 0 and not (res.stdout or "").strip() and not (res.stderr or "").strip():
+                return ToolResult(ok=False, output=f"Command exited with code {res.returncode} and produced no output.")
             return ToolResult(ok=res.returncode == 0, output=f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         except subprocess.TimeoutExpired:
             return ToolResult(ok=False, output="Command timed out after 120 seconds.")
         except Exception as e:
-            return ToolResult(ok=False, output=str(e))
+            # Never hand back an empty error — some exceptions stringify to "" (#7).
+            return ToolResult(ok=False, output=str(e).strip() or f"Command failed: {type(e).__name__}")
 
     async def run_command_streaming(
         self,
