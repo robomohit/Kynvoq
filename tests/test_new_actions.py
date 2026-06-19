@@ -391,6 +391,13 @@ def test_file_glob_stays_inside_workspace(workspace):
     assert result.ok
     assert "src" in result.output
 
+    # An ABSOLUTE pattern inside the workspace is allowed (read_file/write_file accept
+    # such paths too — file_glob used to reject every absolute path, so the agent
+    # couldn't glob a folder it had just written to).
+    abs_inside = t.file_glob(str((workspace / "src" / "*.py").resolve()))
+    assert abs_inside.ok
+    assert "app.py" in abs_inside.output
+
     with pytest.raises(Exception):
         t.file_glob("../**/*")
     with pytest.raises(Exception):

@@ -1877,17 +1877,33 @@ class ToolExecutor:
 
     def file_glob(self, pattern: str):
         import glob
-        raw = Path(pattern)
-        if raw.is_absolute() or ".." in raw.parts:
-            raise ToolError("Glob pattern must be relative and stay inside the workspace.")
-        matches = glob.glob(str(self.workspace / pattern), recursive=True)
+        raw = Path((pattern or "")).expanduser()
+        ws = self.workspace.resolve()
+        if raw.is_absolute():
+            # Absolute patterns are allowed as long as they stay inside the workspace.
+            # read_file/write_file already accept such paths, but file_glob used to
+            # reject EVERY absolute path — so the agent could write a file (e.g. on the
+            # Desktop, which is inside the workspace) yet fail to glob the folder it
+            # just wrote to. Validate the non-wildcard base resolves inside the workspace.
+            base = raw
+            while base != base.parent and any(c in base.name for c in "*?["):
+                base = base.parent
+            base = base.resolve()
+            if not (base == ws or ws in base.parents):
+                raise ToolError("Glob pattern must stay inside the workspace.")
+            search = str(raw)
+        else:
+            if ".." in raw.parts:
+                raise ToolError("Glob pattern must be relative and stay inside the workspace.")
+            search = str(self.workspace / pattern)
+        matches = glob.glob(search, recursive=True)
         rel_matches = []
         for match in matches:
             path = Path(match).resolve()
-            try:
-                rel_matches.append(str(path.relative_to(self.workspace)))
-            except ValueError:
-                raise ToolError("Glob pattern escaped workspace.")
+            # Defense in depth: never surface a match that resolved outside the workspace.
+            if not (path == ws or ws in path.parents):
+                continue
+            rel_matches.append(str(path.relative_to(ws)))
         return ToolResult(ok=True, output="\n".join(rel_matches) if rel_matches else "No matches found.")
 
     GREP_SKIP_DIRS = {
