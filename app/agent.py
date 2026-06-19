@@ -139,6 +139,22 @@ _VISUAL_DESKTOP_ACTION_TYPES = {
 # without a wasted bounce turn.
 _DESKTOP_EVIDENCE_ACTION_TYPES = _UIA_ACTION_TYPES | _VISUAL_DESKTOP_ACTION_TYPES
 
+# Actions that actually CHANGE the UI (vs read-only lookups). If the most recent one
+# failed or its post-action verification was contradicted (verified is False), a
+# "finish" can't honestly claim complete — used to emit complete:false (#3).
+_DESKTOP_MUTATING_ACTION_TYPES = {
+    ActionType.uia_click,
+    ActionType.uia_click_sequence,
+    ActionType.uia_type,
+    ActionType.mouse_click,
+    ActionType.double_click,
+    ActionType.right_click,
+    ActionType.middle_click,
+    ActionType.left_click_drag,
+    ActionType.keyboard_type,
+    ActionType.type_with_delay,
+}
+
 _TEXT_ONLY_DESKTOP_TOOL_EXCLUDES = _VISUAL_DESKTOP_ACTION_TYPES | {
     ActionType.ocr_image,
     ActionType.pixel_color_at,
@@ -1719,6 +1735,11 @@ class AgentService:
         if autonomy_level == "autonomous":
             is_auto_approve = True
             self._approval_bypass_tasks.add(task_id)
+            # Autonomous = no dashboard popups (consent is handled at the Live voice
+            # layer per the product brief §7.3). The 'desktop' scope is otherwise
+            # explicit-grant-only, so without this an autonomous task that escalates a
+            # click would still hit the enable_desktop_control prompt. Pre-grant it (#4).
+            self.permissions.grant(task_id, "desktop")
         if mode in ("computer", "computer_isolated"):
             self.permissions.grant(task_id, "desktop")
 
@@ -2313,6 +2334,9 @@ class AgentService:
                 _recent_calls: list[tuple[str, str]] = []  # (action_type, args_key) last 3 calls
                 _write_cache: dict[str, str] = {}  # path → content of recently written files
                 _last_uia_failed = False
+                # Did the most recent UI-changing action fail / fail to verify? Used so a
+                # "finish" right after a broken click/type reports complete:false (#3).
+                _last_mutation_unverified = False
                 # Finish gate: successful desktop interactions seen so far, and
                 # whether we already bounced one unearned finish (bounce once,
                 # then trust the model — never deadlock the loop).
@@ -2491,6 +2515,13 @@ class AgentService:
                                     elif event["type"] == "tool_call":
                                         action_type = event["name"]
                                         args = event.get("args", {})
+                                        # Guard against a malformed tool payload (model
+                                        # emitted a string/list/null instead of an args
+                                        # object) — a non-dict here would crash every
+                                        # downstream args.get(...). Coerce to {} so the
+                                        # required-arg validator returns a clean message.
+                                        if not isinstance(args, dict):
+                                            args = {}
                                         thought_text = event.get("thought", thought_text)
                                         tool_call_id = event.get("id", f"call-{step}")
                                         # Always emit a finalized reasoning card to show real elapsed time
@@ -3061,6 +3092,14 @@ class AgentService:
                         _last_uia_failed = not res.ok
                     elif act.type in _VISUAL_DESKTOP_ACTION_TYPES:
                         _last_uia_failed = False
+                    # Track whether the latest UI-changing action actually landed: a
+                    # failure, or an ok=True that post-verification contradicted
+                    # (verified is False), leaves us "unverified". A later successful
+                    # mutation clears it (the model recovered).
+                    if act.type in _DESKTOP_MUTATING_ACTION_TYPES:
+                        _res_data = getattr(res, "data", None)
+                        _verified = _res_data.get("verified") if isinstance(_res_data, dict) else None
+                        _last_mutation_unverified = (not res.ok) or (_verified is False)
                     
                     # ── Populate write cache so subsequent reads are free ──
                     if act.type == AT.write_file and res.ok:
@@ -3181,6 +3220,21 @@ class AgentService:
                     await self._emit(task_id, "usage_update", {"total_tokens": provider.total_tokens})
                     
                     if act.type == AT.finish:
+                        # Honest completion (#3): if the last UI-changing action failed
+                        # or its verification was contradicted, don't claim success — the
+                        # model is finishing over a broken step. Report it so Live/the
+                        # dashboard say what really happened instead of a false "done".
+                        if _last_mutation_unverified:
+                            honest = (res.output or "").strip()
+                            reason = (honest + " " if honest else "") + (
+                                "(Note: the last action didn't verify — the change may "
+                                "not have taken effect.)"
+                            )
+                            self._finalize(task_id, "failed", reason)
+                            await self._emit(task_id, "done", {"complete": False, "reason": reason, "finished_at": datetime.now(timezone.utc).isoformat()})
+                            await asyncio.to_thread(self.memory.summarize_session, task_id, goal, False, reason, mode)
+                            asyncio.create_task(asyncio.to_thread(self.memory.maybe_auto_consolidate))
+                            return
                         self._finalize(task_id, "done", res.output)
                         await self._emit(task_id, "done", {"complete": True, "reason": res.output, "finished_at": datetime.now(timezone.utc).isoformat()})
                         await asyncio.to_thread(self.memory.summarize_session, task_id, goal, True, res.output, mode)

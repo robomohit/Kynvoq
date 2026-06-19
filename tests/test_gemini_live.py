@@ -742,6 +742,39 @@ def test_live_tool_desktop_control_routes_to_uia_find_and_visuals():
     assert overlays and overlays[0]["overlay"]["target"] == "Text editor"
 
 
+def test_model_type_escalates_when_unverified():
+    """Honest success (#2): a type that returns ok=True but post-verification says the
+    text didn't land (verified False) escalates to the agent instead of claiming done."""
+    from app.models import ToolResult
+
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {"ok": True}
+            return {}
+
+    class FakeTools:
+        def uia_type(self, query, text, app="", clear_first=False, submit=False):
+            return ToolResult(ok=True, output="typed?, unconfirmed",
+                              data={"method": "paste", "verified": False})
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool_for_generation(
+        None, "desktop_control",
+        {"action": "type", "query": "notes", "text": "hello", "app": "Notepad"},
+    )
+
+    assert "/api/tasks" in calls
+    assert c._active_task_running is True
+
+
 def test_model_type_uses_fast_path_no_agent():
     """A single clear type in an open app does the FAST direct UIA primitive — instant,
     no agent spin-up, no task spawn, no permission prompt."""

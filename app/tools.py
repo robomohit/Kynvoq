@@ -4130,8 +4130,13 @@ class ToolExecutor:
     }
 
     def _validate_action_args(self, action: "Action") -> "Optional[ToolResult]":
+        args = action.args if isinstance(action.args, dict) else {}
         required = self._REQUIRED_ARGS.get(action.type.value, [])
-        missing = [k for k in required if k not in action.args]
+        # Treat a present-but-null required arg the same as missing (the model passed
+        # the key with no value). Empty strings are allowed — write_file content="" is
+        # a legitimately empty file; the acting tools (uia_click/uia_type) guard blank
+        # values themselves with a clearer message.
+        missing = [k for k in required if args.get(k) is None]
         if missing:
             example = ", ".join(f'"{k}": ...' for k in required)
             return ToolResult(

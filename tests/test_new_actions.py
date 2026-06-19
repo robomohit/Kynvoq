@@ -404,6 +404,30 @@ def test_file_glob_stays_inside_workspace(workspace):
         t.file_glob(str((workspace.parent / "*.py").resolve()))
 
 
+def test_validate_action_args_rejects_null_and_missing(workspace):
+    """A required arg that's missing OR explicitly null is rejected before execute,
+    with a clear message — not a confusing downstream crash (#1)."""
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+
+    missing = t._validate_action_args(Action(id="1", type=ActionType.uia_click, args={}))
+    assert missing is not None and missing.ok is False and "query" in missing.output
+
+    null_arg = t._validate_action_args(Action(id="2", type=ActionType.uia_click, args={"query": None}))
+    assert null_arg is not None and null_arg.ok is False
+
+    ok = t._validate_action_args(Action(id="3", type=ActionType.uia_click, args={"query": "OK"}))
+    assert ok is None
+
+
+def test_validate_action_args_allows_empty_string_content(workspace):
+    """Empty content is a legitimately empty file — must not be rejected (#1)."""
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+    res = t._validate_action_args(
+        Action(id="1", type=ActionType.write_file, args={"path": "a.txt", "content": ""})
+    )
+    assert res is None
+
+
 def test_safety_bash():
     s = SafetyManager()
     dec = s.evaluate(Action(id="2", type=ActionType.bash, args={"command": "echo hi"}))
