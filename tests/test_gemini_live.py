@@ -742,24 +742,21 @@ def test_live_tool_desktop_control_routes_to_uia_find_and_visuals():
     assert overlays and overlays[0]["overlay"]["target"] == "Text editor"
 
 
-def test_live_tool_desktop_control_type_upgrades_to_full_agent():
-    """Typing into an app is real desktop work, so Live hard-routes it to the full
-    agent (start_desktop_task) instead of a weak one-shot uia_type (brief §5.2). The
-    built goal carries the text, the field, the app, and the submit intent."""
-    calls = []
+def test_model_type_uses_fast_path_no_agent():
+    """A single clear type in an open app does the FAST direct UIA primitive — instant,
+    no agent spin-up, no task spawn, no permission prompt."""
+    from app.models import ToolResult
 
-    class FakeClient:
-        def request(self, method, path, data=None, timeout=4.0, **kw):
-            calls.append((method, path, data))
-            if path == "/api/tasks/preflight":
-                return {"blocked": False, "issues": []}
-            if path == "/api/tasks":
-                return {"ok": True}
-            return {}
+    typed = []
 
     class FakeTools:
-        def uia_type(self, *args, **kwargs):
-            raise AssertionError("type must route to the full agent, not uia_type")
+        def uia_type(self, query, text, app="", clear_first=False, submit=False):
+            typed.append((query, text, app, clear_first, submit))
+            return ToolResult(ok=True, output="Typed into 'search box'", data={"target": "search box"})
+
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("a successful fast type must not spawn a task")
 
     c = _controller()
     c.client = FakeClient()
@@ -767,22 +764,12 @@ def test_live_tool_desktop_control_type_upgrades_to_full_agent():
     res = c._live_tool_for_generation(
         None,
         "desktop_control",
-        {
-            "action": "type",
-            "query": "search box",
-            "text": "hello",
-            "app": "Notepad",
-        },
+        {"action": "type", "query": "search box", "text": "hello", "app": "Notepad"},
     )
 
     assert res["ok"] is True
-    paths = [p for _, p, _ in calls]
-    assert "/api/tasks/preflight" in paths and "/api/tasks" in paths
-    goal = next(d for _, p, d in calls if p == "/api/tasks")["goal"]
-    assert "hello" in goal
-    assert "search box" in goal
-    assert "Notepad" in goal
-    assert c._active_task_running is True
+    assert typed == [("search box", "hello", "Notepad", False, False)]
+    assert c._active_task_running is False
 
 
 def test_live_type_with_submit_carries_submit_and_needs_consent():
@@ -841,37 +828,67 @@ def test_live_tool_desktop_control_type_requires_non_empty_text():
     assert labels == ["Missing text for type."]
 
 
-def test_live_tool_desktop_control_click_upgrades_to_full_agent():
-    """Clicking in an app is real desktop work — Live hard-routes it to the full agent
-    rather than a weak one-shot uia_click that hijacks the mouse (brief §5.2)."""
-    calls = []
+def test_model_click_uses_fast_path_no_agent():
+    """A single clear click in an open app does the FAST direct UIA primitive — no
+    agent, no task spawn, no enable_desktop_control prompt."""
+    from app.models import ToolResult
 
-    class FakeClient:
-        def request(self, method, path, data=None, timeout=4.0, **kw):
-            calls.append((method, path, data))
-            if path == "/api/tasks/preflight":
-                return {"blocked": False, "issues": []}
-            if path == "/api/tasks":
-                return {"ok": True}
-            return {}
+    clicked = []
 
     class FakeTools:
-        def uia_click(self, *args, **kwargs):
-            raise AssertionError("click must route to the full agent, not uia_click")
+        def uia_click(self, query, app=""):
+            clicked.append((query, app))
+            return ToolResult(ok=True, output="Activated 'OK' via invoke_pattern", data={})
+
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("a successful fast click must not spawn a task")
 
     c = _controller()
     c.client = FakeClient()
     c._desktop_tools = FakeTools()
     res = c._live_tool_for_generation(
-        None,
-        "desktop_control",
-        {"action": "click", "query": "New Agent", "app": "Cursor"},
+        None, "desktop_control", {"action": "click", "query": "OK", "app": "Dialog"}
     )
 
     assert res["ok"] is True
-    goal = next(d for _, p, d in calls if p == "/api/tasks")["goal"]
-    assert "New Agent" in goal
-    assert "Cursor" in goal
+    assert clicked == [("OK", "Dialog")]
+    assert c._active_task_running is False
+
+
+def test_model_click_escalates_to_agent_on_fast_failure():
+    """When the fast UIA click can't do it (control missing / Electron-locked), escalate
+    to the full agent with the same goal — that's where reliability (electron_unlock,
+    retries) lives."""
+    from app.models import ToolResult
+
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append((path, data))
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {"ok": True}
+            return {}
+
+    class FakeTools:
+        def uia_click(self, query, app=""):
+            return ToolResult(ok=False, output="No UIA match for 'New Agent' (app may be locked).", data={})
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "click", "query": "New Agent", "app": "Cursor"}
+    )
+
+    assert res["ok"] is True  # escalated task accepted (status running)
+    paths = [p for p, _ in calls]
+    assert "/api/tasks" in paths
+    goal = next(d for p, d in calls if p == "/api/tasks")["goal"]
+    assert "New Agent" in goal and "Cursor" in goal
     assert c._active_task_running is True
 
 
@@ -1468,48 +1485,20 @@ def test_live_auto_upgraded_click_on_delete_requires_consent():
     assert res.get("needs_consent") is True
 
 
-def test_live_autoroute_off_restores_direct_click(monkeypatch):
-    """ORYNN_LIVE_AUTOROUTE=off opts out of the hard route, so Live does the old
-    direct one-shot uia_click instead of spawning a task (brief §12 pref)."""
+def test_live_autoroute_off_disables_escalation(monkeypatch):
+    """ORYNN_LIVE_AUTOROUTE=off disables fast->agent escalation: a failed fast click
+    just reports failure instead of spawning a task (legacy behavior, brief §12)."""
     from app.models import ToolResult
 
     monkeypatch.setenv("ORYNN_LIVE_AUTOROUTE", "off")
-    clicked = []
 
     class FakeTools:
         def uia_click(self, query, app=""):
-            clicked.append((query, app))
-            return ToolResult(ok=True, output="Clicked", data={})
+            return ToolResult(ok=False, output="No UIA match (locked).", data={})
 
     class FakeClient:
         def request(self, *a, **k):
-            raise AssertionError("autoroute=off must not spawn a task")
-
-    c = _controller()
-    c.client = FakeClient()
-    c._desktop_tools = FakeTools()
-    res = c._live_tool_for_generation(
-        None, "desktop_control", {"action": "click", "query": "OK", "app": "Dialog"}
-    )
-
-    assert res["ok"] is True
-    assert clicked == [("OK", "Dialog")]
-
-
-def test_live_autoroute_default_upgrades_click():
-    """With no override, a model click hard-routes to the full agent (Phase 1 default)."""
-    calls = []
-
-    class FakeClient:
-        def request(self, method, path, data=None, timeout=4.0, **kw):
-            calls.append(path)
-            if path == "/api/tasks/preflight":
-                return {"blocked": False}
-            return {}
-
-    class FakeTools:
-        def uia_click(self, *a, **k):
-            raise AssertionError("default autoroute must hand off, not click directly")
+            raise AssertionError("autoroute=off must not escalate to a task")
 
     c = _controller()
     c.client = FakeClient()
@@ -1518,8 +1507,7 @@ def test_live_autoroute_default_upgrades_click():
         None, "desktop_control", {"action": "click", "query": "New Agent", "app": "Cursor"}
     )
 
-    assert res["ok"] is True
-    assert "/api/tasks" in calls
+    assert res["ok"] is False  # reported failure, did not escalate
 
 
 def test_consent_gate_keyword_boundaries():

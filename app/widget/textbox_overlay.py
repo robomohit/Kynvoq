@@ -99,15 +99,15 @@ LIVE_DESKTOP_ACTION_LABELS = {
 
 LIVE_DESKTOP_ACTIONS = set(LIVE_DESKTOP_ACTION_LABELS)
 
-# The "acting" verbs that actually manipulate app UI. Live must NOT drive these as
-# bounded one-shots — that's the weak-action / mouse-hijack path the product brief
-# (Front Desk + Back Office §5.2) wants gone. When Live calls desktop_control with
-# one of these, the glue layer HARD-ROUTES it to the full agent (start_desktop_task)
-# with a clear goal instead of clicking/typing directly. The remaining desktop_control
-# actions stay atomic on the Live path: read-only inspection (observe/find/wait) plus
-# genuinely one-shot input (focus_window/wait_for_window/press_keys/scroll). Removing
-# the acting verbs from Live also structurally prevents the find→click step-chaining
-# that produced weak multi-step automation.
+# The "acting" verbs that manipulate app UI. On the MODEL path these get fast-path-
+# then-escalate routing (see _desktop_control_route): Live tries the direct UIA
+# primitive first — fast (~1-4s), no agent, no permission prompt, no mouse-jump — and
+# only escalates to the full agent (start_desktop_task) if that fails (control missing
+# / Electron-locked). A single clear click stays fast; the heavy back office is reserved
+# for multi-step / app-launch / vague goals (which the model sends to start_desktop_task
+# directly) and for fast-click failures. The remaining desktop_control actions are never
+# escalated: read-only inspection (observe/find/wait) and one-shot input
+# (focus_window/wait_for_window/press_keys/scroll).
 LIVE_UPGRADE_ACTIONS = {"click", "type"}
 
 LIVE_BLOCKED_KEY_COMBOS = {
@@ -1489,24 +1489,29 @@ class OverlayController(QObject):
         return ""
 
     @staticmethod
-    def _live_upgrade_actions() -> set[str]:
-        """Which desktop_control actions hard-route to the full agent. Defaults to the
-        acting verbs (click/type); ORYNN_LIVE_AUTOROUTE=off restores the legacy direct
-        one-shot clicks for users who prefer them (brief §12 auto-route pref)."""
+    def _live_fast_then_escalate_actions() -> set[str]:
+        """desktop_control actions that try the FAST direct UIA primitive first and
+        escalate to the full agent only on failure (click/type). ORYNN_LIVE_AUTOROUTE=off
+        disables escalation entirely — a failed fast click just reports failure, the
+        legacy behavior (brief §12 auto-route pref)."""
         mode = str(os.getenv("ORYNN_LIVE_AUTOROUTE", "") or "").strip().lower()
         if mode in ("off", "0", "false", "no", "none"):
             return set()
         return set(LIVE_UPGRADE_ACTIONS)
 
-    def _desktop_control_upgrade(self, args: dict[str, Any]) -> dict[str, Any] | None:
-        """If a model-driven desktop_control call is an acting verb (click/type), hand
-        it to the full agent and return that result; otherwise return None so the
-        caller runs the bounded primitive directly. Lives at the MODEL boundary only
-        (_live_tool_for_generation) — the deterministic gateway used by the Golden Five
-        and bounded push-to-talk calls _live_tool directly and must keep doing real
-        UIA primitives, no LLM (brief §5.2 vs the Golden Five reliability bar)."""
+    def _desktop_control_route(self, args: dict[str, Any]) -> dict[str, Any] | None:
+        """Model-path routing for a desktop_control click/type. Try the FAST direct UIA
+        primitive first — instant (~1-4s), no agent spin-up, no enable_desktop_control
+        prompt, no mouse-jump (UIA invoke). It's the same path the Golden Five proves
+        10/10. Only if it can't do it (control missing / Electron-locked / mouse
+        fallback failed) escalate to the full agent, which can electron_unlock, retry,
+        and run a sequence. Returns None for non-acting actions (observe/find/wait/
+        focus/press_keys/scroll) so they run as bounded primitives unchanged. The model
+        sends genuinely multi-step / app-launch / vague work to start_desktop_task
+        directly, so it never reaches here. Lives at the MODEL boundary only — the
+        deterministic gateway (Golden Five, push-to-talk) calls _live_tool directly."""
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
-        if action not in self._live_upgrade_actions():
+        if action not in self._live_fast_then_escalate_actions():
             return None
         query = _clean_text(args.get("query") or "")
         if action == "click" and not query:
@@ -1518,12 +1523,31 @@ class OverlayController(QObject):
             self._set_label("Missing text for type.", source="live_tool", force=True)
             return {"ok": False, "action": action, "message": "Missing text for type."}
         goal = self._goal_from_desktop_control(action, args)
+        # Disruptive targets still need a spoken yes first. A confirmed one runs via
+        # start_desktop_task (confirmed=true) — desktop_control has no confirmed flag.
+        if self._goal_needs_consent(goal) and not self._live_bool(args.get("confirmed")):
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Needs your OK", source="live_tool", force=True)
+            return {
+                "ok": False,
+                "needs_consent": True,
+                "message": (
+                    "This could change or send something that's hard to undo "
+                    f'("{_short(goal, 90)}"). Do NOT do it yet. Ask the user out loud '
+                    "to confirm; only if they clearly say yes, call start_desktop_task "
+                    "with the same goal and confirmed set to true. If they say no, drop it."
+                ),
+            }
+        # FAST path: the direct UIA primitive (same code the Golden Five proves 10/10).
+        fast = self._live_desktop_control(args)
+        if isinstance(fast, dict) and fast.get("ok"):
+            return fast
+        # The fast click couldn't do it (missing control / Electron-locked) → escalate
+        # to the back office for a reliable retry. Live's spoken narration owns the
+        # bubble while it drives, so don't flash a raw handoff status over it.
         self.cursorStateRequested.emit("thinking")
-        # Live's own spoken ack owns the bubble while it drives — don't flash a raw
-        # "Handing to Orynn agent" status that reads like a separate backend.
         if not self._live_is_running():
-            self._set_label("Handing to Orynn agent", source="live_tool", force=True)
-        # Route as a real start_desktop_task so the busy-gate and consent-gate apply.
+            self._set_label("Trying the full agent", source="live_tool", force=True)
         return self._live_tool("start_desktop_task", {"goal": goal})
 
     def _live_desktop_control(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1552,12 +1576,13 @@ class OverlayController(QObject):
         if not self._live_generation_current(generation):
             return {"ok": False, "message": "Gemini Live session changed."}
         args = args if isinstance(args, dict) else {}
-        # Model-driven dispatch only: hard-route click/type to the full agent here so
-        # the deterministic gateway (_live_tool direct) stays a pure UIA primitive path.
+        # Model-driven dispatch only: a click/type tries the fast UIA primitive and
+        # escalates to the full agent on failure (see _desktop_control_route). The
+        # deterministic gateway (_live_tool direct) stays a pure UIA primitive path.
         if name == "desktop_control":
-            upgraded = self._desktop_control_upgrade(args)
-            if upgraded is not None:
-                return upgraded
+            routed = self._desktop_control_route(args)
+            if routed is not None:
+                return routed
         return self._live_tool(name, args)
 
     def _active_desktop_task(self) -> str | None:

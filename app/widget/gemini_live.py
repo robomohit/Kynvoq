@@ -868,12 +868,14 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="desktop_control",
             description=(
-                "Run ONE bounded, local Orynn desktop action using safe Windows "
-                "UI Automation/window tools. Use this only for read-only inspection "
-                "(observe/find/wait) and atomic input (focus_window/wait_for_window/"
-                "press_keys/scroll). For actually clicking or typing in an app, use "
-                "start_desktop_task instead — if you call click or type here they are "
-                "automatically handed to the full agent anyway."
+                "Run ONE bounded, local Orynn desktop action — fast (~1-3s), no agent. "
+                "Use it for a SINGLE clear action in an app that's already open: click a "
+                "named button (click), type into one field (type), a keyboard shortcut "
+                "(press_keys), scroll, focus/await a window, or read controls "
+                "(observe/find/wait). If a click/type can't be done (button missing or a "
+                "locked app like Cursor/Discord), it automatically escalates to the full "
+                "agent. Use start_desktop_task instead for opening apps or anything "
+                "multi-step (\"do X and then Y\")."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -948,11 +950,11 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="start_desktop_task",
             description=(
-                "Start an Orynn desktop task for actions that require using "
-                "the user's computer, apps, files, browser, mouse, or keyboard. "
-                "This is the default for any app UI interaction — clicking buttons, "
-                "filling fields, opening apps, and multi-step chores all go here, "
-                "not through desktop_control."
+                "Start a full Orynn desktop task (the agent: plans, multiple steps, "
+                "files, browser, terminal, app-unlocking). Use it for opening/launching "
+                "an app, multi-step chores (\"open X and do Y, then Z\"), or vague/"
+                "setup goals. For a single clear click or typing into one field in an "
+                "already-open app, prefer desktop_control — it's much faster."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1043,13 +1045,13 @@ def _default_system_instruction() -> str:
         "would: short, natural sentences, contractions, no lists or markdown, no "
         "emoji, and never read out symbols or tool names.\n"
         "When the user asks you to actually do something on the computer, DON'T "
-        "pretend you did it. Anytime it means clicking, typing, opening an app, "
-        "filling something in, or any multi-step chore, say a quick natural "
-        "acknowledgement out loud and in the same turn call start_desktop_task with "
-        "a clear, specific goal — that's the full agent that actually does the work "
-        "and tells you what happened. Use desktop_control only for quick read-only "
-        "checks (observe/find/wait to see what's on a window) or a single atomic "
-        "input like a keyboard shortcut (press_keys) or a scroll. To actually "
+        "pretend you did it. For a SINGLE clear action in an app that's already open — "
+        "click a named button, type into one field, a keyboard shortcut, scroll, or "
+        "read what's on a window — use desktop_control; it's fast and if a click can't "
+        "be done it escalates to the full agent on its own. For opening or launching an "
+        "app, or anything multi-step (\"do X and then Y\"), or a vague/setup goal, say a "
+        "quick natural acknowledgement out loud and in the same turn call "
+        "start_desktop_task with a clear, specific goal — that's the full agent. To actually "
         "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
         "this say' — call look_at_screen with the question; you'll then see the "
         "screenshot and can describe it. For searching the web or checking facts, news, "
