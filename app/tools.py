@@ -3836,15 +3836,19 @@ class ToolExecutor:
         verdict = " (verified)" if verified is True else ""
         return ToolResult(ok=True, output=f"Activated '{res.get('target')}' via {res.get('method')}{verdict}.{tok}", data=data)
 
-    def uia_type(self, query: str, text: str, app: str = "", clear_first: bool = False, submit: bool = False):
+    def uia_type(self, query: str, text: str, app: str = "", clear_first: bool = False, submit: bool = False, allow_pixel_fallback: bool = True):
         from .widget.desktop_features import type_into_ui_element
         self._clear_uia_find_cache()
         res = type_into_ui_element(query, text, app, clear_first, submit)
         if not res.get("ok"):
-            # Auto-fallback: OCR-find the field, click to focus, then paste.
-            ocr_result = self._ocr_type_fallback(query, text, app, clear_first, submit)
-            if ocr_result is not None:
-                return ocr_result
+            # Auto-fallback: OCR-find the field, click to focus (a real mouse click),
+            # then paste — skipped when the caller forbade pixel fallback (Live's fast
+            # path wants UIA-only so it can escalate cleanly instead of hijacking the
+            # mouse), mirroring uia_click (#8).
+            if allow_pixel_fallback:
+                ocr_result = self._ocr_type_fallback(query, text, app, clear_first, submit)
+                if ocr_result is not None:
+                    return ocr_result
             app_rect = self._app_rect_payload(app)
             data = dict(res)
             data["overlay"] = _overlay_payload(

@@ -2338,7 +2338,13 @@ async def kill_task(task_id: str):
     # checkpoint) AND cancels the backing asyncio task. cancel_task alone never
     # set the flag, so killed tasks kept running until their next await.
     killed = service.kill_task(task_id)
-    if not killed:
+    # Also drop it from the pending queue. A queued task has no backing asyncio task,
+    # so service.kill_task() returns False for it — without this, "stop" would leave
+    # queued work that the queue watchdog springs back to life moments later (#9).
+    was_queued = any(s.get("task_id") == task_id for s in _queued_task_specs)
+    if was_queued:
+        _queued_task_specs[:] = [s for s in _queued_task_specs if s.get("task_id") != task_id]
+    if not killed and not was_queued:
         raise HTTPException(status_code=404, detail="Task not found or already complete")
     if task_id in _tasks:
         _tasks[task_id].status = "cancelled"

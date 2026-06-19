@@ -1445,6 +1445,7 @@ class OverlayController(QObject):
                 app,
                 clear_first=self._live_bool(args.get("clear_first")),
                 submit=self._live_bool(args.get("submit")),
+                allow_pixel_fallback=not fast_invoke_only,
             )
             self._raise_if_live_cancelled()
             return result
@@ -1650,14 +1651,19 @@ class OverlayController(QObject):
         if name == "web_search":
             return self._live_web_search(args)
         if name == "stop_current_task":
-            try:
-                stopped = self._kill_active_tasks()
-            except Exception as exc:
-                return {"ok": False, "message": str(exc)[:200]}
+            # Stop is the user's escape hatch — release our local busy state FIRST and
+            # unconditionally, even if the kill HTTP call then fails (network blip). A
+            # stale "busy" flag must never trap the user out of issuing new commands (#9).
             self.cursorStateRequested.emit("idle")
             self._active_task_running = False
             self._active_task_goal = ""
             self._set_label("Stopped", source="live_stop", force=True)
+            try:
+                stopped = self._kill_active_tasks()
+            except Exception as exc:
+                return {"ok": True, "stopped": 0,
+                        "message": ("Stop accepted and I've stopped tracking the task, "
+                                    f"but couldn't confirm with the backend ({str(exc)[:120]}).")}
             return {"ok": True, "stopped": stopped, "message": "Stop request accepted."}
         if name == "look_at_screen":
             return self._live_look_at_screen(args)
@@ -2126,11 +2132,14 @@ class OverlayController(QObject):
                 # "revert to ready" is needed here.
             except Exception:
                 self._consecutive_failures += 1
-                if self._consecutive_failures >= 3:
-                    self._active_task_running = False
-                    self._active_task_goal = ""
-                    if not self._live_is_running():
-                        self.cursorStateRequested.emit("idle")
+                # A poll failure (network blip) must NOT clear the busy flag — a task may
+                # still be running, and clearing it would let Live stack a second task and
+                # fight for focus. The flag is authoritative-via-HTTP: _active_desktop_task()
+                # confirms over HTTP before any new Live action (failing safe to "busy"),
+                # and _sync_state_with_active_tasks() re-syncs from the server the moment
+                # polling recovers (it only clears on a SUCCESSFUL empty response) (#5).
+                if self._consecutive_failures >= 3 and not self._live_is_running():
+                    self.cursorStateRequested.emit("idle")  # cosmetic only; flag untouched
                 if not idle_label_shown:
                     self._set_label("Waiting for Orynn", source="system_wait")
                     idle_label_shown = True

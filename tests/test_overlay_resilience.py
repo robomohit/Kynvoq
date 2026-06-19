@@ -15,7 +15,10 @@ QApplication.instance() or QApplication([])
 
 
 def test_poll_loop_connection_failure_limit(monkeypatch):
-    """Verify that after 3+ consecutive failures, active tasks and cursor states are reset."""
+    """After 3+ consecutive poll failures the cursor goes idle (cosmetic), but the busy
+    flag is NOT cleared — a network blip must not let Live stack a second task on a
+    still-running one. The flag is authoritative-via-HTTP and self-heals on recovery
+    via _sync_state_with_active_tasks (#5)."""
     controller = OverlayController(port=8000)
     
     # Track cursor state emissions
@@ -47,11 +50,14 @@ def test_poll_loop_connection_failure_limit(monkeypatch):
     # Run loop
     controller._poll_loop()
     
-    # Check that failures were tracked and states reset
+    # Failures are tracked and the cursor goes idle (cosmetic)...
     assert controller._consecutive_failures >= 3
-    assert not controller._active_task_running
-    assert controller._active_task_goal == ""
     assert "idle" in emitted_states
+    # ...but the busy flag is intentionally preserved on poll failure (#5): a blip must
+    # never clear it, or Live could start a colliding second task. HTTP confirm at
+    # action time and the recovery re-sync are the only things that clear it.
+    assert controller._active_task_running is True
+    assert controller._active_task_goal == "Test Task"
 
 
 def test_poll_loop_recovery_syncs_active_tasks(monkeypatch):

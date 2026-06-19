@@ -759,7 +759,7 @@ def test_model_type_escalates_when_unverified():
             return {}
 
     class FakeTools:
-        def uia_type(self, query, text, app="", clear_first=False, submit=False):
+        def uia_type(self, query, text, app="", clear_first=False, submit=False, allow_pixel_fallback=True):
             return ToolResult(ok=True, output="typed?, unconfirmed",
                               data={"method": "paste", "verified": False})
 
@@ -783,7 +783,7 @@ def test_model_type_uses_fast_path_no_agent():
     typed = []
 
     class FakeTools:
-        def uia_type(self, query, text, app="", clear_first=False, submit=False):
+        def uia_type(self, query, text, app="", clear_first=False, submit=False, allow_pixel_fallback=True):
             typed.append((query, text, app, clear_first, submit))
             return ToolResult(ok=True, output="Typed into 'search box'", data={"target": "search box"})
 
@@ -984,7 +984,7 @@ def test_deterministic_gateway_type_stays_direct_uia():
     calls = []
 
     class FakeTools:
-        def uia_type(self, query, text, app="", clear_first=False, submit=False):
+        def uia_type(self, query, text, app="", clear_first=False, submit=False, allow_pixel_fallback=True):
             calls.append((query, text, app, clear_first, submit))
             return ToolResult(ok=True, output="Typed into 'Text editor' via ValuePattern",
                               data={"target": "Text editor"})
