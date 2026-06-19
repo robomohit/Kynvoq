@@ -1103,6 +1103,18 @@ DEFAULT_OPENROUTER_MODEL = "openrouter/openai/gpt-oss-120b:free"
 _CHAIN_RETRY_MAX = 3
 _CHAIN_RETRY_BACKOFFS = [8, 20, 40]  # seconds between chain retry attempts
 
+
+def _ttft_failover_seconds() -> float:
+    """Time-to-first-token budget (#10). If a model streams NO token within this many
+    seconds, abandon it and fail over to the next model in the chain (same machinery as
+    a 429). 0 disables it — the default, because free-tier TTFT is legitimately 5-15s and
+    a too-eager budget would thrash off a slow-but-working model. Opt in with
+    ORYNN_TTFT_FAILOVER_SECONDS=<n> (e.g. 30 to rescue a truly hung model)."""
+    try:
+        return max(0.0, float(os.getenv("ORYNN_TTFT_FAILOVER_SECONDS", "0") or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
 # Speed tiers — each is an ordered free-model fallback chain. A user picks a
 # tier ("tier:quick" / "tier:balanced") instead of a raw model; the chain
 # survives the constant free-tier flakiness (most free models error at any
@@ -1902,19 +1914,40 @@ class PlannerProvider:
         _groq_fallback_ready = self._is_groq() and bool(self._openrouter_key)
         try:
             last_err: Optional[Exception] = None
+            _ttft_budget = _ttft_failover_seconds()
             for _chain_attempt in range(_CHAIN_RETRY_MAX + 1):
                 last_err = None
                 _streamed_any = False
                 try:
-                    async for event in self._stream_chat_with_tools_single(
+                    _agen = self._stream_chat_with_tools_single(
                         system, messages, tools, screenshot_b64
-                    ):
+                    )
+                    # Bound only the FIRST token: a model that hangs before saying
+                    # anything fails over like a 429 (#10). Once the stream is flowing
+                    # we never interrupt it. Budget 0 → no bound (default).
+                    while True:
+                        try:
+                            if _ttft_budget > 0 and not _streamed_any:
+                                event = await asyncio.wait_for(_agen.__anext__(), timeout=_ttft_budget)
+                            else:
+                                event = await _agen.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            try:
+                                await _agen.aclose()
+                            except Exception:
+                                pass
+                            raise RuntimeError(
+                                f"model produced no token within {_ttft_budget:g}s (TTFT failover)"
+                            )
                         _streamed_any = True
                         yield event
                     return  # chain succeeded
                 except Exception as e:
                     last_err = e
-                    _is_rate_limit = (
+                    _is_ttft = isinstance(e, RuntimeError) and "TTFT failover" in str(e)
+                    _is_rate_limit = _is_ttft or (
                         isinstance(e, _httpx.HTTPStatusError)
                         and e.response.status_code in (402, 429)
                     ) or isinstance(e, RuntimeError) and (

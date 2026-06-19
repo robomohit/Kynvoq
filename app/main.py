@@ -1168,14 +1168,18 @@ def _select_model_for_task(goal: str, mode: str = "auto", requested_model: Optio
         }
 
     if os.environ.get("GROQ_API_KEY"):
-        # Groq is free AND sub-second, so it's the preferred free provider when its
-        # key is set — this is the app's #1 UX win (latency). A Groq 429/failure
+        # Groq is free AND sub-second, so it's the preferred free provider for
+        # chat/coding/auto — the app's #1 UX win (latency). A Groq 429/failure
         # transparently falls back to the OpenRouter ":free" chain inside
         # LLMProvider.stream_chat_with_tools, so speed doesn't cost reliability.
-        # A deliberate DESKTOP_MODEL opt-in still wins for an explicit desktop task
-        # (reliability is the whole point of that escape hatch).
-        _dm = os.environ.get("DESKTOP_MODEL", "").strip()
-        if not (_dm and requested_mode in ("computer", "computer_isolated")):
+        # BUT keep Groq OFF desktop work (#10): llama-3.3-70b is fast yet weaker at the
+        # multi-step UIA tool loop, so a desktop mode falls through to the tool-accurate
+        # OpenRouter desktop model instead — as long as OpenRouter is actually available
+        # to fall through to (else Groq is still better than no model). A user-set
+        # DESKTOP_MODEL still wins (handled in the OpenRouter branch below).
+        _desktop_mode = requested_mode in ("computer", "computer_isolated", "computer_use")
+        _skip_groq_for_desktop = _desktop_mode and bool(os.environ.get("OPENROUTER_API_KEY"))
+        if not _skip_groq_for_desktop:
             return {"selected_model": "groq/llama-3.3-70b-versatile", "model_source": "auto:groq", "model_auto": True, "required_key": "GROQ_API_KEY", "missing_key": False}
     if os.environ.get("OPENROUTER_API_KEY"):
         from .providers import effort_model, normalize_effort

@@ -15,6 +15,54 @@ def provider(monkeypatch):
     return PlannerProvider(model="openrouter/test-model")
 
 
+@pytest.mark.asyncio
+async def test_ttft_failover_advances_on_slow_first_token(provider, monkeypatch):
+    """A model that streams NO token within the TTFT budget is abandoned and the chain
+    retries the next attempt, instead of hanging the whole step (#10). Opt-in via
+    ORYNN_TTFT_FAILOVER_SECONDS; 0 (default) leaves streaming unbounded."""
+    import asyncio as _aio
+    import app.providers as _prov
+
+    monkeypatch.setenv("ORYNN_TTFT_FAILOVER_SECONDS", "0.15")
+    monkeypatch.setattr(_prov, "_CHAIN_RETRY_BACKOFFS", [0, 0, 0])
+
+    attempts = {"n": 0}
+
+    async def fake_single(system, messages, tools, screenshot_b64=None):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            await _aio.sleep(5)  # hang before the first token → should time out
+            yield {"type": "thought", "content": "too late"}
+        else:
+            yield {"type": "tool_call", "name": "finish", "args": {}, "id": "c1"}
+
+    monkeypatch.setattr(provider, "_stream_chat_with_tools_single", fake_single)
+
+    events = [e async for e in provider.stream_chat_with_tools("sys", [], [])]
+
+    assert attempts["n"] >= 2  # first attempt abandoned, chain retried
+    assert any(e.get("type") == "tool_call" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_ttft_failover_disabled_by_default(provider, monkeypatch):
+    """With no budget set, a slow first token is NOT interrupted (default behavior)."""
+    import app.providers as _prov
+    monkeypatch.delenv("ORYNN_TTFT_FAILOVER_SECONDS", raising=False)
+    assert _prov._ttft_failover_seconds() == 0.0
+
+    attempts = {"n": 0}
+
+    async def fake_single(system, messages, tools, screenshot_b64=None):
+        attempts["n"] += 1
+        yield {"type": "tool_call", "name": "finish", "args": {}, "id": "c1"}
+
+    monkeypatch.setattr(provider, "_stream_chat_with_tools_single", fake_single)
+    events = [e async for e in provider.stream_chat_with_tools("sys", [], [])]
+    assert attempts["n"] == 1  # no failover, single clean attempt
+    assert any(e.get("type") == "tool_call" for e in events)
+
+
 def _sse_lines(*chunks: dict) -> list[str]:
     """Convert dicts to SSE 'data: ...' lines followed by [DONE]."""
     lines = [f"data: {json.dumps(c)}" for c in chunks]
