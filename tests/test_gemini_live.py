@@ -920,6 +920,48 @@ def test_deterministic_gateway_click_stays_direct_uia():
     assert calls == [("OK", "Dialog")]
 
 
+def test_started_label_muted_while_live_drives():
+    """While Live is connected its spoken ack owns the bubble, so the raw
+    'Started: <goal>' echo must NOT flash — that reads like a separate backend doing
+    the work and breaks the 'Live is doing it' feel (brief §9.1)."""
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    c._live = _FakeLive()  # is_running() -> True
+    labels = []
+    c.labelRequested.connect(lambda s: labels.append(s))
+
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad and type hello"})
+
+    assert res["ok"] is True
+    assert not any(l.startswith("Started:") for l in labels), labels
+
+
+def test_started_label_shown_without_live():
+    """For a push-to-talk / dashboard launch (no Live), the 'Started:' status is the
+    only feedback, so it still shows."""
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    labels = []
+    c.labelRequested.connect(lambda s: labels.append(s))
+
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad"})
+
+    assert res["ok"] is True
+    assert any(l.startswith("Started:") for l in labels), labels
+
+
 def test_live_tool_desktop_control_observe_label_is_human_not_raw_map():
     from app.models import ToolResult
 

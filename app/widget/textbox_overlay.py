@@ -1457,7 +1457,10 @@ class OverlayController(QObject):
             return {"ok": False, "action": action, "message": "Missing text for type."}
         goal = self._goal_from_desktop_control(action, args)
         self.cursorStateRequested.emit("thinking")
-        self._set_label("Handing to Orynn agent", source="live_tool", force=True)
+        # Live's own spoken ack owns the bubble while it drives — don't flash a raw
+        # "Handing to Orynn agent" status that reads like a separate backend.
+        if not self._live_is_running():
+            self._set_label("Handing to Orynn agent", source="live_tool", force=True)
         # Route as a real start_desktop_task so the busy-gate and consent-gate apply.
         return self._live_tool("start_desktop_task", {"goal": goal})
 
@@ -1663,7 +1666,12 @@ class OverlayController(QObject):
             self._live_narration_last = time.monotonic()
             self._live_narration_text = ""
             self.cursorStateRequested.emit("thinking")
-            self._set_label("Started: " + _short(goal, 120), source="live_tool", force=True)
+            # While Live drives, its spoken ack owns the bubble — echoing the raw goal as
+            # "Started: open notepad and type hello" reads like a separate backend doing
+            # it and breaks the "Live is doing it" feel (brief §9.1). Show it only for
+            # non-Live (push-to-talk / dashboard) launches where it's the only feedback.
+            if not self._live_is_running():
+                self._set_label("Started: " + _short(goal, 120), source="live_tool", force=True)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:200]
             self.cursorStateRequested.emit("idle")
