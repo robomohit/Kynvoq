@@ -1416,24 +1416,33 @@ class OverlayController(QObject):
             return set()
         return set(LIVE_UPGRADE_ACTIONS)
 
+    def _desktop_control_upgrade(self, args: dict[str, Any]) -> dict[str, Any] | None:
+        """If a model-driven desktop_control call is an acting verb (click/type), hand
+        it to the full agent and return that result; otherwise return None so the
+        caller runs the bounded primitive directly. Lives at the MODEL boundary only
+        (_live_tool_for_generation) — the deterministic gateway used by the Golden Five
+        and bounded push-to-talk calls _live_tool directly and must keep doing real
+        UIA primitives, no LLM (brief §5.2 vs the Golden Five reliability bar)."""
+        action = _clean_text(args.get("action") or "").lower().replace("-", "_")
+        if action not in self._live_upgrade_actions():
+            return None
+        query = _clean_text(args.get("query") or "")
+        if action == "click" and not query:
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Missing target to click", source="live_tool", force=True)
+            return {"ok": False, "action": action, "message": "Missing query for click."}
+        if action == "type" and not str(args.get("text") or "").strip():
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Missing text for type.", source="live_tool", force=True)
+            return {"ok": False, "action": action, "message": "Missing text for type."}
+        goal = self._goal_from_desktop_control(action, args)
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Handing to Orynn agent", source="live_tool", force=True)
+        # Route as a real start_desktop_task so the busy-gate and consent-gate apply.
+        return self._live_tool("start_desktop_task", {"goal": goal})
+
     def _live_desktop_control(self, args: dict[str, Any]) -> dict[str, Any]:
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
-        # Hard route: clicking/typing in app UI is real desktop work, so hand it to the
-        # full agent instead of doing a weak one-shot from Live (brief §5.2 auto-upgrade).
-        if action in self._live_upgrade_actions():
-            query = _clean_text(args.get("query") or "")
-            if action == "click" and not query:
-                self.cursorStateRequested.emit("thinking")
-                self._set_label("Missing target to click", source="live_tool", force=True)
-                return {"ok": False, "action": action, "message": "Missing query for click."}
-            if action == "type" and not str(args.get("text") or "").strip():
-                self.cursorStateRequested.emit("thinking")
-                self._set_label("Missing text for type.", source="live_tool", force=True)
-                return {"ok": False, "action": action, "message": "Missing text for type."}
-            goal = self._goal_from_desktop_control(action, args)
-            self.cursorStateRequested.emit("thinking")
-            self._set_label("Handing to Orynn agent", source="live_tool", force=True)
-            return self._live_start_desktop_task({"goal": goal})
         if action not in LIVE_DESKTOP_ACTIONS:
             self.cursorStateRequested.emit("thinking")
             self._set_label("Unsupported desktop action", source="live_tool", force=True)
@@ -1457,6 +1466,13 @@ class OverlayController(QObject):
     def _live_tool_for_generation(self, generation: int, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if not self._live_generation_current(generation):
             return {"ok": False, "message": "Gemini Live session changed."}
+        args = args if isinstance(args, dict) else {}
+        # Model-driven dispatch only: hard-route click/type to the full agent here so
+        # the deterministic gateway (_live_tool direct) stays a pure UIA primitive path.
+        if name == "desktop_control":
+            upgraded = self._desktop_control_upgrade(args)
+            if upgraded is not None:
+                return upgraded
         return self._live_tool(name, args)
 
     def _active_desktop_task(self) -> str | None:

@@ -740,7 +740,8 @@ def test_live_tool_desktop_control_type_upgrades_to_full_agent():
     c = _controller()
     c.client = FakeClient()
     c._desktop_tools = FakeTools()
-    res = c._live_tool(
+    res = c._live_tool_for_generation(
+        None,
         "desktop_control",
         {
             "action": "type",
@@ -774,7 +775,8 @@ def test_live_type_with_submit_carries_submit_and_needs_consent():
     )
     assert "submit" in goal.lower()
 
-    res = c._live_tool(
+    res = c._live_tool_for_generation(
+        None,
         "desktop_control",
         {"action": "type", "query": "search box", "text": "hi",
          "app": "Notepad", "submit": True},
@@ -798,7 +800,8 @@ def test_live_tool_desktop_control_type_requires_non_empty_text():
     labels = []
     c.labelRequested.connect(lambda s: labels.append(s))
 
-    res = c._live_tool(
+    res = c._live_tool_for_generation(
+        None,
         "desktop_control",
         {
             "action": "type",
@@ -835,7 +838,8 @@ def test_live_tool_desktop_control_click_upgrades_to_full_agent():
     c = _controller()
     c.client = FakeClient()
     c._desktop_tools = FakeTools()
-    res = c._live_tool(
+    res = c._live_tool_for_generation(
+        None,
         "desktop_control",
         {"action": "click", "query": "New Agent", "app": "Cursor"},
     )
@@ -854,10 +858,66 @@ def test_live_tool_desktop_control_click_requires_target():
 
     c = _controller()
     c.client = FakeClient()
-    res = c._live_tool("desktop_control", {"action": "click", "app": "Cursor"})
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "click", "app": "Cursor"}
+    )
 
     assert res["ok"] is False
     assert "missing query" in res["message"].lower()
+
+
+def test_deterministic_gateway_type_stays_direct_uia():
+    """The Golden Five / push-to-talk path calls _live_tool DIRECTLY and must do a
+    real UIA type — no LLM, no task spawn. That deterministic path is the reliability
+    bar; only the model path (_live_tool_for_generation) hard-routes to the agent."""
+    from app.models import ToolResult
+
+    calls = []
+
+    class FakeTools:
+        def uia_type(self, query, text, app="", clear_first=False, submit=False):
+            calls.append((query, text, app, clear_first, submit))
+            return ToolResult(ok=True, output="Typed into 'Text editor' via ValuePattern",
+                              data={"target": "Text editor"})
+
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("the deterministic type path must not spawn a task")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool(
+        "desktop_control",
+        {"action": "type", "query": "Text editor", "text": "hello",
+         "app": "Notepad", "clear_first": True},
+    )
+
+    assert res["ok"] is True
+    assert calls == [("Text editor", "hello", "Notepad", True, False)]
+
+
+def test_deterministic_gateway_click_stays_direct_uia():
+    from app.models import ToolResult
+
+    calls = []
+
+    class FakeTools:
+        def uia_click(self, query, app=""):
+            calls.append((query, app))
+            return ToolResult(ok=True, output="Clicked", data={})
+
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("the deterministic click path must not spawn a task")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("desktop_control", {"action": "click", "query": "OK", "app": "Dialog"})
+
+    assert res["ok"] is True
+    assert calls == [("OK", "Dialog")]
 
 
 def test_live_tool_desktop_control_observe_label_is_human_not_raw_map():
@@ -1275,7 +1335,8 @@ def test_live_auto_upgraded_click_on_delete_requires_consent():
     c = _controller()
     c.client = FakeClient()
     c._desktop_tools = FakeTools()
-    res = c._live_tool(
+    res = c._live_tool_for_generation(
+        None,
         "desktop_control",
         {"action": "click", "query": "Delete", "app": "File Explorer"},
     )
@@ -1304,14 +1365,16 @@ def test_live_autoroute_off_restores_direct_click(monkeypatch):
     c = _controller()
     c.client = FakeClient()
     c._desktop_tools = FakeTools()
-    res = c._live_tool("desktop_control", {"action": "click", "query": "OK", "app": "Dialog"})
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "click", "query": "OK", "app": "Dialog"}
+    )
 
     assert res["ok"] is True
     assert clicked == [("OK", "Dialog")]
 
 
 def test_live_autoroute_default_upgrades_click():
-    """With no override, click still hard-routes to the full agent (Phase 1 default)."""
+    """With no override, a model click hard-routes to the full agent (Phase 1 default)."""
     calls = []
 
     class FakeClient:
@@ -1328,7 +1391,9 @@ def test_live_autoroute_default_upgrades_click():
     c = _controller()
     c.client = FakeClient()
     c._desktop_tools = FakeTools()
-    res = c._live_tool("desktop_control", {"action": "click", "query": "New Agent", "app": "Cursor"})
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "click", "query": "New Agent", "app": "Cursor"}
+    )
 
     assert res["ok"] is True
     assert "/api/tasks" in calls
