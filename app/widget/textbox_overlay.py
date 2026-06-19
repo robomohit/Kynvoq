@@ -165,6 +165,26 @@ LIVE_CONSENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Shell commands that change or remove something hard to undo and so need spoken
+# consent before Live runs them — the run_terminal analog of LIVE_CONSENT_RE.
+# Catastrophic commands (rm -rf /, format, mkfs, shutdown) are already HARD-BLOCKED
+# upstream by SafetyManager; this catches the merely-destructive tier (del a file,
+# git push, taskkill, pip uninstall) that would otherwise run silently. Matched at a
+# command boundary (start, or after a separator) so "git status" / "type file" are
+# never caught by a substring.
+LIVE_TERMINAL_CONSENT_RE = re.compile(
+    r"(?:^|[\s;&|(`])"
+    r"(?:"
+    r"rm|del|erase|rmdir|rd|remove-item|"
+    r"format|mkfs|diskpart|"
+    r"shutdown|reboot|restart-computer|"
+    r"taskkill|stop-process|"
+    r"pip\s+uninstall|npm\s+uninstall|npm\s+publish|"
+    r"git\s+push|git\s+clean|git\s+reset\s+--hard"
+    r")\b",
+    re.IGNORECASE,
+)
+
 _LIVE_LABEL_SOURCES = {
     "live_status",
     "live_input",
@@ -1586,6 +1606,12 @@ class OverlayController(QObject):
         yes before Live runs it autonomously (brief §7.2)."""
         return bool(LIVE_CONSENT_RE.search(goal or ""))
 
+    @staticmethod
+    def _command_needs_consent(command: str) -> bool:
+        """True when a shell command is destructive (delete/push/kill/uninstall) and so
+        needs a spoken yes first — the run_terminal analog of _goal_needs_consent."""
+        return bool(LIVE_TERMINAL_CONSENT_RE.search(command or ""))
+
     def _live_start_desktop_task(self, args: dict[str, Any]) -> dict[str, Any]:
         goal = _clean_text(args.get("goal") or "")
         if not goal:
@@ -1676,6 +1702,21 @@ class OverlayController(QObject):
             return {"ok": False, "blocked": True,
                     "message": (f"That command is blocked for safety ({block_reason}). "
                                 "Do not run it — tell the user it's not allowed.")}
+        # Consent gate: not catastrophic (those are blocked above) but still destructive
+        # — get a spoken yes before running it, same contract as a disruptive task.
+        if self._command_needs_consent(command) and not self._live_bool(args.get("confirmed")):
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Needs your OK", source="live_tool", force=True)
+            return {
+                "ok": False,
+                "needs_consent": True,
+                "message": (
+                    "That command would change or remove something that's hard to undo "
+                    f'("{_short(command, 90)}"). Do NOT run it yet. Ask the user out loud '
+                    "to confirm; only if they clearly say yes, call run_terminal again with "
+                    "the same command and confirmed set to true. If they say no, drop it."
+                ),
+            }
         self.cursorStateRequested.emit("thinking")
         self._set_label("Running: " + _short(command, 70), source="live_tool", force=True)
         try:

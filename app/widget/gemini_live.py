@@ -971,8 +971,9 @@ def _function_declarations(types: Any) -> list[Any]:
                 "get its output back — for quick things like git status, listing or "
                 "reading files, checking versions, pip/npm, python scripts. Prefer "
                 "this for short commands; use start_desktop_task for long-running or "
-                "multi-step work. Destructive commands (deleting/formatting/shutdown) "
-                "are blocked for safety."
+                "multi-step work. Catastrophic commands (wiping the disk, formatting, "
+                "shutdown) are blocked outright; other destructive ones (deleting a "
+                "file, git push, killing a process, uninstalling) need spoken consent."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -980,7 +981,13 @@ def _function_declarations(types: Any) -> list[Any]:
                     "command": {
                         "type": "string",
                         "description": "The exact shell command to run.",
-                    }
+                    },
+                    "confirmed": {
+                        "type": "boolean",
+                        "description": "Set to true ONLY after the user verbally agreed to "
+                                       "a destructive command (delete, push, kill, uninstall). "
+                                       "Leave unset otherwise.",
+                    },
                 },
                 "required": ["command"],
             },

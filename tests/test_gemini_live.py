@@ -2169,6 +2169,61 @@ def test_live_run_terminal_hard_blocks_destructive_command():
     assert calls == []  # nothing destructive ever executed
 
 
+def test_live_run_terminal_destructive_command_needs_consent():
+    """A destructive-but-not-catastrophic command (delete a file, git push) must get a
+    spoken yes before it runs — run_command is never called without consent."""
+    c = _controller()
+    calls = []
+
+    class FakeTools:
+        def run_command(self, cmd):
+            calls.append(cmd)
+            from app.models import ToolResult
+            return ToolResult(ok=True, output="done")
+
+    c._desktop_tools = FakeTools()
+    for cmd in ("del temp.txt", "git push origin main", "pip uninstall numpy"):
+        res = c._live_tool("run_terminal", {"command": cmd})
+        assert res["ok"] is False and res.get("needs_consent") is True, cmd
+    assert calls == []  # nothing ran without consent
+
+
+def test_live_run_terminal_destructive_runs_after_consent():
+    from app.models import ToolResult
+
+    c = _controller()
+    calls = []
+
+    class FakeTools:
+        def run_command(self, cmd):
+            calls.append(cmd)
+            return ToolResult(ok=True, output="deleted")
+
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("run_terminal", {"command": "del temp.txt", "confirmed": True})
+    assert res["ok"] is True
+    assert calls == ["del temp.txt"]
+
+
+def test_live_run_terminal_safe_command_skips_consent():
+    """Read-only commands (git status, listing files) never trigger the consent gate."""
+    from app.models import ToolResult
+
+    c = _controller()
+    calls = []
+
+    class FakeTools:
+        def run_command(self, cmd):
+            calls.append(cmd)
+            return ToolResult(ok=True, output="ok")
+
+    c._desktop_tools = FakeTools()
+    for cmd in ("git status", "dir", "python build.py", "git reset HEAD~1"):
+        res = c._live_tool("run_terminal", {"command": cmd})
+        assert res["ok"] is True, cmd
+    assert calls == ["git status", "dir", "python build.py", "git reset HEAD~1"]
+
+
 def test_live_autostart_enabled_env(monkeypatch):
     from app.widget import gemini_live as gl
 
