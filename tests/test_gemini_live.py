@@ -962,6 +962,38 @@ def test_started_label_shown_without_live():
     assert any(l.startswith("Started:") for l in labels), labels
 
 
+def test_label_log_records_shown_and_muted(tmp_path, monkeypatch):
+    """The opt-in label diagnostic records both what the bubble showed and what got
+    muted (with the reason), so we can audit clutter."""
+    import json as _json
+    from app.widget import textbox_overlay as tbo
+
+    logf = tmp_path / "labels.jsonl"
+    monkeypatch.setattr(tbo, "_LABEL_LOG_ENABLED", True)
+    monkeypatch.setattr(tbo, "_LABEL_LOG_PATH", logf)
+
+    c = _controller()
+    c._set_label("Hello there", source="system")          # shown (no Live)
+    c._live = _FakeLive()                                  # Live now driving
+    c._set_label("Clicking Save", source="task_action")    # churn -> muted under Live
+
+    rows = [_json.loads(l) for l in logf.read_text(encoding="utf-8").splitlines() if l.strip()]
+    by = {(r["action"], r["source"]): r for r in rows}
+    assert ("shown", "system") in by
+    assert ("muted", "task_action") in by
+    assert by[("muted", "task_action")]["reason"] == "task_churn_under_live"
+
+
+def test_label_log_off_by_default(tmp_path, monkeypatch):
+    from app.widget import textbox_overlay as tbo
+
+    logf = tmp_path / "labels.jsonl"
+    monkeypatch.setattr(tbo, "_LABEL_LOG_ENABLED", False)
+    monkeypatch.setattr(tbo, "_LABEL_LOG_PATH", logf)
+    tbo._log_label("anything", "system", "shown", "", False)
+    assert not logf.exists()
+
+
 def test_live_tool_desktop_control_observe_label_is_human_not_raw_map():
     from app.models import ToolResult
 

@@ -208,6 +208,34 @@ _TASK_CHURN_SOURCES = {
     "system_wait",
 }
 
+# Optional diagnostic: record every textbox-label decision — what text was shown, its
+# source, and (when suppressed) why — to logs/textbox_labels.jsonl. It lets us see
+# exactly what the bubble displayed over a session and prune redundant/cluttered
+# labels. Opt-in (ORYNN_LABEL_LOG=1) because it fires on nearly every UI tick.
+_LABEL_LOG_ENABLED = str(os.getenv("ORYNN_LABEL_LOG") or "").strip().lower() in {"1", "true", "yes", "on"}
+_LABEL_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "textbox_labels.jsonl"
+
+
+def _log_label(text: str, source: str, action: str, reason: str, live_running: bool) -> None:
+    """Append one label decision to the label diagnostic log (best-effort, no-throw).
+    action is 'shown' or 'muted'; reason explains a mute ('' when shown)."""
+    if not _LABEL_LOG_ENABLED:
+        return
+    try:
+        rec = {
+            "ts": round(time.time(), 3),
+            "action": action,
+            "source": source,
+            "reason": reason,
+            "live": bool(live_running),
+            "text": str(text)[:200],
+        }
+        _LABEL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_LABEL_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
 
 def _clean_text(value: Any) -> str:
     text = str(value or "").replace("\r", " ").replace("\n", " ")
@@ -695,6 +723,7 @@ class OverlayController(QObject):
                 # (task_result — the final answer — is deliberately not in the
                 # churn set, so a task's outcome still surfaces during Live.)
                 if source in _TASK_CHURN_SOURCES and (live_running or live_holding):
+                    _log_label(label, source, "muted", "task_churn_under_live", live_running)
                     return False
                 # Don't let the periodic "Listening" status wipe a fresher, more
                 # meaningful Live label (what the user said / the reply / a tool).
@@ -703,6 +732,7 @@ class OverlayController(QObject):
                     and live_holding
                     and self._label_protect_source in {"live_input", "live_reply", "live_tool"}
                 ):
+                    _log_label(label, source, "muted", "live_status_under_hold", live_running)
                     return False
 
             if hold_seconds is None:
@@ -720,6 +750,7 @@ class OverlayController(QObject):
                     self._label_protect_until = next_until
                     self._label_protect_source = source
 
+        _log_label(label, source, "shown", "", live_running)
         self.labelRequested.emit(label)
         return True
 
