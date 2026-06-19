@@ -231,13 +231,14 @@ def test_web_search_unwraps_and_filters_result_urls(workspace, monkeypatch):
 
     safe_target = urllib.parse.quote("https://safe.example/page", safe="")
     local_target = urllib.parse.quote("http://127.0.0.1/admin", safe="")
+    # lite.duckduckgo.com layout (the stable endpoint web_search now prefers).
     page = f"""
-    <a class="result__a" href="/l/?uddg={safe_target}">Safe Result</a>
-    <a class="result__snippet">Useful snippet</a>
-    <a class="result__a" href="/l/?uddg={local_target}">Local Result</a>
-    <a class="result__snippet">Bad snippet</a>
-    <a class="result__a" href="mailto:test@example.com">Mail Result</a>
-    <a class="result__snippet">Mail snippet</a>
+    <a href="/l/?uddg={safe_target}" class='result-link'>Safe Result</a>
+    <td class='result-snippet'>Useful snippet</td>
+    <a href="/l/?uddg={local_target}" class='result-link'>Local Result</a>
+    <td class='result-snippet'>Bad snippet</td>
+    <a href="mailto:test@example.com" class='result-link'>Mail Result</a>
+    <td class='result-snippet'>Mail snippet</td>
     """.encode("utf-8")
 
     seen_fetches = []
@@ -260,7 +261,7 @@ def test_web_search_unwraps_and_filters_result_urls(workspace, monkeypatch):
     assert res.ok is True
     assert res.output.startswith("UNTRUSTED WEB CONTENT:")
     assert "Kind: web_search" in res.output
-    assert seen_fetches == [("https://html.duckduckgo.com/html/?q=example", 1_000_000)]
+    assert seen_fetches == [("https://lite.duckduckgo.com/lite/?q=example", 1_000_000)]
     assert "Safe Result" in res.output
     assert "https://safe.example/page" in res.output
     assert "duckduckgo.com/l/" not in res.output

@@ -2419,53 +2419,88 @@ class ToolExecutor:
         except Exception as e:
             return ToolResult(ok=False, output=str(e))
 
+    @staticmethod
+    def _ddg_resolve_href(href: str) -> str:
+        """Turn a DuckDuckGo redirect href (…/l/?uddg=<real>) into the real URL."""
+        import urllib.parse
+        full = urllib.parse.urljoin("https://duckduckgo.com/", href.strip())
+        parsed = urllib.parse.urlsplit(full)
+        if parsed.netloc.lower().endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+            uddg = urllib.parse.parse_qs(parsed.query).get("uddg", [""])[0]
+            if uddg:
+                return urllib.parse.unquote(uddg)
+        return full
+
+    @staticmethod
+    def _parse_ddg_lite(page: str, max_results: int):
+        """Parse the stable lite.duckduckgo.com layout: result-link anchors paired with
+        the following result-snippet cells (the html.duckduckgo.com markup changed and
+        now returns no result__a/result__snippet, breaking the old parser)."""
+        import html, re
+        links = re.findall(
+            r"<a[^>]+href=[\"'](?P<href>[^\"']+)[\"'][^>]*class=[\"']result-link[\"'][^>]*>(?P<title>.*?)</a>",
+            page, flags=re.IGNORECASE | re.DOTALL)
+        snippets = re.findall(
+            r"<td[^>]*class=[\"']result-snippet[\"'][^>]*>(?P<snip>.*?)</td>",
+            page, flags=re.IGNORECASE | re.DOTALL)
+        strip = lambda s: html.unescape(re.sub(r"<.*?>", "", s)).strip()
+        out = []
+        for i, (href, title) in enumerate(links[:max_results]):
+            snip = strip(snippets[i]) if i < len(snippets) else ""
+            out.append((strip(title), href.strip(), snip))
+        return out
+
+    @staticmethod
+    def _parse_ddg_html(page: str, max_results: int):
+        """Legacy html.duckduckgo.com parser (result__a/result__snippet) — kept as a
+        fallback in case the lite endpoint is unavailable."""
+        import html, re
+        pattern = re.compile(
+            r'<a[^>]*class="result__a"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
+            r'<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
+            flags=re.IGNORECASE | re.DOTALL)
+        strip = lambda s: html.unescape(re.sub(r"<.*?>", "", s)).strip()
+        out = []
+        for m in pattern.finditer(page):
+            out.append((strip(m.group("title")), m.group("href").strip(), strip(m.group("snippet"))))
+            if len(out) >= max_results:
+                break
+        return out
+
     def web_search(self, query: str, max_results: int = 5):
-        try:
-            import html
-            import re
-            import urllib.parse
-            import urllib.request
-
-            encoded = urllib.parse.quote_plus(query)
-            url = f"https://html.duckduckgo.com/html/?q={encoded}"
-            raw, _final_url = _read_public_http_url(url, max_bytes=1_000_000)
-            page = raw.decode("utf-8", errors="replace")
-
-            results = []
-            ddg_base = "https://duckduckgo.com/"
-            pattern = re.compile(
-                r'<a[^>]*class="result__a"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
-                r'<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            for match in pattern.finditer(page):
-                href = html.unescape(re.sub(r"<.*?>", "", match.group("href"))).strip()
-                title = html.unescape(re.sub(r"<.*?>", "", match.group("title"))).strip()
-                snippet = html.unescape(re.sub(r"<.*?>", "", match.group("snippet"))).strip()
-                full_href = urllib.parse.urljoin(ddg_base, href)
-                parsed_href = urllib.parse.urlsplit(full_href)
-                if parsed_href.netloc.lower().endswith("duckduckgo.com") and parsed_href.path.startswith("/l/"):
-                    redirect_params = urllib.parse.parse_qs(parsed_href.query)
-                    uddg = redirect_params.get("uddg", [""])[0]
-                    if uddg:
-                        full_href = urllib.parse.unquote(uddg)
-                try:
-                    href = _validate_public_http_url(full_href)
-                except ToolError:
-                    continue
-                if href and title:
-                    results.append(f"{title}\n{href}\n{snippet}")
-                if len(results) >= max_results:
-                    break
-
-            if not results:
-                return ToolResult(ok=False, output=f"No search results found for: {query}")
-            return ToolResult(
-                ok=True,
-                output=wrap_untrusted_web_content("\n\n".join(results), source=url, kind="web_search"),
-            )
-        except Exception as e:
-            return ToolResult(ok=False, output=str(e))
+        import urllib.parse
+        encoded = urllib.parse.quote_plus(query)
+        # lite is the stable endpoint; html.duckduckgo.com now returns no parseable
+        # results. Try lite first, fall back to html, so a markup change on one can't
+        # silently break search.
+        endpoints = [
+            (f"https://lite.duckduckgo.com/lite/?q={encoded}", self._parse_ddg_lite),
+            (f"https://html.duckduckgo.com/html/?q={encoded}", self._parse_ddg_html),
+        ]
+        last_err = ""
+        for url, parser in endpoints:
+            try:
+                raw, _final = _read_public_http_url(url, max_bytes=1_000_000)
+                page = raw.decode("utf-8", errors="replace")
+                results = []
+                for title, href, snippet in parser(page, max_results):
+                    try:
+                        real = _validate_public_http_url(self._ddg_resolve_href(href))
+                    except ToolError:
+                        continue
+                    if real and title:
+                        results.append(f"{title}\n{real}\n{snippet}".rstrip())
+                if results:
+                    return ToolResult(
+                        ok=True,
+                        output=wrap_untrusted_web_content("\n\n".join(results), source=url, kind="web_search"),
+                    )
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e).strip()
+                continue
+        if last_err:
+            return ToolResult(ok=False, output=f"Web search failed: {last_err}")
+        return ToolResult(ok=False, output=f"No search results found for: {query}")
 
     # ── Real API connectors: free, no-auth, single-call (reliable on free models) ──
     # Each is one HTTP GET to a hardcoded public host (user input is URL-encoded
