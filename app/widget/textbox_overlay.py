@@ -215,6 +215,11 @@ _TASK_CHURN_SOURCES = {
 _LABEL_LOG_ENABLED = str(os.getenv("ORYNN_LABEL_LOG") or "").strip().lower() in {"1", "true", "yes", "on"}
 _LABEL_LOG_PATH = Path(__file__).resolve().parents[2] / "logs" / "textbox_labels.jsonl"
 
+# Within this window, re-setting the SAME bubble text is a no-op repaint and is
+# skipped (de-clutter). Kept under the overlay's ~10s auto-collapse so a genuine
+# re-show after the bubble has rested to its orb still paints.
+_LABEL_DEDUP_WINDOW = 4.0
+
 
 def _log_label(text: str, source: str, action: str, reason: str, live_running: bool) -> None:
     """Append one label decision to the label diagnostic log (best-effort, no-throw).
@@ -543,6 +548,11 @@ class OverlayController(QObject):
         self._live_reply_done = True
         self._label_protect_until = 0.0
         self._label_protect_source = ""
+        # Last text actually painted + when, so an unchanged label can't repaint and
+        # flicker the bubble. Time-bounded so a legit re-show after the bubble
+        # auto-collapses to its orb still paints.
+        self._last_emitted_label = ""
+        self._last_emitted_at = 0.0
         # _set_label is called from the Live audio thread, the poll thread and the
         # GUI thread; guard the read-decide-write of the protection window so the
         # arbitration can't race into a flicker.
@@ -749,7 +759,20 @@ class OverlayController(QObject):
                 if next_until >= self._label_protect_until:
                     self._label_protect_until = next_until
                     self._label_protect_source = source
+            # Skip a no-op repaint of the text that's already on screen (de-clutter),
+            # but only within a short window so a re-show after the bubble has rested
+            # to its orb still paints.
+            duplicate = (
+                label == self._last_emitted_label
+                and (now - self._last_emitted_at) < _LABEL_DEDUP_WINDOW
+            )
+            if not duplicate:
+                self._last_emitted_label = label
+                self._last_emitted_at = now
 
+        if duplicate:
+            _log_label(label, source, "muted", "duplicate_of_current", live_running)
+            return False
         _log_label(label, source, "shown", "", live_running)
         self.labelRequested.emit(label)
         return True

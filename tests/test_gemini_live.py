@@ -1008,6 +1008,31 @@ def test_label_log_records_shown_and_muted(tmp_path, monkeypatch):
     assert by[("muted", "task_action")]["reason"] == "task_churn_under_live"
 
 
+def test_label_dedupe_skips_identical_repaint():
+    """Re-setting the same bubble text within the dedupe window is a no-op repaint
+    (de-clutter) — only distinct text paints."""
+    c = _controller()
+    labels = []
+    c.labelRequested.connect(lambda s: labels.append(s))
+    c._set_label("Thinking", source="system")
+    c._set_label("Thinking", source="system")   # identical, within window -> skipped
+    c._set_label("Done", source="system")
+    assert labels == ["Thinking", "Done"]
+
+
+def test_label_dedupe_allows_reshow_after_window(monkeypatch):
+    """The dedupe is time-bounded so a genuine re-show (e.g. after the bubble rested
+    to its orb) still paints."""
+    from app.widget import textbox_overlay as tbo
+    monkeypatch.setattr(tbo, "_LABEL_DEDUP_WINDOW", 0.0)  # treat any gap as "expired"
+    c = _controller()
+    labels = []
+    c.labelRequested.connect(lambda s: labels.append(s))
+    c._set_label("Ready", source="system")
+    c._set_label("Ready", source="system")      # window expired -> repaints
+    assert labels == ["Ready", "Ready"]
+
+
 def test_label_log_off_by_default(tmp_path, monkeypatch):
     from app.widget import textbox_overlay as tbo
 
