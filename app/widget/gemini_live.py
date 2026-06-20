@@ -1071,16 +1071,29 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="remember",
             description=(
-                "Save a durable fact about the user, their setup, or their vocabulary "
-                "so you know it in future conversations — e.g. 'cowork is the button at "
-                "the top-right of the dashboard', 'my budget sheet is in Documents', or "
-                "what an app/term they use means. Call this whenever the user says "
-                "'remember that…' or teaches you something worth keeping."
+                "Save a durable fact into your organized memory so you know it next time "
+                "— e.g. 'cowork is the button top-right of the dashboard', 'my budget "
+                "sheet is in Documents', a rule the user states ('always confirm before "
+                "sending'), or what a term/app means. Call it when the user says "
+                "'remember that…', states a preference/rule, OR when YOU figure something "
+                "out by looking (where an app or button is) so you don't have to look "
+                "again — set owner='assistant' for things you learned yourself."
             ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {
                     "fact": {"type": "string", "description": "The fact to remember, in plain words."},
+                    "category": {
+                        "type": "string",
+                        "enum": ["rule", "preference", "location", "vocab", "fact", "app"],
+                        "description": "How to file it: rule/preference (the user's), location (where "
+                                       "something is), vocab (what a term means), app, or general fact.",
+                    },
+                    "owner": {
+                        "type": "string",
+                        "enum": ["user", "assistant"],
+                        "description": "'user' if the user told you; 'assistant' if you learned it yourself.",
+                    },
                     "app": {"type": "string", "description": "Optional app/window it relates to."},
                 },
                 "required": ["fact"],
@@ -1120,10 +1133,13 @@ def _default_system_instruction() -> str:
         "user spell out where it is. To actually "
         "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
         "this say' — call look_at_screen with the question; you'll then see the "
-        "screenshot and can describe it. When the user teaches you something worth "
-        "keeping ('remember that…', what an app or term means, where something lives), "
-        "call remember so you know it next time; use forget to drop it. Lean on what you "
-        "already know about their setup before asking or looking. For searching the web or checking facts, news, "
+        "screenshot and can describe it. You have an organized memory: when the user "
+        "teaches you something or states a rule/preference, call remember (owner 'user'); "
+        "and when YOU work out where something is by looking — an app, a button, a "
+        "feature like 'slack' or 'cowork' — call remember with owner 'assistant' and "
+        "category 'location' so you learn their setup and won't have to look again. Use "
+        "forget to drop things. Always lean on what you already know before asking or "
+        "looking. For searching the web or checking facts, news, "
         "weather, or real-time info, call web_search directly in the same turn. For a "
         "quick shell command (git status, listing/reading files, versions, running a "
         "script) call run_terminal and read back the result; destructive commands are "

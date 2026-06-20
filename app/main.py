@@ -1612,15 +1612,17 @@ async def get_memory_facts(q: str = "", limit: int = 50):
 class _FactBody(BaseModel):
     text: str
     app: str = ""
-    source: str = "taught"
+    owner: str = "user"          # "user" (taught) | "assistant" (Orynn learned it)
+    category: str = "fact"       # rule | preference | location | vocab | fact | app
 
 
 @app.post("/api/memory/facts", dependencies=[Depends(verify_token)])
 async def add_memory_fact(body: _FactBody):
     """Teach Orynn a fact ('cowork is the button top-right in the dashboard') or record
-    one it auto-learned. Near-identical facts are de-duped."""
+    one it auto-learned. Organized by owner (user vs assistant) + category. De-duped."""
     from . import knowledge
-    fact = await asyncio.to_thread(knowledge.add_fact, body.text, app=body.app, source=body.source)
+    fact = await asyncio.to_thread(
+        knowledge.add_fact, body.text, owner=body.owner, category=body.category, app=body.app)
     if fact is None:
         raise HTTPException(status_code=400, detail="Empty fact text.")
     return {"ok": True, "fact": fact}

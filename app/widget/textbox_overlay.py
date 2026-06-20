@@ -1612,9 +1612,13 @@ class OverlayController(QObject):
         fact = _clean_text(args.get("fact") or "")
         if not fact:
             return {"ok": False, "message": "Nothing to remember — say the fact."}
+        owner = _clean_text(args.get("owner") or "user").lower()
+        category = _clean_text(args.get("category") or "fact").lower()
         try:
             self.client.request("POST", "/api/memory/facts",
-                                {"text": fact, "app": _clean_text(args.get("app") or ""), "source": "taught"},
+                                {"text": fact, "app": _clean_text(args.get("app") or ""),
+                                 "owner": owner if owner in ("user", "assistant") else "user",
+                                 "category": category},
                                 timeout=5.0)
         except Exception as exc:
             return {"ok": False, "message": f"Couldn't save that: {str(exc)[:120]}"}

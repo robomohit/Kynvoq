@@ -33,12 +33,34 @@ def test_forget(tmp_path, monkeypatch):
     assert all("cowork" not in f["text"].lower() for f in k.all_facts())
 
 
-def test_prompt_block_and_empty(tmp_path, monkeypatch):
+def test_prompt_block_groups_by_owner(tmp_path, monkeypatch):
     k = _fresh(tmp_path, monkeypatch)
     assert k.as_prompt_block() == ""  # nothing known yet -> no block
-    k.add_fact("Discord servers are in the left rail")
-    block = k.as_prompt_block("discord")
-    assert "What you already know" in block and "left rail" in block
+    k.add_fact("always confirm before sending", owner="user", category="rule")
+    k.add_fact("slack is pinned on the taskbar", owner="assistant", category="location")
+    block = k.as_prompt_block()
+    assert "ORYNN MEMORY" in block
+    assert "What the user has told you" in block and "[rule] always confirm" in block
+    assert "What you've learned" in block and "slack is pinned" in block
+
+
+def test_owner_and_category_stored(tmp_path, monkeypatch):
+    k = _fresh(tmp_path, monkeypatch)
+    f = k.add_fact("cowork is top-right", owner="assistant", category="location", app="dashboard")
+    assert f["owner"] == "assistant" and f["category"] == "location" and f["app"] == "dashboard"
+    # bad owner falls back to "user"
+    f2 = k.add_fact("x", owner="bogus")
+    assert f2["owner"] == "user"
+
+
+def test_migrates_legacy_source_field(tmp_path, monkeypatch):
+    k = _fresh(tmp_path, monkeypatch)
+    # simulate an old-format file (source instead of owner/category)
+    from app.state_store import write_json
+    write_json(k.store_path(), [{"id": "old1", "text": "legacy learned fact",
+                                 "source": "learned", "created_at": 1.0}])
+    facts = k.all_facts()
+    assert facts[0]["owner"] == "assistant" and facts[0]["category"] == "fact"
 
 
 def test_empty_text_ignored(tmp_path, monkeypatch):
