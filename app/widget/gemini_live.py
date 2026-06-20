@@ -425,6 +425,14 @@ class GeminiLiveCompanion:
                         retries = 0
                         retry_delay = 1.0
                         self.callbacks.on_status("Gemini Live listening")
+                        # Close any half-captured input turn from the previous session so
+                        # a reconnect (go_away / drop) starts a fresh "Hearing:" buffer —
+                        # otherwise the next utterance concatenates onto the last
+                        # ("Look at my screen.Hello."). No-op on the first connect.
+                        try:
+                            self.callbacks.on_input_transcript("", True)
+                        except Exception:
+                            pass
                         await self._maybe_greet(session, types)
 
                         # Clear stale audio chunks from mic queue on reconnect
@@ -607,16 +615,29 @@ class GeminiLiveCompanion:
         async def _send() -> None:
             try:
                 from google.genai import types
-                parts = [types.Part(inline_data=types.Blob(
-                    data=jpeg_bytes, mime_type="image/jpeg"))]
-                if prompt:
-                    parts.append(types.Part(text=prompt))
+                # Images MUST go over the realtime-input channel (the same one mic audio
+                # and video frames use), NOT inside a send_client_content text turn. The
+                # Live API rejects an inline image blob in client_content with WebSocket
+                # 1007 "Request contains an invalid argument", which dropped the WHOLE
+                # session on every "look at my screen" (it reconnected and the vision
+                # reply was lost — the user saw "Listening" forever). Send the frame as
+                # realtime media, then a normal text turn to make the model answer it.
+                await session.send_realtime_input(
+                    video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg")
+                )
+                text = prompt or "Describe what's on my screen in one or two short sentences."
                 await session.send_client_content(
-                    turns=[types.Content(role="user", parts=parts)],
+                    turns=[types.Content(role="user", parts=[types.Part(text=text)])],
                     turn_complete=True,
                 )
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # region agent log
+                _agent_debug_log(
+                    "V", "gemini_live.py:send_screen_image:error",
+                    "failed to send screen image to Live",
+                    {"error": str(exc)[:200]},
+                )
+                # endregion
 
         try:
             asyncio.run_coroutine_threadsafe(_send(), loop)

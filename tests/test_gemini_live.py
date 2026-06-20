@@ -2259,6 +2259,47 @@ def test_handle_message_go_away_schedules_graceful_reconnect():
     assert session.audio_stream_end is True
 
 
+def test_send_screen_image_uses_realtime_video_not_client_content_blob():
+    """A screenshot must go over the realtime VIDEO channel — stuffing it into a
+    send_client_content inline_data blob is what the Live API rejected with WS 1007,
+    dropping the session so 'look at my screen' replied with silence ('Listening')."""
+    import threading
+    import time as _time
+    import asyncio as _aio
+    from app.widget import gemini_live as gl
+
+    calls = {"video": 0, "inline_blob": 0, "client_text": []}
+
+    class FakeSession:
+        async def send_realtime_input(self, *, video=None, media=None, **kw):
+            assert media is None, "must not use the deprecated media= channel"
+            if video is not None:
+                calls["video"] += 1
+
+        async def send_client_content(self, *, turns=None, turn_complete=False, **kw):
+            for content in (turns or []):
+                for part in getattr(content, "parts", []) or []:
+                    if getattr(part, "inline_data", None) is not None:
+                        calls["inline_blob"] += 1
+                    if getattr(part, "text", None):
+                        calls["client_text"].append(part.text)
+
+    loop = _aio.new_event_loop()
+    threading.Thread(target=loop.run_forever, daemon=True).start()
+    try:
+        comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+        comp._loop = loop
+        comp._session = FakeSession()
+        assert comp.send_screen_image(b"\xff\xd8jpeg-bytes", "what app is shown?") is True
+        _time.sleep(0.4)
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+
+    assert calls["video"] == 1                 # image went over realtime video
+    assert calls["inline_blob"] == 0           # NOT stuffed into a client_content blob
+    assert any("what app is shown" in t for t in calls["client_text"])  # question asked
+
+
 def test_live_desktop_control_scroll_routes_to_tools():
     from app.models import ToolResult
 
