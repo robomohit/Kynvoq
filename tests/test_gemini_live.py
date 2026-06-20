@@ -59,6 +59,8 @@ def test_function_declarations_cover_desktop_tools():
         "look_at_screen",
         "web_search",
         "run_terminal",
+        "remember",
+        "forget",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")
@@ -1593,6 +1595,54 @@ def test_consent_gate_keyword_boundaries():
               "delete my downloads", "buy the item", "restart cursor",
               "format the c drive"]:
         assert needs(g) is True, g
+
+
+def test_live_remember_saves_fact_to_backend():
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append((method, path, data))
+            return {"ok": True, "fact": {"id": "k1"}}
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool("remember", {"fact": "cowork is the top-right button", "app": "dashboard"})
+    assert res["ok"] is True
+    m, p, d = calls[0]
+    assert m == "POST" and p == "/api/memory/facts"
+    assert d["text"] == "cowork is the top-right button" and d["app"] == "dashboard"
+
+
+def test_live_remember_requires_fact():
+    c = _controller()
+    res = c._live_tool("remember", {"fact": "  "})
+    assert res["ok"] is False
+
+
+def test_live_forget_calls_backend():
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            assert path == "/api/memory/forget"
+            return {"ok": True, "removed": 2}
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool("forget", {"query": "cowork"})
+    assert res["ok"] is True and res["removed"] == 2
+
+
+def test_live_knowledge_block_injected_into_config(monkeypatch):
+    """Known facts are appended to the Live system instruction on connect."""
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    comp.dynamic_context = lambda: "What you already know about the user and their setup:\n- cowork is top-right"
+    cfg = comp._live_config(types)
+    assert "cowork is top-right" in cfg.system_instruction
+    # base instruction still present
+    assert "Orynn" in cfg.system_instruction
 
 
 def test_live_tool_start_desktop_task_requires_goal():

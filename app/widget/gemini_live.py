@@ -222,6 +222,10 @@ class GeminiLiveCompanion:
         # Aoede/Kore/Leda (female).
         self.voice_name = voice_name or os.environ.get("GEMINI_LIVE_VOICE") or "Puck"
         self.system_instruction = system_instruction or _default_system_instruction()
+        # Optional hook returning extra system-instruction text (Orynn's knowledge
+        # memory). Called on every (re)connect so the latest learned/taught facts are
+        # always in context. Best-effort: exceptions are ignored.
+        self.dynamic_context: Callable[[], str] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -507,6 +511,14 @@ class GeminiLiveCompanion:
         tools = [types.Tool(function_declarations=_function_declarations(types))]
         if live_search_enabled():
             tools.insert(0, types.Tool(google_search=types.GoogleSearch()))
+        instruction = self.system_instruction
+        if self.dynamic_context is not None:
+            try:
+                extra = self.dynamic_context()
+                if extra:
+                    instruction = f"{instruction}\n\n{extra}"
+            except Exception:
+                pass
         return types.LiveConnectConfig(
             response_modalities=[types.Modality.AUDIO],
             input_audio_transcription=types.AudioTranscriptionConfig(),
@@ -521,7 +533,7 @@ class GeminiLiveCompanion:
             thinking_config=types.ThinkingConfig(
                 thinking_level=types.ThinkingLevel.MINIMAL
             ),
-            system_instruction=self.system_instruction,
+            system_instruction=instruction,
             tools=tools,
             # Resume the same conversation across reconnects (handle is None on the
             # first connect = fresh session; set from session_resumption_update).
@@ -1056,6 +1068,35 @@ def _function_declarations(types: Any) -> list[Any]:
                 "required": ["query"],
             },
         ),
+        types.FunctionDeclaration(
+            name="remember",
+            description=(
+                "Save a durable fact about the user, their setup, or their vocabulary "
+                "so you know it in future conversations — e.g. 'cowork is the button at "
+                "the top-right of the dashboard', 'my budget sheet is in Documents', or "
+                "what an app/term they use means. Call this whenever the user says "
+                "'remember that…' or teaches you something worth keeping."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string", "description": "The fact to remember, in plain words."},
+                    "app": {"type": "string", "description": "Optional app/window it relates to."},
+                },
+                "required": ["fact"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="forget",
+            description="Forget facts you previously remembered that match the given text.",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Text of the fact(s) to forget."},
+                },
+                "required": ["query"],
+            },
+        ),
     ]
 
 
@@ -1072,10 +1113,17 @@ def _default_system_instruction() -> str:
         "be done it escalates to the full agent on its own. For opening or launching an "
         "app, or anything multi-step (\"do X and then Y\"), or a vague/setup goal, say a "
         "quick natural acknowledgement out loud and in the same turn call "
-        "start_desktop_task with a clear, specific goal — that's the full agent. To actually "
+        "start_desktop_task with a clear, specific goal — that's the full agent. "
+        "When the user refers to something on screen you can't place from what you "
+        "already know (a button, menu, or area by name like 'cowork'), call "
+        "look_at_screen FIRST to actually see it, then act — don't guess or make the "
+        "user spell out where it is. To actually "
         "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
         "this say' — call look_at_screen with the question; you'll then see the "
-        "screenshot and can describe it. For searching the web or checking facts, news, "
+        "screenshot and can describe it. When the user teaches you something worth "
+        "keeping ('remember that…', what an app or term means, where something lives), "
+        "call remember so you know it next time; use forget to drop it. Lean on what you "
+        "already know about their setup before asking or looking. For searching the web or checking facts, news, "
         "weather, or real-time info, call web_search directly in the same turn. For a "
         "quick shell command (git status, listing/reading files, versions, running a "
         "script) call run_terminal and read back the result; destructive commands are "

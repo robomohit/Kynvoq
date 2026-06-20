@@ -1600,6 +1600,44 @@ async def set_preferences(body: _PreferencesBody):
     return {"ok": True, "preferences": updated}
 
 
+@app.get("/api/memory/facts", dependencies=[Depends(verify_token)])
+async def get_memory_facts(q: str = "", limit: int = 50):
+    """Orynn's knowledge memory — durable facts it knows about the user's setup and
+    vocabulary. `q` filters by relevance; otherwise the most recent are returned."""
+    from . import knowledge
+    facts = knowledge.relevant(q, limit) if q else knowledge.all_facts()[-limit:][::-1]
+    return {"facts": facts, "prompt_block": knowledge.as_prompt_block(q)}
+
+
+class _FactBody(BaseModel):
+    text: str
+    app: str = ""
+    source: str = "taught"
+
+
+@app.post("/api/memory/facts", dependencies=[Depends(verify_token)])
+async def add_memory_fact(body: _FactBody):
+    """Teach Orynn a fact ('cowork is the button top-right in the dashboard') or record
+    one it auto-learned. Near-identical facts are de-duped."""
+    from . import knowledge
+    fact = await asyncio.to_thread(knowledge.add_fact, body.text, app=body.app, source=body.source)
+    if fact is None:
+        raise HTTPException(status_code=400, detail="Empty fact text.")
+    return {"ok": True, "fact": fact}
+
+
+class _ForgetBody(BaseModel):
+    query: str
+
+
+@app.post("/api/memory/forget", dependencies=[Depends(verify_token)])
+async def forget_memory_fact(body: _ForgetBody):
+    """Forget facts whose text contains the query (case-insensitive)."""
+    from . import knowledge
+    removed = await asyncio.to_thread(knowledge.forget, body.query)
+    return {"ok": True, "removed": removed}
+
+
 @app.get("/api/skills", dependencies=[Depends(verify_token)])
 async def get_skills():
     return {"skills": skill_manager.get_all_skills()}

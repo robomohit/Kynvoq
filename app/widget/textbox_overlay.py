@@ -1040,6 +1040,9 @@ class OverlayController(QObject):
                 on_tool=lambda name, args, gen=generation: self._live_tool_for_generation(gen, name, args),
             )
             live = GeminiLiveCompanion(callbacks)
+            # Inject Orynn's knowledge memory into the Live system prompt on every
+            # (re)connect, so it knows the user's setup/vocabulary in conversation.
+            live.dynamic_context = self._live_knowledge_block
             self._live = live
             if live.start():
                 self._live_cancel.clear()
@@ -1603,6 +1606,44 @@ class OverlayController(QObject):
                 return routed
         return self._live_tool(name, args)
 
+    def _live_remember(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Save a durable fact into Orynn's knowledge memory (backend-persisted, shared
+        with the desktop agent) so it's known in future conversations."""
+        fact = _clean_text(args.get("fact") or "")
+        if not fact:
+            return {"ok": False, "message": "Nothing to remember — say the fact."}
+        try:
+            self.client.request("POST", "/api/memory/facts",
+                                {"text": fact, "app": _clean_text(args.get("app") or ""), "source": "taught"},
+                                timeout=5.0)
+        except Exception as exc:
+            return {"ok": False, "message": f"Couldn't save that: {str(exc)[:120]}"}
+        self.cursorStateRequested.emit("listening")
+        self._set_label("Remembered", source="live_tool", force=True)
+        return {"ok": True, "message": "Got it — I'll remember that. Confirm briefly to the user."}
+
+    def _live_forget(self, args: dict[str, Any]) -> dict[str, Any]:
+        query = _clean_text(args.get("query") or "")
+        if not query:
+            return {"ok": False, "message": "Say what you'd like me to forget."}
+        try:
+            data = self.client.request("POST", "/api/memory/forget", {"query": query}, timeout=5.0)
+            removed = int(data.get("removed", 0)) if isinstance(data, dict) else 0
+        except Exception as exc:
+            return {"ok": False, "message": f"Couldn't forget that: {str(exc)[:120]}"}
+        self._set_label("Forgotten" if removed else "Nothing to forget", source="live_tool", force=True)
+        return {"ok": True, "removed": removed,
+                "message": (f"Forgot {removed} thing(s)." if removed else "I didn't have anything matching that.")}
+
+    def _live_knowledge_block(self) -> str:
+        """Fetch Orynn's known facts as a system-prompt block to inject into the Live
+        session on (re)connect. Best-effort — returns "" if the backend is unreachable."""
+        try:
+            data = self.client.request("GET", "/api/memory/facts?limit=14", timeout=3.0)
+            return str(data.get("prompt_block", "")).strip() if isinstance(data, dict) else ""
+        except Exception:
+            return ""
+
     def _active_desktop_task(self) -> str | None:
         """Return the goal of a desktop task that's currently driving the screen, or
         None. Used to stop a new Live action from colliding with one already running
@@ -1669,6 +1710,10 @@ class OverlayController(QObject):
             return self._live_look_at_screen(args)
         if name == "run_terminal":
             return self._live_run_terminal(args)
+        if name == "remember":
+            return self._live_remember(args)
+        if name == "forget":
+            return self._live_forget(args)
         if name == "get_companion_status":
             try:
                 data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
