@@ -72,6 +72,20 @@ def test_groq_kept_off_desktop_when_openrouter_available(monkeypatch):
     assert chat["selected_model"].startswith("groq/"), chat
 
 
+def test_desktop_model_honored_for_computer_use_mode(monkeypatch):
+    """computer_use is a desktop mode too — a user's DESKTOP_MODEL must be honored for
+    it, not silently dropped to the generic effort model."""
+    from app.main import _select_model_for_task
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setenv("DESKTOP_MODEL", "z-ai/glm-4.5-air:free")
+
+    sel = _select_model_for_task("click the Start button", mode="computer_use")
+    assert sel["selected_model"] == "z-ai/glm-4.5-air:free", sel
+    assert sel["model_source"] == "auto:desktop:env"
+
+
 def test_groq_stays_on_desktop_when_its_the_only_key(monkeypatch):
     """If Groq is the only provider, a desktop task still uses it — better than no
     model. We only skip Groq for desktop when OpenRouter exists to fall through to."""

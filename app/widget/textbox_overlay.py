@@ -548,6 +548,11 @@ class OverlayController(QObject):
         # progress ("clicking New Agent") instead of going silent after the ack.
         self._live_narration_last = 0.0
         self._live_narration_text = ""
+        # Cached knowledge-memory prompt block, refreshed off the Live event loop (poll
+        # thread + after remember/forget). dynamic_context reads this cache so it never
+        # makes a blocking HTTP call on the event loop during (re)connect.
+        self._knowledge_block_cache = ""
+        self._knowledge_refreshed_at = 0.0
         self._live: Any = None
         self._live_cancel = threading.Event()
         # Wake-word mode: a background listener wakes Live on "Orynn" and lets it
@@ -1541,6 +1546,12 @@ class OverlayController(QObject):
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
         if action not in self._live_fast_then_escalate_actions():
             return None
+        # Busy gate FIRST: the fast UIA click/type runs here, before _live_tool's gate,
+        # so without this a model click during a running task would interleave a UIA
+        # action with the agent and fight for focus (the exact thing the gate prevents).
+        busy = self._busy_response()
+        if busy is not None:
+            return busy
         query = _clean_text(args.get("query") or "")
         if action == "click" and not query:
             self.cursorStateRequested.emit("thinking")
@@ -1642,6 +1653,7 @@ class OverlayController(QObject):
                                 timeout=5.0)
         except Exception as exc:
             return {"ok": False, "message": f"Couldn't save that: {str(exc)[:120]}"}
+        self._refresh_knowledge_block()  # so the next (re)connect injects it
         self.cursorStateRequested.emit("listening")
         self._set_label("Remembered", source="live_tool", force=True)
         return {"ok": True, "message": "Got it — I'll remember that. Confirm briefly to the user."}
@@ -1655,18 +1667,29 @@ class OverlayController(QObject):
             removed = int(data.get("removed", 0)) if isinstance(data, dict) else 0
         except Exception as exc:
             return {"ok": False, "message": f"Couldn't forget that: {str(exc)[:120]}"}
+        if removed:
+            self._refresh_knowledge_block()
         self._set_label("Forgotten" if removed else "Nothing to forget", source="live_tool", force=True)
         return {"ok": True, "removed": removed,
                 "message": (f"Forgot {removed} thing(s)." if removed else "I didn't have anything matching that.")}
 
-    def _live_knowledge_block(self) -> str:
-        """Fetch Orynn's known facts as a system-prompt block to inject into the Live
-        session on (re)connect. Best-effort — returns "" if the backend is unreachable."""
+    def _refresh_knowledge_block(self) -> None:
+        """Fetch Orynn's known-facts prompt block from the backend into the cache.
+        BLOCKING (urllib) — only call from the poll thread or a tool worker thread,
+        NEVER the Live event loop. Best-effort: a failure keeps the last good cache."""
         try:
             data = self.client.request("GET", "/api/memory/facts?limit=14", timeout=3.0)
-            return str(data.get("prompt_block", "")).strip() if isinstance(data, dict) else ""
+            if isinstance(data, dict):
+                self._knowledge_block_cache = str(data.get("prompt_block", "")).strip()
         except Exception:
-            return ""
+            pass  # keep the previous cache on a hiccup
+        self._knowledge_refreshed_at = time.monotonic()
+
+    def _live_knowledge_block(self) -> str:
+        """Return the CACHED knowledge block for injection into the Live system prompt.
+        Non-blocking (safe to call on the Live event loop via dynamic_context) — the
+        cache is refreshed off-loop by the poll loop and after remember/forget."""
+        return self._knowledge_block_cache
 
     def _active_desktop_task(self) -> str | None:
         """Return the goal of a desktop task that's currently driving the screen, or
@@ -1687,6 +1710,27 @@ class OverlayController(QObject):
             pass  # network hiccup — trust the flag and stay safe (assume busy)
         return self._active_task_goal or "a desktop task"
 
+    def _busy_response(self) -> dict[str, Any] | None:
+        """If a desktop task is already driving the screen, return the 'busy' tool
+        result so Live tells the user / offers to stop — else None. Two Live desktop
+        actions at once fight over focus and the keyboard, so this gate must cover the
+        fast click/type path (_desktop_control_route) too, not just _live_tool."""
+        active = self._active_desktop_task()
+        if active is None:
+            return None
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Busy: " + _short(active, 90), source="live_tool", force=True)
+        return {
+            "ok": False,
+            "busy": True,
+            "active_task": active,
+            "message": (
+                f'A desktop task is already running: "{active}". Do NOT start '
+                "another action on top of it. Tell the user what's in progress "
+                "and ask whether to stop it (call stop_current_task) or wait."
+            ),
+        }
+
     def _live_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         name = str(name or "")
         args = args if isinstance(args, dict) else {}
@@ -1695,20 +1739,9 @@ class OverlayController(QObject):
         # so Live can tell the user and offer to stop it. (stop_current_task and
         # get_companion_status are intentionally NOT gated — those are how you escape.)
         if name in ("desktop_control", "start_desktop_task"):
-            active = self._active_desktop_task()
-            if active is not None:
-                self.cursorStateRequested.emit("thinking")
-                self._set_label("Busy: " + _short(active, 90), source="live_tool", force=True)
-                return {
-                    "ok": False,
-                    "busy": True,
-                    "active_task": active,
-                    "message": (
-                        f'A desktop task is already running: "{active}". Do NOT start '
-                        "another action on top of it. Tell the user what's in progress "
-                        "and ask whether to stop it (call stop_current_task) or wait."
-                    ),
-                }
+            busy = self._busy_response()
+            if busy is not None:
+                return busy
         if name == "desktop_control":
             return self._live_desktop_control(args)
         if name == "start_desktop_task":
@@ -2213,6 +2246,12 @@ class OverlayController(QObject):
                 if not idle_label_shown:
                     self._set_label("Waiting for Orynn", source="system_wait")
                     idle_label_shown = True
+            # Keep the knowledge-memory cache warm off the Live event loop, so
+            # dynamic_context never blocks at (re)connect. Warms on the first iteration
+            # (refreshed_at=0) and refreshes every ~30s as a backstop for facts changed
+            # outside the remember/forget tools (e.g. via the dashboard).
+            if time.monotonic() - self._knowledge_refreshed_at > 30.0:
+                self._refresh_knowledge_block()
             self._stop.wait(0.45)
 
     def _prime_from_active_task(self) -> None:

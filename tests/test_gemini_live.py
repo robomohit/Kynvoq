@@ -1651,6 +1651,50 @@ def test_live_knowledge_block_injected_into_config(monkeypatch):
     assert "Orynn" in cfg.system_instruction
 
 
+def test_fast_click_blocked_when_a_task_is_running():
+    """A model click while a desktop task is running must hit the busy gate, not run a
+    UIA action on top of the agent. The fast path bypassed the gate before this fix."""
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/active-tasks":
+                return {"tasks": [{"id": "t1", "goal": "organizing downloads"}]}
+            raise AssertionError("must not POST a task while one is already running")
+
+    class FakeTools:
+        def uia_click(self, *a, **k):
+            raise AssertionError("must not click on top of a running task")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    c._active_task_running = True
+    c._active_task_goal = "organizing downloads"
+
+    res = c._live_tool_for_generation(None, "desktop_control", {"action": "click", "query": "OK", "app": "X"})
+    assert res.get("busy") is True
+
+
+def test_knowledge_block_read_is_non_blocking_cache():
+    """dynamic_context (_live_knowledge_block) must NOT do HTTP — it runs on the Live
+    event loop at connect. The blocking fetch lives in _refresh_knowledge_block (off-loop)."""
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            return {"facts": [], "prompt_block": "ORYNN MEMORY block"}
+
+    c = _controller()
+    c.client = FakeClient()
+    # Reading the cache does zero HTTP.
+    assert c._live_knowledge_block() == ""
+    assert calls == []
+    # Refreshing (poll thread / after remember) populates it via one HTTP call.
+    c._refresh_knowledge_block()
+    assert "ORYNN MEMORY block" in c._live_knowledge_block()
+    assert calls == ["/api/memory/facts?limit=14"]
+
+
 def test_live_tool_start_desktop_task_requires_goal():
     c = _controller()
 

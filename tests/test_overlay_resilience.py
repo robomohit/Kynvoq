@@ -64,9 +64,13 @@ def test_poll_loop_recovery_syncs_active_tasks(monkeypatch):
     """Verify that state is synced with active tasks upon recovering from 3+ failures."""
     controller = OverlayController(port=8000)
     
-    # Mock client request: fail 3 times, then succeed on 4th
+    # Mock client request: fail the first 3 POLL requests, then succeed on the 4th.
+    # The off-loop knowledge-cache refresh also calls the client; it's incidental to
+    # this scenario, so it doesn't count toward the failure budget.
     call_count = 0
     def mock_request(method, path, *args, **kwargs):
+        if "/api/memory/facts" in path:
+            return {"facts": [], "prompt_block": ""}
         nonlocal call_count
         call_count += 1
         if call_count <= 3:

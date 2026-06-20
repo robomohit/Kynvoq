@@ -1193,8 +1193,10 @@ def _select_model_for_task(goal: str, mode: str = "auto", requested_model: Optio
             # Only one free coder model — effort doesn't change it.
             selected_model = "openrouter/qwen/qwen3-coder:free"
             source = "auto:openrouter:coding"
-        elif detected_mode in ("computer", "computer_isolated"):
+        elif detected_mode in ("computer", "computer_isolated", "computer_use"):
             # A user-set DESKTOP_MODEL always wins; otherwise effort picks the tier.
+            # (computer_use is a desktop mode too — without it here a user's
+            # DESKTOP_MODEL was silently ignored for that mode.)
             dm = os.environ.get("DESKTOP_MODEL", "").strip()
             selected_model = dm or effort_model(effort, detected_mode)
             source = "auto:desktop:env" if dm else f"auto:desktop:effort:{effort}"
