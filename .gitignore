@@ -60,6 +60,7 @@ Thumbs.db
 # Runtime state (written by the app at runtime; not source)
 connectors.json
 preferences.json
+memory/knowledge.json
 clipboard_history.json
 form_profiles.json
 scheduled_recipes.json
