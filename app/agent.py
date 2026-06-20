@@ -2668,6 +2668,30 @@ class AgentService:
                         return
                     
                     if not action_type:
+                        # Desktop evidence gate: a desktop task that produced ZERO
+                        # interaction can't be "done" just because the model stopped
+                        # emitting actions — that's the false "Done." with no actions.
+                        # Bounce ONCE (like the finish gate) so a text-only reply can't
+                        # false-complete a task that did nothing; if the model insists,
+                        # let it through (it may legitimately be saying it can't).
+                        if (_is_computer_desktop and _desktop_evidence == 0
+                                and not _finish_bounced):
+                            _finish_bounced = True
+                            _gate_obs = (
+                                "[not done] You haven't interacted with any app yet "
+                                "(no click/type/keyboard action), so the task is NOT "
+                                "complete — don't say it's done. Actually do it using the "
+                                "visible control names (uia_click / uia_type / "
+                                "keyboard_type), verify the result, then finish stating "
+                                "what you observed. If the request genuinely needs no "
+                                "desktop action, say that explicitly instead."
+                            )
+                            messages.append({"role": "assistant", "content": thought_text or "(no action)"})
+                            messages.append({"role": "user", "content": f"<observation>\n{_gate_obs}\n</observation>"})
+                            await self._emit(task_id, "status", {
+                                "message": "No desktop interaction yet — asking the agent to actually do the task before finishing.",
+                            })
+                            continue
                         # Model gave a text-only response — that IS the answer.
                         # Emit as a finalized response card only (no duplicate live card).
                         if thought_text and thought_text.strip():

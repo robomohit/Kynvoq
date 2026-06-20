@@ -165,6 +165,26 @@ LIVE_CONSENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# A negation right before a disruptive verb flips the intent — "do NOT send",
+# "without deleting", "don't submit". Used to avoid gating those for consent (the
+# user is telling Orynn NOT to do the thing).
+_NEGATION_RE = re.compile(
+    r"\b(?:not|never|without|don'?t|do\s+not|won'?t|cannot|can'?t|avoid|no\s+need\s+to)\W*$",
+    re.IGNORECASE,
+)
+
+
+def _has_unnegated_match(text: str, regex: "re.Pattern[str]") -> bool:
+    """True if `text` contains a regex match that is NOT immediately preceded by a
+    negation — so 'delete the file' gates but 'do not delete the file' does not."""
+    text = text or ""
+    for m in regex.finditer(text):
+        if _NEGATION_RE.search(text[:m.start()][-28:]):
+            continue
+        return True
+    return False
+
+
 # Shell commands that change or remove something hard to undo and so need spoken
 # consent before Live runs them — the run_terminal analog of LIVE_CONSENT_RE.
 # Catastrophic commands (rm -rf /, format, mkfs, shutdown) are already HARD-BLOCKED
@@ -1765,14 +1785,15 @@ class OverlayController(QObject):
     @staticmethod
     def _goal_needs_consent(goal: str) -> bool:
         """True when a goal looks disruptive / hard to undo and so needs a spoken
-        yes before Live runs it autonomously (brief §7.2)."""
-        return bool(LIVE_CONSENT_RE.search(goal or ""))
+        yes before Live runs it (brief §7.2). Negated verbs ('do not send') don't
+        count — the user is asking NOT to do it."""
+        return _has_unnegated_match(goal or "", LIVE_CONSENT_RE)
 
     @staticmethod
     def _command_needs_consent(command: str) -> bool:
         """True when a shell command is destructive (delete/push/kill/uninstall) and so
         needs a spoken yes first — the run_terminal analog of _goal_needs_consent."""
-        return bool(LIVE_TERMINAL_CONSENT_RE.search(command or ""))
+        return _has_unnegated_match(command or "", LIVE_TERMINAL_CONSENT_RE)
 
     def _live_start_desktop_task(self, args: dict[str, Any]) -> dict[str, Any]:
         goal = _clean_text(args.get("goal") or "")

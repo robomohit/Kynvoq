@@ -1595,6 +1595,12 @@ def test_consent_gate_keyword_boundaries():
               "delete my downloads", "buy the item", "restart cursor",
               "format the c drive"]:
         assert needs(g) is True, g
+    # Negated intent must NOT gate — the user is asking it NOT to do the thing.
+    for g in ["do not send any data", "don't delete my files",
+              "without sending anything just open it", "never post that"]:
+        assert needs(g) is False, g
+    # ...but a real send that merely contains a negation elsewhere still gates.
+    assert needs("don't forget to send the report") is True
 
 
 def test_live_remember_saves_fact_to_backend():
