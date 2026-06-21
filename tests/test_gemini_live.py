@@ -1695,6 +1695,39 @@ def test_knowledge_block_read_is_non_blocking_cache():
     assert calls == ["/api/memory/facts?limit=14"]
 
 
+def test_extract_web_sources_dedups_and_drops_ddg():
+    from app.widget.textbox_overlay import OverlayController
+    out = (
+        "Result A\nhttps://docs.python.org/3/whatsnew.html\nsnippet\n\n"
+        "Result B\nhttps://www.python.org/downloads/\nmore\n\n"
+        "Dup domain\nhttps://docs.python.org/other.html\nx\n"
+        "https://duckduckgo.com/l/?uddg=redirect"
+    )
+    src = OverlayController._extract_web_sources(out)
+    doms = [d for d, _ in src]
+    assert "docs.python.org" in doms and "python.org" in doms
+    assert "duckduckgo.com" not in doms           # the search engine itself isn't a source
+    assert doms.count("docs.python.org") == 1      # deduped by domain
+    assert all(u.startswith("http") for _, u in src)
+
+
+def test_live_web_search_surfaces_sources_and_asks_to_cite():
+    """Perplexity-style trust: the web answer carries its sources, and the model is
+    told to cite the source out loud so the user can verify it."""
+    from app.models import ToolResult
+
+    class FakeTools:
+        def web_search(self, q):
+            return ToolResult(ok=True, output="Latest Python\nhttps://www.python.org/downloads/\n3.14")
+
+    c = _controller()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("web_search", {"query": "latest python version"})
+    assert res["ok"] is True
+    assert res["sources"] and "python.org" in res["sources"][0]
+    assert "according to python.org" in res["message"]
+
+
 def test_live_tool_start_desktop_task_requires_goal():
     c = _controller()
 

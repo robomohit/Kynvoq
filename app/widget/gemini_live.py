@@ -1052,7 +1052,9 @@ def _function_declarations(types: Any) -> list[Any]:
             name="web_search",
             description=(
                 "Search the web for real-time information, weather, news, facts, or questions. "
-                "Call this directly in the same turn instead of starting a desktop task."
+                "Call this directly in the same turn instead of starting a desktop task. The "
+                "result includes the sources it came from — when you answer, say which source "
+                "you're citing out loud (e.g. 'according to <site>') so the user can trust it."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1137,7 +1139,9 @@ def _default_system_instruction() -> str:
         "category 'location' so you learn their setup and won't have to look again. Use "
         "forget to drop things. Always lean on what you already know before asking or "
         "looking. For searching the web or checking facts, news, "
-        "weather, or real-time info, call web_search directly in the same turn. For a "
+        "weather, or real-time info, call web_search directly in the same turn — and when "
+        "you give the answer, name the source you got it from out loud ('according to …') "
+        "so the user can trust and verify it; never state a web fact you can't attribute. For a "
         "quick shell command (git status, listing/reading files, versions, running a "
         "script) call run_terminal and read back the result; destructive commands are "
         "blocked. If the user says stop, cancel, or never "

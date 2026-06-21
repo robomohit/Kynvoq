@@ -1987,6 +1987,26 @@ class OverlayController(QObject):
         return {"ok": ok, "output": output[:1500],
                 "message": "Command finished — tell the user the result briefly."}
 
+    @staticmethod
+    def _extract_web_sources(output: str) -> list[tuple[str, str]]:
+        """Pull (domain, url) pairs out of a web_search result, in order, deduped by
+        domain — so Live can cite where an answer came from (Perplexity-style trust:
+        every claim is traceable to a source the user can see)."""
+        import urllib.parse
+        seen: set[str] = set()
+        out: list[tuple[str, str]] = []
+        for url in re.findall(r"https?://[^\s)\"'<>]+", output or ""):
+            url = url.rstrip(".,);]")
+            try:
+                dom = urllib.parse.urlsplit(url).netloc.lower().lstrip("www.")
+            except Exception:
+                continue
+            if not dom or dom.endswith("duckduckgo.com") or dom in seen:
+                continue
+            seen.add(dom)
+            out.append((dom, url))
+        return out
+
     def _live_web_search(self, args: dict[str, Any]) -> dict[str, Any]:
         query = _clean_text(args.get("query") or "")
         if not query:
@@ -1999,7 +2019,23 @@ class OverlayController(QObject):
             self._raise_if_live_cancelled()
             # If the tool returned a ToolResult, extract output
             if hasattr(result, "ok") and hasattr(result, "output"):
-                return {"ok": result.ok, "output": result.output}
+                output = str(getattr(result, "output", "") or "")
+                sources = self._extract_web_sources(output)
+                if sources:
+                    # Show the user WHERE the answer comes from so it's verifiable,
+                    # and tell the model to attribute its answer out loud.
+                    self._set_label("Sources: " + _short(", ".join(d for d, _ in sources[:3]), 80),
+                                    source="live_tool", force=True)
+                return {
+                    "ok": bool(getattr(result, "ok", False)),
+                    "output": output,
+                    "sources": [u for _, u in sources[:5]],
+                    "message": (
+                        "Answer the user from these results, and say which source you're "
+                        "citing out loud (e.g. 'according to " + (sources[0][0] if sources else "the site")
+                        + "') so they can trust it — don't state a fact you can't point to a source for."
+                    ),
+                }
             if isinstance(result, dict):
                 return result
             return {"ok": True, "result": result}
