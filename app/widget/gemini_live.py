@@ -237,6 +237,11 @@ class GeminiLiveCompanion:
         self._resume_handle: str | None = None
         # Greet once per session (not on every reconnect).
         self._greeted = False
+        # False until the first session has connected. The mic-queue drain (clearing
+        # stale audio) must run ONLY on reconnects — on the first connect that queue
+        # holds the user's FIRST utterance (captured between the mic starting and the
+        # audio sender starting), so draining it makes them repeat themselves.
+        self._connected_once = False
         # Set when the server sends go_away so we exit the receive loop cleanly
         # (instead of waiting for a 1008 abort when the session duration expires).
         self._go_away_reconnect = False
@@ -426,6 +431,8 @@ class GeminiLiveCompanion:
                     async with client.aio.live.connect(model=self.model, config=config) as session:
                         self._session = session
                         self._audio_fail_streak = 0
+                        is_reconnect = self._connected_once
+                        self._connected_once = True
                         retries = 0
                         retry_delay = 1.0
                         self.callbacks.on_status("Gemini Live listening")
@@ -439,12 +446,16 @@ class GeminiLiveCompanion:
                             pass
                         await self._maybe_greet(session, types)
 
-                        # Clear stale audio chunks from mic queue on reconnect
-                        while not audio_queue.empty():
-                            try:
-                                audio_queue.get_nowait()
-                            except asyncio.QueueEmpty:
-                                break
+                        # Clear stale audio from the mic queue ONLY on a reconnect — on
+                        # the FIRST connect this queue holds the user's first utterance
+                        # (captured while connecting/greeting), so draining it would make
+                        # them repeat their opening command.
+                        if is_reconnect:
+                            while not audio_queue.empty():
+                                try:
+                                    audio_queue.get_nowait()
+                                except asyncio.QueueEmpty:
+                                    break
 
                         # Clear stale audio chunks from speaker (output) queue on reconnect
                         self._flush_output(output_q)
