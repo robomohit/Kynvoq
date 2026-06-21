@@ -40,13 +40,16 @@ def _capture_jpeg() -> bytes:
     import io
     import mss
     from PIL import Image
-    import pyautogui
-    w, h = pyautogui.size()
+    # FULL primary screen, scaled — the same capture _live_look_at_screen now uses
+    # (a top-left crop at JPEG-65 made the model hallucinate).
     with mss.mss() as sct:
-        shot = sct.grab({"left": 0, "top": 0, "width": min(w, 1280), "height": min(h, 800)})
+        mons = sct.monitors
+        mon = mons[1] if len(mons) > 1 else mons[0]
+        shot = sct.grab(mon)
         img = Image.frombytes("RGB", shot.size, shot.rgb)
+        img.thumbnail((1920, 1920))
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=65, optimize=True)
+        img.save(buf, format="JPEG", quality=92)
         return buf.getvalue()
 
 

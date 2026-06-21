@@ -2300,6 +2300,7 @@ class AgentService:
                         "WHEN TO USE TOOLS: only when you actually need to do something (create files, run code, search, etc.).\n"
                         "For questions and conversation, just answer — then finish.\n\n"
                         "DESKTOP: if you need to see or control the Windows desktop or an app, first call enable_desktop_control with a concrete reason. The desktop tools appear only after the user allows that request.\n\n"
+                        "READING FILES: to read, understand, or explain a file's contents (e.g. 'read gemini_live.py'), use read_file. If you were given only a name without a path, locate it first with file_glob (e.g. \"**/gemini_live.py\") then read_file the match. Do NOT open the file in Notepad/an editor or web-search for it — that's only for when the user wants to SEE or EDIT it on screen.\n\n"
                         "EFFICIENCY: Never call the same tool twice with the same args. Never read_file a file you just wrote. Never re-fetch a URL. After getting what you need, call finish.\n\n"
                         f"Available tools:\n{tool_guidance}\n\n"
                         "After each <observation>, decide your next step. Call finish when done."

@@ -1849,6 +1849,33 @@ class OverlayController(QObject):
         self._set_label("Unsupported Live tool", source="live_tool", force=True)
         return {"ok": False, "message": f"Unknown tool: {name}"}
 
+    @staticmethod
+    def _capture_vision_jpeg() -> bytes | None:
+        """Capture the FULL primary screen, scaled to a readable size at good quality,
+        for Live's vision. The agent's shared screenshot() CROPS the top-left 1280x800
+        at JPEG-65 (it's tuned for the agent's coordinate space) — too partial and blurry
+        for 'what's on my screen', which made the model hallucinate (a code editor read
+        as 'a photo editor with a beach'). Here we grab the WHOLE screen so it can
+        actually read what's there."""
+        try:
+            import io
+            import mss
+            from PIL import Image
+            with mss.mss() as sct:
+                mons = sct.monitors
+                mon = mons[1] if len(mons) > 1 else mons[0]  # primary monitor, full
+                shot = sct.grab(mon)
+                img = Image.frombytes("RGB", shot.size, shot.rgb)
+                # High fidelity on purpose — Live's free tier is generous (64k TPM), so we
+                # don't trade quality for tokens. A crisp near-full-res frame lets the model
+                # actually read code/text on screen instead of guessing.
+                img.thumbnail((1920, 1920))
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=92)
+                return buf.getvalue()
+        except Exception:
+            return None
+
     def _live_look_at_screen(self, args: dict[str, Any]) -> dict[str, Any]:
         """Capture a screenshot and hand it to Live's own vision so it can SEE the
         screen and answer (no local OCR). Read-only — fine to use mid-task."""
@@ -1858,18 +1885,9 @@ class OverlayController(QObject):
         question = _clean_text(args.get("question") or "")
         self.cursorStateRequested.emit("thinking")
         self._set_label("Looking at the screen", source="live_tool", force=True)
-        try:
-            shot = self._live_desktop_tools().screenshot()
-        except Exception as exc:
-            return {"ok": False, "message": f"Couldn't capture the screen: {str(exc)[:160]}"}
-        b64 = getattr(shot, "base64_image", None)
-        if not bool(getattr(shot, "ok", False)) or not b64:
+        data = self._capture_vision_jpeg()
+        if not data:
             return {"ok": False, "message": "Couldn't capture the screen."}
-        try:
-            import base64 as _b64
-            data = _b64.b64decode(b64)
-        except Exception:
-            return {"ok": False, "message": "Couldn't read the screenshot."}
         if not bool(live.send_screen_image(data)):
             return {"ok": False, "message": "Couldn't send the screen image."}
         # The FunctionResponse is the SINGLE prompt that drives the model to describe the

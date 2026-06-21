@@ -2508,18 +2508,11 @@ def test_live_desktop_control_scroll_routes_to_tools():
     assert ft.scrolled == -25
 
 
-def test_live_look_at_screen_sends_screenshot_to_vision():
-    import base64
-    from app.models import ToolResult
-
+def test_live_look_at_screen_sends_screenshot_to_vision(monkeypatch):
     c = _controller()
-
-    class FakeTools:
-        def screenshot(self):
-            return ToolResult(ok=True, output="shot",
-                              base64_image=base64.b64encode(b"IMGDATA").decode())
-
-    c._desktop_tools = FakeTools()
+    # look_at_screen uses a dedicated full-screen vision capture; stub it (real mss
+    # screen capture isn't available headless).
+    monkeypatch.setattr(c, "_capture_vision_jpeg", lambda: b"IMGDATA")
 
     class FakeLive:
         def __init__(self):
