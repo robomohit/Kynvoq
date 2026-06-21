@@ -945,20 +945,22 @@ def test_model_click_escalates_to_agent_on_fast_failure():
 
     class FakeTools:
         def uia_click(self, query, app="", allow_pixel_fallback=True):
-            return ToolResult(ok=False, output="No UIA match for 'New Agent' (app may be locked).", data={})
+            return ToolResult(ok=False, output="No UIA match for 'Save' (app may be locked).", data={})
 
     c = _controller()
     c.client = FakeClient()
     c._desktop_tools = FakeTools()
+    # A NON-Electron app: a fast-click failure escalates straight to the agent (an
+    # Electron app would ask for unlock consent first — see test_electron_click_*).
     res = c._live_tool_for_generation(
-        None, "desktop_control", {"action": "click", "query": "New Agent", "app": "Cursor"}
+        None, "desktop_control", {"action": "click", "query": "Save", "app": "Paint"}
     )
 
     assert res["ok"] is True  # escalated task accepted (status running)
     paths = [p for p, _ in calls]
     assert "/api/tasks" in paths
     goal = next(d for p, d in calls if p == "/api/tasks")["goal"]
-    assert "New Agent" in goal and "Cursor" in goal
+    assert "Save" in goal and "Paint" in goal
     assert c._active_task_running is True
 
 
@@ -1649,6 +1651,59 @@ def test_live_knowledge_block_injected_into_config(monkeypatch):
     assert "cowork is top-right" in cfg.system_instruction
     # base instruction still present
     assert "Orynn" in cfg.system_instruction
+
+
+def test_electron_click_asks_consent_before_unlock():
+    """A fast click into a known Electron app that can't be done cleanly asks for a
+    spoken yes before escalating — the agent may electron_unlock, which relaunches the
+    app (brief §7.2). It must NOT silently spawn the task."""
+    from app.models import ToolResult
+
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("must not hit the backend before consent")
+
+    class FakeTools:
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
+            return ToolResult(ok=False, output="DOM locked (electron)", data={})
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "click", "query": "New Agent", "app": "Cursor"}
+    )
+    assert res.get("needs_consent") is True
+    assert "unlock" in res["message"].lower()
+    assert c._active_task_running is False
+
+
+def test_non_electron_click_escalates_without_unlock_consent():
+    """A fast click failure in a NON-Electron app just escalates to the agent — no
+    unlock consent, since UIA/pixel handles native apps without a relaunch."""
+    from app.models import ToolResult
+
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            return {}
+
+    class FakeTools:
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
+            return ToolResult(ok=False, output="no match", data={})
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "click", "query": "OK", "app": "Notepad"}
+    )
+    assert res.get("needs_consent") is not True
+    assert "/api/tasks" in calls  # escalated to the agent
 
 
 def test_fast_click_blocked_when_a_task_is_running():

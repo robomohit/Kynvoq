@@ -110,6 +110,17 @@ LIVE_DESKTOP_ACTIONS = set(LIVE_DESKTOP_ACTION_LABELS)
 # (focus_window/wait_for_window/press_keys/scroll).
 LIVE_UPGRADE_ACTIONS = {"click", "type"}
 
+# Apps whose accessibility tree is commonly locked (Electron/Chromium shells). When a
+# fast UIA click into one of these fails and Live would escalate, the back office may
+# need electron_unlock — which RELAUNCHES the app (the user might have to close it
+# first). The product brief (§7.2) says ask before that, so the route gets a spoken
+# consent for these instead of silently unlocking. Matched as a substring of app/title.
+LIVE_ELECTRON_APP_HINTS = (
+    "cursor", "discord", "slack", "vscode", "visual studio code",
+    "notion", "obsidian", "spotify", "microsoft teams", "figma", "whatsapp",
+    "postman", "github desktop", "1password", "linear",
+)
+
 LIVE_BLOCKED_KEY_COMBOS = {
     "alt+f4",
     "alt+tab",
@@ -1609,14 +1620,40 @@ class OverlayController(QObject):
         fast = self._live_desktop_control(args, fast_invoke_only=True)
         if isinstance(fast, dict) and fast.get("ok") and not self._fast_result_is_soft_fail(fast):
             return fast
-        # Couldn't do it cleanly (no invoke pattern / Electron-locked / click didn't
-        # visibly land) → escalate to the back office, which can electron_unlock,
-        # pixel-click with the user's awareness, and retry. Live's spoken narration
-        # owns the bubble while it drives, so don't flash a raw handoff status over it.
+        # The clean UIA click failed. If the target is a known Electron app, doing it for
+        # real may require electron_unlock — which RELAUNCHES the app (the user might have
+        # to close it first). Per the brief, ask out loud before that disruption rather
+        # than silently unlocking under the autonomous task (which bypasses approvals).
+        app = _clean_text(args.get("app") or args.get("title") or "")
+        if self._looks_like_electron(app) and not self._live_bool(args.get("confirmed")):
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Needs your OK", source="live_tool", force=True)
+            return {
+                "ok": False,
+                "needs_consent": True,
+                "message": (
+                    f"I couldn't click that the gentle way in {app or 'that app'}. To do "
+                    "it I may have to unlock the app, which can briefly relaunch it (you "
+                    "might need to reopen or close it). Ask the user out loud if that's "
+                    "okay; only if they clearly say yes, call start_desktop_task with the "
+                    "same goal and confirmed set to true. If they say no, drop it."
+                ),
+            }
+        # Otherwise escalate to the back office, which can electron_unlock, pixel-click
+        # with the user's awareness, and retry. Live's spoken narration owns the bubble
+        # while it drives, so don't flash a raw handoff status over it.
         self.cursorStateRequested.emit("thinking")
         if not self._live_is_running():
             self._set_label("Trying the full agent", source="live_tool", force=True)
         return self._live_tool("start_desktop_task", {"goal": goal})
+
+    @staticmethod
+    def _looks_like_electron(app: str) -> bool:
+        """True if the app/window name matches a known Electron/Chromium shell whose
+        UIA tree is commonly locked (so doing a click for real may need electron_unlock,
+        which relaunches the app)."""
+        a = (app or "").lower()
+        return any(hint in a for hint in LIVE_ELECTRON_APP_HINTS)
 
     @staticmethod
     def _fast_result_is_soft_fail(fast: dict[str, Any]) -> bool:
