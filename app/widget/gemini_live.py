@@ -615,10 +615,19 @@ class GeminiLiveCompanion:
         except Exception:
             pass
 
-    def send_screen_image(self, jpeg_bytes: bytes, prompt: str = "") -> bool:
-        """Send a screenshot into the live conversation so the model can SEE the
-        screen (Gemini's own vision — no local OCR needed) and answer about it.
-        Thread-safe; returns True if the send was scheduled."""
+    def send_screen_image(self, jpeg_bytes: bytes) -> bool:
+        """Push a screenshot FRAME into the live session so the model can SEE the screen
+        (Gemini's own vision — no local OCR). Thread-safe; returns True if scheduled.
+
+        Sends ONLY the frame, over the realtime-input VIDEO channel. Two things matter:
+        (1) an image MUST go over realtime input, not a send_client_content blob — the
+        Live API rejects an inline image in client_content with WebSocket 1007 and drops
+        the whole session (the old "Listening forever" bug). (2) We do NOT also send a
+        client_content text turn here: the tool's FunctionResponse already prompts the
+        model to describe, so a second turn would be a redundant double-prompt. The
+        caller (look_at_screen) puts the question in the FunctionResponse. Verified
+        end-to-end by scripts/live_vision_smoke.py (this exact frame-then-FunctionResponse
+        sequence)."""
         loop = self._loop
         session = self._session
         if loop is None or session is None or self._stop.is_set() or not jpeg_bytes:
@@ -627,20 +636,8 @@ class GeminiLiveCompanion:
         async def _send() -> None:
             try:
                 from google.genai import types
-                # Images MUST go over the realtime-input channel (the same one mic audio
-                # and video frames use), NOT inside a send_client_content text turn. The
-                # Live API rejects an inline image blob in client_content with WebSocket
-                # 1007 "Request contains an invalid argument", which dropped the WHOLE
-                # session on every "look at my screen" (it reconnected and the vision
-                # reply was lost — the user saw "Listening" forever). Send the frame as
-                # realtime media, then a normal text turn to make the model answer it.
                 await session.send_realtime_input(
                     video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg")
-                )
-                text = prompt or "Describe what's on my screen in one or two short sentences."
-                await session.send_client_content(
-                    turns=[types.Content(role="user", parts=[types.Part(text=text)])],
-                    turn_complete=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 # region agent log

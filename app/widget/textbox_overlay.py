@@ -1388,6 +1388,31 @@ class OverlayController(QObject):
         if self._live_cancel_requested():
             raise InterruptedError("Gemini Live was stopped.")
 
+    def _run_cancellable(self, fn: Any, *args: Any, poll: float = 0.12) -> Any:
+        """Run a blocking call on a worker thread while watching the Live cancel flag,
+        so 'stop' interrupts a long call (e.g. run_terminal) within ~poll seconds
+        instead of only after it returns. Raises InterruptedError on cancel; the
+        underlying call is left to finish in the background (its own timeout bounds it).
+        Returns fn(*args), or re-raises whatever fn raised."""
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def _worker() -> None:
+            try:
+                box["result"] = fn(*args)
+            except BaseException as exc:  # noqa: BLE001 — surface any failure to the caller
+                box["error"] = exc
+            finally:
+                done.set()
+
+        threading.Thread(target=_worker, name="orynn-live-cancellable", daemon=True).start()
+        while not done.wait(poll):
+            if self._live_cancel_requested():
+                raise InterruptedError("Gemini Live was stopped.")
+        if "error" in box:
+            raise box["error"]
+        return box.get("result")
+
     def _run_live_interruptible_wait(self, runner: Any, timeout: float) -> Any:
         deadline = time.monotonic() + max(0.1, float(timeout))
         last_result = None
@@ -1808,12 +1833,16 @@ class OverlayController(QObject):
             data = _b64.b64decode(b64)
         except Exception:
             return {"ok": False, "message": "Couldn't read the screenshot."}
-        prompt = ("Here's a screenshot of the user's screen. "
-                  + (question or "Describe what's on it.")
-                  + " Answer out loud in one or two short, natural sentences.")
-        if not bool(live.send_screen_image(data, prompt)):
+        if not bool(live.send_screen_image(data)):
             return {"ok": False, "message": "Couldn't send the screen image."}
-        return {"ok": True, "message": "Looking at the screen now — describe what you see."}
+        # The FunctionResponse is the SINGLE prompt that drives the model to describe the
+        # frame just sent — send_screen_image deliberately sends no extra turn, so this
+        # isn't a double-prompt. Carry the user's actual question here.
+        return {"ok": True, "message": (
+            "The user's screen is now in view. "
+            + (question or "Describe what's on it.")
+            + " Answer out loud in one or two short, natural sentences."
+        )}
 
     @staticmethod
     def _goal_needs_consent(goal: str) -> bool:
@@ -1941,8 +1970,9 @@ class OverlayController(QObject):
         self.cursorStateRequested.emit("thinking")
         self._set_label("Running: " + _short(command, 70), source="live_tool", force=True)
         try:
-            result = self._live_desktop_tools().run_command(command)
-            self._raise_if_live_cancelled()
+            # Run on a worker thread so 'stop' interrupts a long command promptly,
+            # instead of only being noticed after run_command blocks to completion.
+            result = self._run_cancellable(self._live_desktop_tools().run_command, command)
         except InterruptedError:
             self.cursorStateRequested.emit("idle")
             self._set_label("Stopped", source="live_stop", force=True)

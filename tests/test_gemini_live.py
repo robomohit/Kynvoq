@@ -2359,16 +2359,17 @@ def test_handle_message_go_away_schedules_graceful_reconnect():
     assert session.audio_stream_end is True
 
 
-def test_send_screen_image_uses_realtime_video_not_client_content_blob():
-    """A screenshot must go over the realtime VIDEO channel — stuffing it into a
-    send_client_content inline_data blob is what the Live API rejected with WS 1007,
-    dropping the session so 'look at my screen' replied with silence ('Listening')."""
+def test_send_screen_image_sends_video_frame_only():
+    """A screenshot goes over the realtime VIDEO channel and NOTHING else: not a
+    send_client_content inline_data blob (the Live API 1007's on that, dropping the
+    session — the old 'Listening forever' bug), and not an extra text turn (the tool's
+    FunctionResponse is the single describe-prompt, so a turn here would double-prompt)."""
     import threading
     import time as _time
     import asyncio as _aio
     from app.widget import gemini_live as gl
 
-    calls = {"video": 0, "inline_blob": 0, "client_text": []}
+    calls = {"video": 0, "client_content_turns": 0, "inline_blob": 0}
 
     class FakeSession:
         async def send_realtime_input(self, *, video=None, media=None, **kw):
@@ -2377,12 +2378,11 @@ def test_send_screen_image_uses_realtime_video_not_client_content_blob():
                 calls["video"] += 1
 
         async def send_client_content(self, *, turns=None, turn_complete=False, **kw):
+            calls["client_content_turns"] += 1
             for content in (turns or []):
                 for part in getattr(content, "parts", []) or []:
                     if getattr(part, "inline_data", None) is not None:
                         calls["inline_blob"] += 1
-                    if getattr(part, "text", None):
-                        calls["client_text"].append(part.text)
 
     loop = _aio.new_event_loop()
     threading.Thread(target=loop.run_forever, daemon=True).start()
@@ -2390,14 +2390,14 @@ def test_send_screen_image_uses_realtime_video_not_client_content_blob():
         comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
         comp._loop = loop
         comp._session = FakeSession()
-        assert comp.send_screen_image(b"\xff\xd8jpeg-bytes", "what app is shown?") is True
+        assert comp.send_screen_image(b"\xff\xd8jpeg-bytes") is True
         _time.sleep(0.4)
     finally:
         loop.call_soon_threadsafe(loop.stop)
 
-    assert calls["video"] == 1                 # image went over realtime video
-    assert calls["inline_blob"] == 0           # NOT stuffed into a client_content blob
-    assert any("what app is shown" in t for t in calls["client_text"])  # question asked
+    assert calls["video"] == 1                  # frame went over realtime video
+    assert calls["inline_blob"] == 0            # never a client_content image blob
+    assert calls["client_content_turns"] == 0   # no extra text turn (no double-prompt)
 
 
 def test_live_desktop_control_scroll_routes_to_tools():
@@ -2436,22 +2436,24 @@ def test_live_look_at_screen_sends_screenshot_to_vision():
     class FakeLive:
         def __init__(self):
             self.img = None
-            self.prompt = None
+            self.call_count = 0
 
         def is_running(self):
             return True
 
-        def send_screen_image(self, data, prompt=""):
+        def send_screen_image(self, data):
             self.img = data
-            self.prompt = prompt
+            self.call_count += 1
             return True
 
     fl = FakeLive()
     c._live = fl
     res = c._live_tool("look_at_screen", {"question": "what is this error"})
     assert res["ok"] is True
-    assert fl.img == b"IMGDATA"               # the real screenshot bytes were sent
-    assert "what is this error" in fl.prompt  # with the user's question
+    assert fl.img == b"IMGDATA"               # the real screenshot bytes were sent (frame only)
+    assert fl.call_count == 1
+    # The user's question rides in the FunctionResponse — the single describe-prompt.
+    assert "what is this error" in res["message"]
 
 
 def test_capture_live_task_outcome_notifies_live_proactively():
@@ -2514,6 +2516,38 @@ def test_live_run_terminal_hard_blocks_destructive_command():
         res = c._live_tool("run_terminal", {"command": danger})
         assert res["ok"] is False and res.get("blocked") is True
     assert calls == []  # nothing destructive ever executed
+
+
+def test_live_run_terminal_cancels_promptly_mid_command():
+    """'stop' must interrupt a long run_command promptly — the tool returns Stopped
+    without waiting for the blocking subprocess to finish (QA: a 4s command ignored
+    cancel for 4.6s before this)."""
+    import time as _t
+    import threading as _th
+    from app.models import ToolResult
+
+    started = _th.Event()
+
+    class FakeTools:
+        def run_command(self, cmd):
+            started.set()
+            _t.sleep(5.0)  # simulate a slow command
+            return ToolResult(ok=True, output="late output")
+
+    c = _controller()
+    c._desktop_tools = FakeTools()
+
+    def _cancel():
+        started.wait(2.0)
+        c._live_cancel.set()  # user said "stop" mid-command
+
+    _th.Thread(target=_cancel, daemon=True).start()
+    t0 = _t.monotonic()
+    res = c._live_tool("run_terminal", {"command": "slow-build"})
+    elapsed = _t.monotonic() - t0
+
+    assert res["ok"] is False and "Stopped" in res["message"]
+    assert elapsed < 2.0, f"should return promptly on cancel, took {elapsed:.1f}s"
 
 
 def test_live_run_terminal_destructive_command_needs_consent():
