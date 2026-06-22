@@ -81,6 +81,25 @@ def test_run_workflow_disruptive_needs_consent(tmp_path, monkeypatch):
     assert res2["ok"] is True and len(stepped) == 2
 
 
+def test_type_step_without_target_uses_keyboard_type(tmp_path, monkeypatch):
+    """A 'type' step with no named field types into the FOCUSED window via raw
+    keyboard_type (the page you just opened) instead of failing on a missing target."""
+    c, wf = _controller(tmp_path, monkeypatch)
+    typed = []
+
+    class FakeTools:
+        def focus_window(self, app):
+            return None
+
+        def keyboard_type(self, text):
+            typed.append(text)
+
+    monkeypatch.setattr(c, "_live_desktop_tools", lambda: FakeTools())
+    out = c._run_workflow_step({"action": "type", "text": "hello there", "app": "Notepad"})
+    assert out["ok"] is True
+    assert typed == ["hello there"]
+
+
 def test_save_workflow_via_live_tool(tmp_path, monkeypatch):
     c, wf = _controller(tmp_path, monkeypatch)
     res = c._live_tool("save_workflow", {

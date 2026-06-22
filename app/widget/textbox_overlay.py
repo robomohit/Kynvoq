@@ -1997,9 +1997,25 @@ class OverlayController(QObject):
             except Exception:
                 pass
             return {"ok": True, "label": f"Opened {_short(name, 40)}"}
-        # click / type / press_keys / scroll / focus -> the synchronous verified path
-        # (UIA invoke/ancestor/legacy -> OCR -> grid-locate -> click), NOT the async
-        # escalation route, so steps run in order and each completes before the next.
+        if action == "type" and not target:
+            # No named field -> type into whatever's focused (the page/box you just
+            # opened or clicked into). UIA type needs a target; raw keyboard_type is the
+            # right primitive here. Focus the app first so the keystrokes land in it.
+            txt = _clean_text(step.get("text") or "")
+            if app:
+                try:
+                    tools.focus_window(app)
+                    time.sleep(0.15)
+                except Exception:
+                    pass
+            try:
+                tools.keyboard_type(txt)
+                return {"ok": True, "label": f"typed {_short(txt, 30)}"}
+            except Exception as exc:
+                return {"ok": False, "label": f"type failed ({str(exc)[:40]})"}
+        # click / type(with target) / press_keys / scroll / focus -> the synchronous
+        # verified path (UIA invoke/ancestor/legacy -> OCR -> grid-locate -> click),
+        # NOT the async route, so steps run in order and each completes before the next.
         dargs: dict[str, Any] = {"action": action}
         if target:
             dargs["query"] = target
