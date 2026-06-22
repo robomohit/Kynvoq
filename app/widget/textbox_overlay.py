@@ -1505,7 +1505,27 @@ class OverlayController(QObject):
 
     def _live_tool_display_label(self, action: str, ok: bool, output: str, data: Any) -> str:
         if not ok:
-            return _short(output or "Action failed", 120)
+            # NEVER show the raw tool output in the bubble — it's agent-facing
+            # diagnostics ("no UIA control matched 'X' Adaptive recovery plan
+            # (uia_no_match, 0.70)…"). The model still gets the full output (in the
+            # tool response) to read and explain; the user just sees a clean line.
+            target = self._live_tool_target(data)
+            fail = {
+                "click": "Couldn't click",
+                "type": "Couldn't type into",
+                "find": "Couldn't find",
+                "wait": "Couldn't find",
+                "focus_window": "Couldn't focus",
+                "wait_for_window": "Couldn't open",
+                "observe": "Couldn't read the screen",
+                "press_keys": "Shortcut didn't work",
+                "scroll": "Couldn't scroll",
+            }.get(action, "That didn't work")
+            if target and action in {
+                "click", "type", "find", "wait", "focus_window", "wait_for_window", "scroll",
+            }:
+                return _short(f"{fail} {target}", 90)
+            return fail
 
         target = self._live_tool_target(data)
         if action in {"wait_for_window", "focus_window"} and not target:

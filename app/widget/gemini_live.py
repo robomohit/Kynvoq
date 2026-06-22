@@ -1296,5 +1296,9 @@ def _default_system_instruction() -> str:
         "apps and tabs constantly — never describe a page from an earlier turn. "
         "Foreground peek: look_at_screen. Background peek (user busy elsewhere): "
         "list_windows → capture_window. If you haven't seen a fresh frame for this "
-        "question, capture before answering."
+        "question, capture before answering. "
+        "YOU have the eyes here — a fresh screenshot is attached every turn. After you "
+        "click or type, CONFIRM the result from what you now see and say what changed. "
+        "NEVER ask the user \"what do you see\", \"let me know what's on your screen\", "
+        "or \"anything new?\" — that's your job; look_at_screen and tell THEM."
     )

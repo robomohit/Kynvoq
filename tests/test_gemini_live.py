@@ -820,6 +820,25 @@ def _controller():
     return OverlayController(8000)
 
 
+def test_failed_desktop_action_label_hides_raw_diagnostics():
+    """A failed Live click/type must show a clean human label in the bubble — never
+    the raw agent-facing tool output (UIA miss + adaptive-recovery scoring)."""
+    c = _controller()
+    raw = ("no UIA control matched 'Search or create item' Adaptive recovery plan "
+           "(uia_no_match, 0.70): UIA is available, but the control wasn't found")
+    data = {"overlay": {"target": "Search or create item"}}
+
+    label = c._live_tool_display_label("click", False, raw, data)
+    assert label == "Couldn't click Search or create item"
+    # The leak we fixed: none of the internal diagnostics reach the bubble.
+    for leak in ("uia_no_match", "Adaptive recovery", "0.70", "UIA is available"):
+        assert leak not in label
+
+    # No target in data → still a clean generic line, never the raw output.
+    assert c._live_tool_display_label("type", False, raw, {}) == "Couldn't type into"
+    assert c._live_tool_display_label("observe", False, raw, {}) == "Couldn't read the screen"
+
+
 def test_live_toggle_success_resets_stale_session_state(monkeypatch):
     from app.widget import gemini_live as gl
 
