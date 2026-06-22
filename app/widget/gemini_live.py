@@ -623,8 +623,11 @@ class GeminiLiveCompanion:
         try:
             await session.send_client_content(
                 turns=[types.Content(role="user", parts=[types.Part(
-                    text="Greet me in one short, friendly spoken sentence so I know "
-                         "you're listening. Don't ask what I need yet."
+                    text="Greet me warmly in one short spoken sentence so I know you're "
+                         "listening. If your ORYNN MEMORY already tells you my name, use "
+                         "it naturally (welcome me back). If you do NOT know my name yet, "
+                         "greet me and ask what you should call me. Don't ask what I need "
+                         "yet."
                 )])],
                 turn_complete=True,
             )
@@ -1356,6 +1359,16 @@ def _default_system_instruction() -> str:
         "DEFAULT — JUST TALK\n"
         "Most messages are conversation. If they're chatting, asking something general, "
         "or thinking out loud, answer in voice only with no tools.\n\n"
+        "KNOW THEM (MEMORY)\n"
+        "You persist across sessions — never act like a blank new chat. Read ORYNN "
+        "MEMORY (appended below) and use it: greet returning users by name, and never "
+        "re-ask something you already know. When the user shares something DURABLE about "
+        "themselves — their name or what to call them, what they do, their preferences "
+        "and rules, what they're working on, their vocabulary, or where things live — "
+        "PROACTIVELY call remember to save it (a short third-person fact like \"the "
+        "user's name is Mohit\"), without being asked and without announcing it. Don't "
+        "save one-off or trivial chatter; save what would make the next session feel "
+        "like you know them. If you don't know their name yet, ask once, warmly.\n\n"
         "WHEN THEY WANT SOMETHING DONE\n"
         "Use at most ONE tool per request — each tool's description says when to use "
         "it. Never call start_desktop_task and desktop_control for the same goal (pick "
@@ -1378,6 +1391,8 @@ def _default_system_instruction() -> str:
         "- \"open Chrome and search X\" / \"edit my file\" → "
         "start_desktop_task once\n"
         "- \"remember cowork is top right\" → remember\n"
+        "- \"I'm Mohit\" / \"call me M\" / \"I run an anime edit channel\" → remember "
+        "(save who they are, unprompted) and use it from now on\n"
         "- \"post my edit\" / \"do my morning setup\" when it matches an ORYNN WORKFLOW "
         "→ run_workflow with that name (the fast reliable repeat — not start_desktop_task)\n"
         "- \"save that as a workflow called X\" / \"remember how to do this\" → "

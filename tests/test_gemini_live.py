@@ -2503,6 +2503,21 @@ def test_user_pointing_flag_tracks_the_users_words(monkeypatch):
     assert c._live_turn_points_at_cursor is False
 
 
+def test_system_prompt_personalizes_and_greets_by_name():
+    """Orynn should feel like it knows the user across sessions: greet by name, ask the
+    name on a first run, and proactively remember durable personal facts."""
+    import inspect
+    from app.widget import gemini_live as gl
+
+    prompt = gl._default_system_instruction().lower()
+    assert "orynn memory" in prompt
+    assert "proactively" in prompt and "remember" in prompt
+    assert "name" in prompt and "greet returning users by name" in prompt
+
+    greet = inspect.getsource(gl.GeminiLiveCompanion._maybe_greet).lower()
+    assert "name" in greet and "call me" in greet   # asks the name on first run
+
+
 def test_points_at_cursor_detection():
     from app.widget.textbox_overlay import _utterance_points_at_cursor as p
     # pointing -> focus on the mouse (full-monitor + ring)
