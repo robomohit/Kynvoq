@@ -2484,6 +2484,37 @@ def test_live_listening_status_does_not_overwrite_fresh_input():
     assert states[-1] == "listening"
 
 
+def test_auto_screen_fires_at_utterance_start_not_just_end(monkeypatch):
+    """The vision frame is sent as the user STARTS speaking (one per utterance), so it
+    reaches the model before end-of-turn — not raced at 'finished' (the 'read the news
+    -> made up storms, right on retry' bug)."""
+    import app.widget.textbox_overlay as tbo
+
+    monkeypatch.setattr(tbo, "_live_auto_screen_mode", lambda: "always")
+
+    class _ImmediateThread:
+        def __init__(self, target=None, args=(), daemon=None, **kw):
+            self._t, self._a = target, args
+
+        def start(self):
+            self._t(*self._a)
+
+    monkeypatch.setattr(tbo.threading, "Thread", _ImmediateThread)
+
+    c = _controller()
+    calls = []
+    monkeypatch.setattr(c, "_maybe_auto_screen_for_live_utterance", lambda u: calls.append(u))
+
+    c._live_input_transcript("read me", False)          # first chunk -> fire EARLY
+    assert len(calls) == 1
+    c._live_input_transcript("read me the news", False)  # same utterance -> no re-fire
+    assert len(calls) == 1
+    c._live_input_transcript("read me the news", True)   # finished -> still one
+    assert len(calls) == 1
+    c._live_input_transcript("what time is it", False)   # NEW utterance -> fires again
+    assert len(calls) == 2
+
+
 def test_live_input_transcript_resets_the_reply_buffer():
     c = _controller()
     c._live_output_transcript("half a sen", False)  # a reply got interrupted

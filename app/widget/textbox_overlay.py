@@ -693,6 +693,9 @@ class OverlayController(QObject):
         self._live_input_done = True
         self._live_reply_buffer = ""
         self._live_reply_done = True
+        # One auto-screen frame per utterance — sent as the user STARTS speaking so it
+        # reaches the model before end-of-turn (not racing its reply).
+        self._live_turn_auto_screened = False
         self._label_protect_until = 0.0
         self._label_protect_source = ""
         # Last text actually painted + when, so an unchanged label can't repaint and
@@ -1254,17 +1257,32 @@ class OverlayController(QObject):
         if self._live_input_done:
             self._live_input_buffer = ""
             self._live_input_done = False
+            self._live_turn_auto_screened = False   # new utterance -> one fresh frame
         self._live_input_buffer = _merge_streamed_text(self._live_input_buffer, chunk)
         # The bubble is Gemini Live's CONVERSATION (it's the front desk) — do NOT echo
         # the user's own words back at them ("Hearing: hi" / "Heard: …"). That read as
         # robotic and redundant. Keep the listening cue + the buffer (for auto-screen
         # intent); the bubble stays on Live's reply, which is what the user came for.
         self.cursorStateRequested.emit("listening")
+        # In always-mode, capture+send the fresh frame as soon as the user STARTS
+        # speaking, so it's on the wire BEFORE end-of-turn instead of racing the model's
+        # reply — the "read the news -> made up storms, correct on retry" bug came from
+        # firing this only at end-of-turn, by which point the model is already answering.
+        if not self._live_turn_auto_screened and _live_auto_screen_mode() == "always":
+            self._live_turn_auto_screened = True
+            threading.Thread(
+                target=self._maybe_auto_screen_for_live_utterance,
+                args=(self._live_input_buffer,),
+                daemon=True,
+            ).start()
         if finished:
             self._live_input_done = True
             self._live_reply_done = True
             utterance = self._live_input_buffer.strip()
-            if utterance:
+            # intent-mode (or a fallback if the early send didn't run) screens here, now
+            # that the full utterance text is available for intent matching.
+            if utterance and not self._live_turn_auto_screened:
+                self._live_turn_auto_screened = True
                 threading.Thread(
                     target=self._maybe_auto_screen_for_live_utterance,
                     args=(utterance,),
