@@ -623,11 +623,14 @@ class GeminiLiveCompanion:
         try:
             await session.send_client_content(
                 turns=[types.Content(role="user", parts=[types.Part(
-                    text="Greet me warmly in one short spoken sentence so I know you're "
+                    text="Greet me in a warm, natural SPOKEN voice so I know you're "
                          "listening. If your ORYNN MEMORY already tells you my name, use "
-                         "it naturally (welcome me back). If you do NOT know my name yet, "
-                         "greet me and ask what you should call me. Don't ask what I need "
-                         "yet."
+                         "it (welcome me back). If your ORYNN MEMORY is EMPTY — you know "
+                         "nothing about me yet, so this is our first meeting — briefly "
+                         "introduce yourself: you're Orynn, you can see my screen and do "
+                         "things on my PC just by voice, and ask what you should call me. "
+                         "Otherwise just greet me warmly and ask my name. Keep it to one "
+                         "or two short sentences; don't ask what I need yet."
                 )])],
                 turn_complete=True,
             )

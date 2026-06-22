@@ -981,20 +981,26 @@ class OverlayController(QObject):
         try:
             import keyboard
 
-            self._ptt_combo = (os.getenv("ORYNN_PTT_KEY") or "ctrl+shift+space").strip()
-            # Press starts recording; a watcher thread detects release (combo
-            # trigger_on_release is unreliable in the keyboard lib, so we poll).
-            keyboard.add_hotkey(self._ptt_combo, self._ptt_start)
-            # Backwards-compatible tap-to-talk (records until silence).
-            keyboard.add_hotkey("ctrl+shift+m", self.listenRequested.emit)
-            # Real-time Gemini Live conversation (toggle on/off).
+            # Gemini Live is the front desk — the ONE voice interface. The legacy
+            # push-to-talk (Ctrl+Shift+Space) and tap-to-talk (Ctrl+Shift+M) STT paths
+            # are off by default now; opt back in with ORYNN_ENABLE_PTT=1 (kept as a
+            # fallback for when Live's cloud isn't reachable).
+            ptt_on = (os.getenv("ORYNN_ENABLE_PTT") or "0").strip().lower() in (
+                "1", "true", "yes", "on")
+            if ptt_on:
+                self._ptt_combo = (os.getenv("ORYNN_PTT_KEY") or "ctrl+shift+space").strip()
+                # Press starts recording; a watcher thread detects release.
+                keyboard.add_hotkey(self._ptt_combo, self._ptt_start)
+                keyboard.add_hotkey("ctrl+shift+m", self.listenRequested.emit)
+            # Real-time Gemini Live conversation (toggle on/off) — the primary interface.
             self._live_combo = (os.getenv("ORYNN_LIVE_KEY") or "ctrl+shift+l").strip()
             keyboard.add_hotkey(self._live_combo, self._toggle_live)
             # Emergency stop: instantly kill whatever the agent is doing.
             self._stop_combo = (os.getenv("ORYNN_STOP_KEY") or "ctrl+shift+x").strip()
             keyboard.add_hotkey(self._stop_combo, self._stop_all)
-            print(f"[clicky] push-to-talk: hold {self._ptt_combo} (tap Ctrl+Shift+M); "
-                  f"live: {self._live_combo}; stop: {self._stop_combo}", flush=True)
+            extra = f"; push-to-talk {self._ptt_combo}" if ptt_on else ""
+            print(f"[clicky] Gemini Live: {self._live_combo}; stop: {self._stop_combo}{extra}",
+                  flush=True)
             return True
         except Exception as exc:
             print(f"[clicky] voice hotkey unavailable: {exc}", flush=True)
