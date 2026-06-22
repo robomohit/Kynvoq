@@ -2338,6 +2338,7 @@ class AgentService:
                 # Did the most recent UI-changing action fail / fail to verify? Used so a
                 # "finish" right after a broken click/type reports complete:false (#3).
                 _last_mutation_unverified = False
+                _unrecovered_desktop_failure = False
                 # Finish gate: successful desktop interactions seen so far, and
                 # whether we already bounced one unearned finish (bounce once,
                 # then trust the model — never deadlock the loop).
@@ -3125,6 +3126,10 @@ class AgentService:
                         _res_data = getattr(res, "data", None)
                         _verified = _res_data.get("verified") if isinstance(_res_data, dict) else None
                         _last_mutation_unverified = (not res.ok) or (_verified is False)
+                        if (not res.ok) or (_verified is False):
+                            _unrecovered_desktop_failure = True
+                        elif res.ok and _verified is not False:
+                            _unrecovered_desktop_failure = False
                     
                     # ── Populate write cache so subsequent reads are free ──
                     if act.type == AT.write_file and res.ok:
@@ -3249,7 +3254,7 @@ class AgentService:
                         # or its verification was contradicted, don't claim success — the
                         # model is finishing over a broken step. Report it so Live/the
                         # dashboard say what really happened instead of a false "done".
-                        if _last_mutation_unverified:
+                        if _last_mutation_unverified or _unrecovered_desktop_failure:
                             honest = (res.output or "").strip()
                             reason = (honest + " " if honest else "") + (
                                 "(Note: the last action didn't verify — the change may "

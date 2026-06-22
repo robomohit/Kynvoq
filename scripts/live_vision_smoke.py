@@ -36,20 +36,25 @@ QUESTION = "Look at this screenshot and tell me in one short sentence what app o
 
 
 def _capture_jpeg() -> bytes:
-    """Same capture look_at_screen uses (mss → JPEG q65, capped 1280x800)."""
+    """Same capture path as Live auto-screen / look_at_screen."""
+    from app.widget.textbox_overlay import OverlayController, _live_vision_jpeg_settings
+    data, _, _ = OverlayController._capture_vision_jpeg()
+    if data:
+        return data
+    # Fallback for smoke script if mss unavailable
     import io
     import mss
     from PIL import Image
-    # FULL primary screen, scaled — the same capture _live_look_at_screen now uses
-    # (a top-left crop at JPEG-65 made the model hallucinate).
+    quality, max_edge = _live_vision_jpeg_settings()
     with mss.mss() as sct:
         mons = sct.monitors
         mon = mons[1] if len(mons) > 1 else mons[0]
         shot = sct.grab(mon)
         img = Image.frombytes("RGB", shot.size, shot.rgb)
-        img.thumbnail((1920, 1920))
+        if max_edge > 0 and max(img.size) > max_edge:
+            img.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=92)
+        img.save(buf, format="JPEG", quality=quality, subsampling=0, optimize=False)
         return buf.getvalue()
 
 

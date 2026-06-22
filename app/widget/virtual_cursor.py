@@ -195,6 +195,7 @@ class VirtualCursorOverlay(QWidget):
         self._action_label_set_ms = 0
         self._ACTION_LABEL_FADE_MS = 200
         self._ACTION_LABEL_HOLD_MS = 1100  # show for 1.1s after last update
+        self._action_label_hold_ms = self._ACTION_LABEL_HOLD_MS
         self._companion_enabled = False
         self._companion_label = ""
         self._companion_label_set_ms = 0
@@ -409,6 +410,7 @@ class VirtualCursorOverlay(QWidget):
     def _set_action_label(self, label: str) -> None:
         self._action_label_text = (label or "").strip()
         self._action_label_set_ms = self._now_ms()
+        self._action_label_hold_ms = self._ACTION_LABEL_HOLD_MS
 
     # ── internal ────────────────────────────────────────────────────────
     def _now_ms(self) -> int:
@@ -436,7 +438,7 @@ class VirtualCursorOverlay(QWidget):
             return True
         if self._action_label_text and (
                 now_ms - self._action_label_set_ms) < (
-                    self._ACTION_LABEL_HOLD_MS + self._ACTION_LABEL_FADE_MS):
+                    self._action_label_hold_ms + self._ACTION_LABEL_FADE_MS):
             return True
         if now_ms < self._cursor_visible_until:
             return True
@@ -639,7 +641,7 @@ class VirtualCursorOverlay(QWidget):
 
         label_alive = (self._action_label_text and
                        now_ms - self._action_label_set_ms <
-                       (self._ACTION_LABEL_HOLD_MS
+                       (self._action_label_hold_ms
                         + self._ACTION_LABEL_FADE_MS))
 
         # Repaint ONLY when something is actually moving/animating. The overlay
@@ -728,14 +730,14 @@ class VirtualCursorOverlay(QWidget):
 
         # 3b. UIA spotlights — disabled per user request
 
-        # 4. Cursor pointer and action label — disabled per user request to only show ripple
+        # 4. Companion bubble + Clicky task-progress pill follow the cursor.
         now = self._now_ms()
         if self._companion_enabled and self._companion_display_pos.x() >= 0:
             has_target_overlay = bool(self._spotlights or self._ripples
                                       or self._carets)
+            cx = self._companion_display_pos.x()
+            cy = self._companion_display_pos.y()
             if not has_target_overlay:
-                cx = self._companion_display_pos.x()
-                cy = self._companion_display_pos.y()
                 # The listening/thinking indicators are drawn INSIDE the bubble
                 # (in the status-dot slot) by _paint_companion_bubble, so they
                 # read as one tidy element instead of a circle floating off the
@@ -1067,7 +1069,7 @@ class VirtualCursorOverlay(QWidget):
         if not self._action_label_text:
             return
         age = now_ms - self._action_label_set_ms
-        hold = self._ACTION_LABEL_HOLD_MS
+        hold = self._action_label_hold_ms
         fade = self._ACTION_LABEL_FADE_MS
         if age >= hold + fade:
             return

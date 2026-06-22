@@ -57,6 +57,8 @@ def test_function_declarations_cover_desktop_tools():
         "stop_current_task",
         "get_companion_status",
         "look_at_screen",
+        "list_windows",
+        "capture_window",
         "web_search",
         "run_terminal",
         "remember",
@@ -76,6 +78,12 @@ def test_function_declarations_cover_desktop_tools():
         desktop_schema["properties"]["action"]["enum"]
     )
 
+    # Routing mutual-exclusion lives in declarations (Google: tool descriptions drive selection).
+    dc_desc = desktop.description.lower()
+    task_desc = start.description.lower()
+    assert "do not also call start_desktop_task" in dc_desc
+    assert "do not also call desktop_control" in task_desc
+
 
 def _config_tool_names(cfg) -> tuple[set[str], bool]:
     fn_names: set[str] = set()
@@ -93,6 +101,8 @@ def test_live_config_exposes_tools_audio_and_transcription(monkeypatch):
     from app.widget import gemini_live as gl
 
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.delenv("GEMINI_LIVE_THINKING", raising=False)
+    monkeypatch.delenv("GEMINI_LIVE_THINKING_LEVEL", raising=False)
     comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
     cfg = comp._live_config(types)
 
@@ -101,10 +111,22 @@ def test_live_config_exposes_tools_audio_and_transcription(monkeypatch):
     assert cfg.input_audio_transcription is not None
     assert cfg.output_audio_transcription is not None
     assert cfg.system_instruction  # a personality/safety prompt is attached
+    assert cfg.thinking_config.thinking_level == types.ThinkingLevel.MEDIUM
 
     # Our local desktop function tools are always wired in.
     fn_names, _ = _config_tool_names(cfg)
-    assert {"desktop_control", "start_desktop_task", "stop_current_task"} <= fn_names
+    assert {"desktop_control", "start_desktop_task", "stop_current_task", "list_windows", "capture_window"} <= fn_names
+
+
+def test_live_config_thinking_level_env(monkeypatch):
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GEMINI_LIVE_THINKING_LEVEL", "high")
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    cfg = comp._live_config(types)
+    assert cfg.thinking_config.thinking_level == types.ThinkingLevel.HIGH
 
 
 def test_live_config_google_search_is_opt_in(monkeypatch):
@@ -479,7 +501,11 @@ def test_handle_message_turn_complete_finalizes_input_turn():
     from app.widget import gemini_live as gl
 
     inputs = []
-    cbs = gl.GeminiLiveCallbacks(on_input_transcript=lambda t, fin: inputs.append((t, fin)))
+    turns = []
+    cbs = gl.GeminiLiveCallbacks(
+        on_input_transcript=lambda t, fin: inputs.append((t, fin)),
+        on_turn_complete=lambda s: turns.append(s),
+    )
 
     class FakeContent:
         input_transcription = None
@@ -494,6 +520,287 @@ def test_handle_message_turn_complete_finalizes_input_turn():
     comp = gl.GeminiLiveCompanion(cbs)
     asyncio.run(comp._handle_message(object(), FakeMessage(), None, types))
     assert ("", True) in inputs  # input turn was finalized at the boundary
+    assert turns == [""]
+
+
+def test_handle_message_rejects_second_desktop_tool_in_batch():
+    """Only one of desktop_control / start_desktop_task may run per tool-call batch."""
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    executed = []
+
+    def handler(name, args):
+        executed.append(name)
+        return {"ok": True, "tool": name}
+
+    cbs = gl.GeminiLiveCallbacks(on_tool=handler)
+    comp = gl.GeminiLiveCompanion(cbs)
+
+    class FakeCall:
+        def __init__(self, name, call_id):
+            self.name = name
+            self.id = call_id
+            self.args = {"action": "click", "query": "OK"} if name == "desktop_control" else {"goal": "open x"}
+
+    class FakeToolCall:
+        function_calls = [
+            FakeCall("desktop_control", "1"),
+            FakeCall("start_desktop_task", "2"),
+        ]
+
+    class FakeMessage:
+        server_content = None
+        tool_call = FakeToolCall()
+
+    sent = []
+
+    class FakeSession:
+        async def send_tool_response(self, function_responses):
+            sent.append(function_responses)
+
+    asyncio.run(comp._handle_message(FakeSession(), FakeMessage(), None, types))
+    assert executed == ["desktop_control"]
+    assert len(sent) == 1
+    responses = sent[0]
+    assert responses[0].response.get("ok") is True
+    assert responses[1].response.get("ok") is False
+    assert "only one desktop action" in responses[1].response.get("message", "").lower()
+
+
+def test_parse_single_click_goal():
+    from app.widget import textbox_overlay as tbo
+
+    assert tbo._parse_single_click_goal('Click the "Usage" control in Settings.') == {
+        "action": "click",
+        "query": "Usage",
+        "app": "Settings",
+    }
+    assert tbo._parse_single_click_goal('Click "New Agent" button in Cursor') == {
+        "action": "click",
+        "query": "New Agent",
+        "app": "Cursor",
+    }
+    assert tbo._parse_single_click_goal("Click Usage then type hello") is None
+    assert tbo._parse_single_click_goal("Open Settings and click Usage") is None
+
+
+def test_start_desktop_task_single_click_redirects_to_fast_path():
+    """start_desktop_task goals that are really one click should hit desktop_control."""
+    from app.models import ToolResult
+
+    clicked = []
+
+    class FakeTools:
+        def uia_click(self, query, app="", allow_pixel_fallback=True):
+            clicked.append((query, app))
+            return ToolResult(ok=True, output="Activated", data={"method": "invoke_pattern"})
+
+    class FakeClient:
+        def request(self, *a, **k):
+            raise AssertionError("single click must not spawn agent task")
+
+    c = _controller()
+    c.client = FakeClient()
+    c._desktop_tools = FakeTools()
+
+    res = c._live_tool(
+        "start_desktop_task",
+        {"goal": 'Click the "Usage" control in Settings.'},
+    )
+    assert res["ok"] is True
+    assert clicked == [("Usage", "Settings")]
+    assert c._active_task_running is False
+
+
+def test_resolve_hwnd_skips_taskbar_picks_largest_app(monkeypatch):
+    from app import providers as prov
+
+    monkeypatch.delenv("ORYNN_LIVE_SCREEN_CAPTURE", raising=False)
+    monkeypatch.setattr(prov, "_minimize_orynn_owned_windows", lambda: None)
+    monkeypatch.setattr(prov, "_is_orynn_owned_hwnd", lambda h: False)
+    monkeypatch.setattr(prov, "list_open_windows", lambda **kw: [
+        {"hwnd": 42, "title": "Cursor", "minimized": False},
+        {"hwnd": 43, "title": "Notepad", "minimized": False},
+    ])
+
+    def fake_area(hwnd):
+        return {42: 900 * 700, 43: 400 * 300}.get(hwnd, 0)
+
+    monkeypatch.setattr(prov, "_hwnd_client_area", fake_area)
+
+    class FG:
+        calls = 0
+
+        @staticmethod
+        def GetForegroundWindow():
+            FG.calls += 1
+            return 1
+
+        @staticmethod
+        def GetWindowText(hwnd):
+            return {42: "Cursor", 43: "Notepad"}.get(hwnd, "")
+
+        @staticmethod
+        def IsWindow(hwnd):
+            return True
+
+        @staticmethod
+        def GetClassName(hwnd):
+            return "Shell_TrayWnd" if hwnd == 1 else "Chrome_WidgetWin_1"
+
+    monkeypatch.setitem(__import__("sys").modules, "win32gui", FG)
+    hwnd, title, mode = prov.resolve_hwnd_for_live_vision()
+    assert hwnd == 42
+    assert title == "Cursor"
+    assert mode == "window"
+
+
+def test_is_shell_or_junk_hwnd_detects_shell_classes(monkeypatch):
+    from app import providers as prov
+
+    assert prov._is_shell_or_junk_hwnd(0) is True
+
+    class FG:
+        @staticmethod
+        def IsWindow(hwnd):
+            return True
+
+        @staticmethod
+        def GetClassName(hwnd):
+            return "Shell_TrayWnd"
+
+        @staticmethod
+        def GetWindowText(hwnd):
+            return "Taskbar"
+
+        @staticmethod
+        def GetWindowRect(hwnd):
+            return (0, 0, 1920, 48)
+
+    monkeypatch.setitem(__import__("sys").modules, "win32gui", FG)
+    assert prov._is_shell_or_junk_hwnd(1) is True
+
+
+def test_capture_vision_jpeg_uses_printwindow_when_window_mode(monkeypatch):
+    from PIL import Image
+    from app.widget import textbox_overlay as tbo
+
+    img = Image.new("RGB", (800, 600), color=(10, 20, 30))
+    monkeypatch.setenv("ORYNN_LIVE_SCREEN_CAPTURE", "window")
+    monkeypatch.setattr(
+        "app.providers.resolve_hwnd_for_live_vision",
+        lambda: (12345, "TikTok", "window"),
+    )
+    monkeypatch.setattr("app.providers._capture_hwnd_image", lambda hwnd, max_edge=0: img)
+
+    data, title, mode = tbo.OverlayController._capture_vision_jpeg()
+    assert data is not None
+    assert len(data) > 100
+    assert title == "TikTok"
+    assert mode == "window"
+
+
+def test_list_windows_returns_titles_without_hwnd(monkeypatch):
+    from app.widget import textbox_overlay as tbo
+
+    monkeypatch.setattr(
+        "app.providers.list_open_windows",
+        lambda **kw: [
+            {"hwnd": 99, "title": "Cursor", "minimized": False},
+            {"hwnd": 100, "title": "Counter-Strike 2", "minimized": False},
+        ],
+    )
+    c = _controller()
+    res = c._live_tool("list_windows", {})
+    assert res["ok"] is True
+    assert res["count"] == 2
+    assert res["windows"] == [
+        {"title": "Cursor", "minimized": False},
+        {"title": "Counter-Strike 2", "minimized": False},
+    ]
+    assert "hwnd" not in str(res["windows"])
+
+
+def test_capture_window_peeks_background_window(monkeypatch):
+    from PIL import Image
+    from app.widget import textbox_overlay as tbo
+
+    img = Image.new("RGB", (640, 480), color=(1, 2, 3))
+    sent = []
+
+    class FakeLive:
+        def send_screen_image(self, data, wait=False):
+            sent.append(len(data))
+            return True
+
+        def send_context_update(self, note):
+            pass
+
+    monkeypatch.setattr(
+        tbo.OverlayController,
+        "_capture_window_jpeg",
+        staticmethod(lambda title, index=0: (b"jpeg-bytes", "Cursor - project")),
+    )
+    c = _controller()
+    c._live = FakeLive()
+    res = c._live_tool(
+        "capture_window",
+        {"title": "Cursor", "question": "is the agent done?"},
+    )
+    assert res["ok"] is True
+    assert res["window"] == "Cursor - project"
+    assert sent == [len(b"jpeg-bytes")]
+
+
+def test_send_task_update_uses_proactive_prefix():
+    from app.widget import gemini_live as gl
+
+    notes = []
+    comp = gl.GeminiLiveCompanion(
+        gl.GeminiLiveCallbacks(),
+    )
+    comp._send_client_note = lambda text: notes.append(text)
+    comp.send_task_update("Task finished.")
+    assert len(notes) == 1
+    assert notes[0].startswith(gl.LIVE_PROACTIVE_PREFIX)
+    assert "Task finished." in notes[0]
+
+
+def test_start_desktop_task_notifies_live_on_background_start(monkeypatch):
+    from app.models import ToolResult
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {"ok": True}
+            if path.startswith("/api/tasks/"):
+                return {"status": "running"}
+            return {}
+
+    class FakeLive:
+        def __init__(self):
+            self.notes = []
+
+        def is_running(self):
+            return True
+
+        def send_task_update(self, text):
+            self.notes.append(text)
+
+    monkeypatch.setenv("ORYNN_LIVE_TASK_WAIT", "0")
+    c = _controller()
+    c.client = FakeClient()
+    fl = FakeLive()
+    c._live = fl
+    c._await_task_outcome = lambda tid, goal: {
+        "ok": True, "status": "running", "task_id": tid, "message": "running",
+    }
+    res = c._live_tool("start_desktop_task", {"goal": "fix the bug in Cursor"})
+    assert res["ok"] is True
+    assert any("fix the bug" in n for n in fl.notes)
 
 
 def _controller():
@@ -1373,9 +1680,10 @@ class _FakeLive:
         self.updates.append(text)
 
 
-def test_live_narration_speaks_humanized_milestone():
+def test_live_narration_speaks_humanized_milestone(monkeypatch):
     """A milestone from a Live-launched task is pushed into the conversation as a
     short, humanized spoken note (brief §6)."""
+    monkeypatch.setenv("ORYNN_LIVE_NARRATE_INTERVAL", "3.5")
     c = _controller()
     live = _FakeLive()
     c._live = live
@@ -1392,7 +1700,8 @@ def test_live_narration_speaks_humanized_milestone():
     assert "uia_click" not in live.updates[0]  # never a raw tool name
 
 
-def test_live_narration_throttles_rapid_milestones():
+def test_live_narration_throttles_rapid_milestones(monkeypatch):
+    monkeypatch.setenv("ORYNN_LIVE_NARRATE_INTERVAL", "3.5")
     c = _controller()
     live = _FakeLive()
     c._live = live
@@ -1441,7 +1750,8 @@ def test_live_narration_skips_terminal_events():
     assert live.updates == []
 
 
-def test_live_narration_never_echoes_typed_text():
+def test_live_narration_never_echoes_typed_text(monkeypatch):
+    monkeypatch.setenv("ORYNN_LIVE_NARRATE_INTERVAL", "3.5")
     c = _controller()
     live = _FakeLive()
     c._live = live
@@ -1456,6 +1766,24 @@ def test_live_narration_never_echoes_typed_text():
     assert len(live.updates) == 1
     assert "secret" not in live.updates[0]
     assert "typing that in" in live.updates[0]
+
+
+def test_live_narration_on_by_default(monkeypatch):
+    """Mid-task milestones push proactive spoken updates by default."""
+    monkeypatch.delenv("ORYNN_LIVE_NARRATE_INTERVAL", raising=False)
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {"t1": "read my file"}
+    c._live_narration_last = 0.0
+
+    c._maybe_narrate_to_live({
+        "type": "action_start", "task_id": "t1",
+        "action_type": "wait_for_window", "args_summary": "Notepad",
+    })
+
+    assert len(live.updates) == 1
+    assert "opening Notepad" in live.updates[0]
 
 
 def test_live_narration_disabled_with_zero_interval(monkeypatch):
@@ -1611,15 +1939,30 @@ def test_live_remember_saves_fact_to_backend():
     class FakeClient:
         def request(self, method, path, data=None, timeout=4.0, **kw):
             calls.append((method, path, data))
+            if path == "/api/memory/facts?limit=14":
+                return {"prompt_block": "ORYNN MEMORY\n- cowork is top-right"}
             return {"ok": True, "fact": {"id": "k1"}}
+
+    class FakeLive:
+        def __init__(self):
+            self.notes = []
+
+        def is_running(self):
+            return True
+
+        def send_context_update(self, text):
+            self.notes.append(text)
 
     c = _controller()
     c.client = FakeClient()
+    c._live = FakeLive()
     res = c._live_tool("remember", {"fact": "cowork is the top-right button", "app": "dashboard"})
     assert res["ok"] is True
     m, p, d = calls[0]
     assert m == "POST" and p == "/api/memory/facts"
     assert d["text"] == "cowork is the top-right button" and d["app"] == "dashboard"
+    assert c._knowledge_block_cache.startswith("ORYNN MEMORY")
+    assert c._live.notes and "cowork is top-right" in c._live.notes[0]
 
 
 def test_live_remember_requires_fact():
@@ -1640,8 +1983,27 @@ def test_live_forget_calls_backend():
     assert res["ok"] is True and res["removed"] == 2
 
 
+def test_live_system_prompt_voice_first_with_examples():
+    """System prompt: Clicky-style voice + Google few-shot examples; routing detail
+    lives in tool declarations, not a numbered ladder."""
+    from app.widget.gemini_live import _default_system_instruction
+
+    prompt = _default_system_instruction()
+    lower = prompt.lower()
+    assert prompt.startswith("You are Orynn")
+    assert "write for the ear" in lower
+    assert "never say" in lower and "simply" in lower
+    assert "just talk" in lower
+    assert "at most one tool" in lower
+    assert "never call start_desktop_task and desktop_control" in lower
+    assert "examples:" in lower
+    assert "open notepad" in lower
+    assert "look_at_screen first" not in lower
+    assert "orynn memory" in lower
+    assert "pick exactly one path" not in lower
+
+
 def test_live_knowledge_block_injected_into_config(monkeypatch):
-    """Known facts are appended to the Live system instruction on connect."""
     from google.genai import types
     from app.widget import gemini_live as gl
 
@@ -1807,6 +2169,40 @@ def test_live_tool_start_desktop_task_blocks_on_preflight():
     res = c._live_tool("start_desktop_task", {"goal": "open notepad"})
     assert res["ok"] is False
     assert "setup" in res["message"].lower()
+
+
+def test_live_task_progress_tracked_without_overlay_pill():
+    """Subagent step tracking is internal (get_companion_status) — no extra UI."""
+    c = _controller()
+    c._live_task_ids["clicky-abc"] = "click Save"
+    c._update_live_task_progress({
+        "task_id": "clicky-abc",
+        "type": "action_start",
+        "action_type": "uia_click",
+        "args_summary": "Save",
+    })
+    assert c._live_task_progress["clicky-abc"]["step"] == "clicking Save"
+
+
+def test_get_companion_status_includes_subagent_progress():
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/active-tasks":
+                return {"tasks": [{"id": "clicky-abc"}]}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    c._live_task_ids["clicky-abc"] = "open notepad"
+    c._live_task_progress["clicky-abc"] = {
+        "task_id": "clicky-abc",
+        "goal": "open notepad",
+        "step": "switching windows",
+        "updated_at": 1.0,
+    }
+    status = c._live_tool("get_companion_status", {})
+    assert status["progress"]["step"] == "switching windows"
+    assert status["progress"]["goal"] == "open notepad"
 
 
 def test_live_tool_stop_and_status_route_correctly():
@@ -2508,33 +2904,130 @@ def test_live_desktop_control_scroll_routes_to_tools():
     assert ft.scrolled == -25
 
 
+def test_live_vision_jpeg_defaults_high_quality(monkeypatch):
+    from app.widget import textbox_overlay as tbo
+    monkeypatch.delenv("ORYNN_LIVE_SCREEN_QUALITY", raising=False)
+    monkeypatch.delenv("ORYNN_LIVE_SCREEN_MAX_EDGE", raising=False)
+    quality, max_edge = tbo._live_vision_jpeg_settings()
+    assert quality == 98
+    assert max_edge == 0  # native resolution, no downscale
+
+
+def test_utterance_wants_live_screen():
+    from app.widget import textbox_overlay as tbo
+    assert tbo._utterance_wants_live_screen("what's on my screen")
+    assert tbo._utterance_wants_live_screen("look at my screen right now")
+    assert tbo._utterance_wants_live_screen("what tab am I on")
+    assert not tbo._utterance_wants_live_screen("open notepad")
+    assert not tbo._utterance_wants_live_screen("thanks")
+
+
+def test_auto_screen_default_is_always(monkeypatch):
+    from app.widget import textbox_overlay as tbo
+    monkeypatch.delenv("ORYNN_LIVE_AUTO_SCREEN", raising=False)
+    assert tbo._live_auto_screen_mode() == "always"
+
+
+def test_auto_screen_fires_on_chitchat_when_always(monkeypatch):
+    from app.widget import textbox_overlay as tbo
+    monkeypatch.delenv("ORYNN_LIVE_AUTO_SCREEN", raising=False)
+    assert tbo._live_auto_screen_mode() == "always"
+    c = _controller()
+    pushed = []
+    c._push_live_screen_frame = lambda q: pushed.append(q) or (True, "TikTok")
+    c._live = type("L", (), {"is_running": lambda self: True})()
+    c._maybe_auto_screen_for_live_utterance("how are you")
+    assert pushed == ["how are you"]
+
+
+def test_auto_screen_fires_on_screen_question(monkeypatch):
+    from app.widget import textbox_overlay as tbo
+    monkeypatch.setenv("ORYNN_LIVE_AUTO_SCREEN", "intent")
+    c = _controller()
+    pushed = []
+    c._push_live_screen_frame = lambda q: pushed.append(q) or (True, "TikTok")
+    c._live = type("L", (), {"is_running": lambda self: True})()
+    c._maybe_auto_screen_for_live_utterance("what's on my screen")
+    assert pushed == ["what's on my screen"]
+
+
+def test_auto_screen_skipped_for_chitchat(monkeypatch):
+    from app.widget import textbox_overlay as tbo
+    monkeypatch.setenv("ORYNN_LIVE_AUTO_SCREEN", "intent")
+    c = _controller()
+    c._push_live_screen_frame = lambda q: (_ for _ in ()).throw(AssertionError("should not push"))
+    c._live = type("L", (), {"is_running": lambda self: True})()
+    c._maybe_auto_screen_for_live_utterance("how are you")
+
+
 def test_live_look_at_screen_sends_screenshot_to_vision(monkeypatch):
     c = _controller()
-    # look_at_screen uses a dedicated full-screen vision capture; stub it (real mss
-    # screen capture isn't available headless).
-    monkeypatch.setattr(c, "_capture_vision_jpeg", lambda: b"IMGDATA")
+    pushed = []
+
+    def fake_push(question=""):
+        pushed.append(question)
+        return True, "Chrome"
+
+    monkeypatch.setattr(c, "_push_live_screen_frame", fake_push)
 
     class FakeLive:
-        def __init__(self):
-            self.img = None
-            self.call_count = 0
-
         def is_running(self):
             return True
 
-        def send_screen_image(self, data):
-            self.img = data
-            self.call_count += 1
+        def send_screen_image(self, *_a, **_k):
             return True
 
-    fl = FakeLive()
-    c._live = fl
+    c._live = FakeLive()
     res = c._live_tool("look_at_screen", {"question": "what is this error"})
     assert res["ok"] is True
-    assert fl.img == b"IMGDATA"               # the real screenshot bytes were sent (frame only)
-    assert fl.call_count == 1
-    # The user's question rides in the FunctionResponse — the single describe-prompt.
+    assert pushed == ["what is this error"]
     assert "what is this error" in res["message"]
+    assert "earlier turns" in res["message"]
+
+
+def test_capture_live_task_outcome_honors_complete_false():
+    c = _controller()
+    live = _FakeLive()
+    c._live = live
+    c._live_task_ids = {"clicky-bad": "open the file"}
+    c._active_task_running = True
+
+    c._capture_live_task_outcome({
+        "type": "done",
+        "task_id": "clicky-bad",
+        "complete": False,
+        "reason": "Timed out waiting for Notepad.",
+    })
+
+    assert c._active_task_running is False
+    assert c._last_task_result["ok"] is False
+    assert len(live.updates) == 1
+    assert "FAILED" in live.updates[0]
+    assert "finished" not in live.updates[0].lower() or "do not" in live.updates[0].lower()
+
+
+def test_await_task_outcome_honors_complete_false_from_api():
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {}
+            if path.startswith("/api/tasks/"):
+                return {
+                    "status": "done",
+                    "complete": False,
+                    "reason": "Window never appeared.",
+                }
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    res = c._live_tool("start_desktop_task", {"goal": "open notepad"})
+
+    assert res["ok"] is False
+    assert "FAILED" in res["message"] or "failed" in res["message"].lower()
+    assert "do not" in res["message"].lower()
 
 
 def test_capture_live_task_outcome_notifies_live_proactively():

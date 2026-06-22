@@ -560,11 +560,27 @@ def _task_is_server_running(task_id: str) -> bool:
     return bool(task and not task.done())
 
 
+def _task_complete_from_log(task_id: str, status: str) -> bool:
+    """Read the last done event so Live/poll can distinguish complete:true vs false."""
+    if status in {"failed", "error", "cancelled"}:
+        return False
+    try:
+        events = log_emitter.read_log(task_id)
+    except Exception:
+        events = []
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("type") == "done":
+            return event.get("complete") is not False
+    return status in {"done", "complete"}
+
+
 def _serialize_task_record(record: TaskRecord) -> dict:
     payload = record.model_dump()
     terminal = _is_terminal_status(record.status)
     payload["paused"] = False if terminal else bool(record.paused or record.id in service._paused_tasks)
     payload["server_running"] = _task_is_server_running(record.id)
+    if terminal:
+        payload["complete"] = _task_complete_from_log(record.id, record.status)
     
     is_queued = any(spec["task_id"] == record.id for spec in _queued_task_specs)
     if not terminal:

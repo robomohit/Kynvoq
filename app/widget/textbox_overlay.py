@@ -149,10 +149,111 @@ LIVE_TOOL_LABEL_HOLD_SECONDS = 1.6
 LIVE_TASK_RESULT_WAIT = 6.0
 TERMINAL_TASK_STATES = {"done", "complete", "error", "failed", "cancelled"}
 
-# Minimum gap between spoken mid-task progress notes pushed into the Live
-# conversation, so a busy task doesn't machine-gun the user with narration
-# (brief §6.4 silence rules). Override with ORYNN_LIVE_NARRATE_INTERVAL; 0 disables.
-LIVE_NARRATE_INTERVAL = 3.5
+
+def _terminal_task_succeeded(*, event_type: str = "", complete: Any = None, status: str = "") -> bool:
+    """True only when a terminal task event/record honestly succeeded."""
+    et = str(event_type or "").lower()
+    st = str(status or "").lower()
+    if et in {"error", "failed", "cancelled"} or st in {"error", "failed", "cancelled"}:
+        return False
+    if et in {"done", "complete"} or st in {"done", "complete"}:
+        return complete is not False
+    return False
+
+
+# Mid-task spoken milestones injected into Live (brief §6). Default 8s between updates;
+# set ORYNN_LIVE_NARRATE_INTERVAL=0 to disable step narration entirely.
+LIVE_NARRATE_INTERVAL = 8.0
+
+# Auto-attach a fresh screenshot during Live voice turns so the model can't answer
+# from stale conversation memory (e.g. still describing "Usage" after you switched
+# to TikTok). Default is always (fresh frame every utterance) — fine on Google AI
+# Studio Live tiers with generous TPM. Set ORYNN_LIVE_AUTO_SCREEN=intent for
+# screen-question-only capture, or off for tool-only look_at_screen.
+_LIVE_SCREEN_UTTERANCE_RE = re.compile(
+    r"\b("
+    r"what(?:'?s| is) on (?:my )?screen|"
+    r"look at (?:my )?screen|"
+    r"what am i looking at|"
+    r"what(?:'?s| is) (?:this|that) (?:page|tab|site|app|window)|"
+    r"what (?:page|tab|site|app) (?:am i|is this|are we)|"
+    r"what do you see|"
+    r"can you see (?:my )?screen|"
+    r"what does (?:this|that|it) say|"
+    r"read (?:this|that|the screen)|"
+    r"describe (?:what(?:'?s| is) on )?(?:my )?screen|"
+    r"what(?:'?s| is) (?:this|that) (?:on screen|showing)"
+    r")\b",
+    re.I,
+)
+
+
+def _live_auto_screen_mode() -> str:
+    raw = (os.getenv("ORYNN_LIVE_AUTO_SCREEN") or "always").strip().lower()
+    if raw in ("0", "false", "no", "off", "none"):
+        return "off"
+    if raw in ("intent", "questions", "smart"):
+        return "intent"
+    return "always"
+
+
+def _live_vision_jpeg_settings() -> tuple[int, int]:
+    """JPEG quality (1–100) and optional max-edge downscale (0 = native resolution)."""
+    try:
+        quality = int(os.getenv("ORYNN_LIVE_SCREEN_QUALITY") or "98")
+    except Exception:
+        quality = 98
+    quality = max(75, min(100, quality))
+    try:
+        max_edge = int(os.getenv("ORYNN_LIVE_SCREEN_MAX_EDGE") or "0")
+    except Exception:
+        max_edge = 0
+    max_edge = max(0, max_edge)
+    return quality, max_edge
+
+
+_MULTI_STEP_GOAL_RE = re.compile(
+    r"\b(then|after that|next|also|first|second|step\s+\d|\d+\.\s|;\s|,\s*then\s)",
+    re.I,
+)
+_SINGLE_CLICK_GOAL_RE = re.compile(
+    r"^click\s+(?:the\s+)?"
+    r'(?:"([^"]+)"|\'([^\']+)\'|([^"\']+?))'
+    r"(?:\s+(?:control|button|link|tab|menu(?:\s+item)?|option|item))?"
+    r"(?:\s+in\s+(.+?))?\s*\.?$",
+    re.I,
+)
+
+
+def _parse_single_click_goal(goal: str) -> dict[str, str] | None:
+    """If a start_desktop_task goal is really one click, return desktop_control args."""
+    g = _clean_text(goal)
+    if not g or not g.lower().startswith("click "):
+        return None
+    if _MULTI_STEP_GOAL_RE.search(g):
+        return None
+    m = _SINGLE_CLICK_GOAL_RE.match(g)
+    if not m:
+        return None
+    query = _clean_text(m.group(1) or m.group(2) or m.group(3) or "")
+    app = _clean_text(m.group(4) or "").rstrip(".")
+    if not query or len(query) > 80:
+        return None
+    vague = {"it", "that", "this", "there", "here", "something", "the button", "the control"}
+    if query.lower() in vague:
+        return None
+    out: dict[str, str] = {"action": "click", "query": query}
+    if app:
+        out["app"] = app
+    return out
+
+
+def _utterance_wants_live_screen(text: str) -> bool:
+    t = _clean_text(text).lower()
+    if not t:
+        return False
+    return bool(_LIVE_SCREEN_UTTERANCE_RE.search(t))
+
 
 # Disruptive / hard-to-undo intents that must get spoken user consent before Live
 # spawns an autonomous task to do them (brief §7.2): deleting, sending/submitting,
@@ -226,12 +327,9 @@ _LIVE_LABEL_SOURCES = {
 }
 
 # Desktop-task "churn" label sources — the noisy per-step status/action chatter
-# from a running task ("Orynning…", "Searching…", "Clicking Save"). While Gemini
-# Live is the active driver it OWNS the bubble text (Live narrates the task out
-# loud), so this churn is muted to stop the bubble flashing between the live
-# transcript and the task's step labels. The flying cursor still shows what's
-# happening on screen. The one exception is `task_result`: a task's final answer
-# is meaningful and a single, non-flickering update, so it surfaces even mid-Live.
+# in the MAIN companion bubble. While Live drives, that bubble stays on the
+# conversation; the flying cursor still shows what's happening on screen.
+# task_result still surfaces in the main bubble.
 _TASK_CHURN_SOURCES = {
     "task_status",
     "task_prime",
@@ -451,8 +549,15 @@ def build_task_payload(goal: str) -> dict[str, Any]:
         is_app_launch = False
     payload_goal = goal
     if not is_app_launch:
+        try:
+            from app import knowledge
+            mem = knowledge.as_prompt_block(goal, limit=12)
+            if mem:
+                payload_goal = mem + "\n\n" + payload_goal
+        except Exception:
+            pass
         if mode in {"computer", "computer_use", "computer_isolated"}:
-            payload_goal = DESKTOP_HARDENING + goal
+            payload_goal = DESKTOP_HARDENING + payload_goal
         payload_goal = payload_goal + VOICE_BREVITY
     width, height = _screen_size()
     return {
@@ -551,6 +656,8 @@ class OverlayController(QObject):
         # Tasks Live launched (task_id -> short goal), so when one finishes we can
         # feed the outcome back to the conversation instead of losing it.
         self._live_task_ids: dict[str, str] = {}
+        # Latest step phrase for Live-launched subagents (get_companion_status only).
+        self._live_task_progress: dict[str, dict[str, Any]] = {}
         # The most recent finished Live task's outcome, surfaced via
         # get_companion_status so Live can answer "did it work?" for longer jobs.
         self._last_task_result: dict[str, Any] | None = None
@@ -1073,6 +1180,7 @@ class OverlayController(QObject):
                 ),
                 on_error=lambda text, gen=generation: self._live_error(text, gen),
                 on_stopped=lambda text, gen=generation: self._live_stopped(text, gen),
+                on_turn_complete=lambda _text, gen=generation: self._live_turn_complete(gen),
                 on_tool=lambda name, args, gen=generation: self._live_tool_for_generation(gen, name, args),
             )
             live = GeminiLiveCompanion(callbacks)
@@ -1137,6 +1245,62 @@ class OverlayController(QObject):
         if finished:
             self._live_input_done = True
             self._live_reply_done = True
+            utterance = self._live_input_buffer.strip()
+            if utterance:
+                threading.Thread(
+                    target=self._maybe_auto_screen_for_live_utterance,
+                    args=(utterance,),
+                    daemon=True,
+                ).start()
+
+    def _maybe_auto_screen_for_live_utterance(self, utterance: str) -> None:
+        """Push a fresh screenshot when the user asks about what's visible — without
+        waiting for the model to remember to call look_at_screen."""
+        mode = _live_auto_screen_mode()
+        if mode == "off":
+            return
+        if mode == "intent" and not _utterance_wants_live_screen(utterance):
+            return
+        live = self._live
+        if live is None or not getattr(live, "is_running", lambda: False)():
+            return
+        ok, _fg = self._push_live_screen_frame(utterance)
+        if ok:
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Looking at the screen", source="live_tool", force=True)
+
+    def _live_turn_complete(self, generation: int | None = None) -> None:
+        if not self._live_generation_current(generation):
+            return
+
+    def _push_live_screen_frame(self, question: str = "") -> tuple[bool, str]:
+        """Capture + send a vision frame into Live. Returns (ok, foreground title)."""
+        live = self._live
+        if live is None or not hasattr(live, "send_screen_image"):
+            return False, ""
+        data, fg, mode = self._capture_vision_jpeg()
+        if not data:
+            return False, ""
+        send = getattr(live, "send_screen_image", None)
+        if not send or not send(data, wait=True):
+            return False, fg
+        capture_kind = "foreground window (PrintWindow)" if mode == "window" else "primary monitor"
+        note = (
+            f"[Fresh screenshot attached RIGHT NOW — {capture_kind}"
+            + (f": {fg}" if fg else "")
+            + ". Describe ONLY what you see in THIS frame. The user may have "
+            "switched apps or tabs since earlier turns — never answer from memory "
+            "of old pages. If you don't see what they named, say so plainly (e.g. "
+            "\"I don't see X on this screen\") and tell them what IS visible instead "
+            "— never invent it or give generic directions for something not in this "
+            "frame.]"
+        )
+        q = _clean_text(question)
+        if q:
+            note += f" User asked: {_short(q, 140)}"
+        if hasattr(live, "send_context_update"):
+            live.send_context_update(note)
+        return True, fg
 
     def _live_output_transcript(self, text: str, finished: bool, generation: int | None = None) -> None:
         if not self._live_generation_current(generation):
@@ -1645,7 +1809,7 @@ class OverlayController(QObject):
         self.cursorStateRequested.emit("thinking")
         if not self._live_is_running():
             self._set_label("Trying the full agent", source="live_tool", force=True)
-        return self._live_tool("start_desktop_task", {"goal": goal})
+        return self._live_start_desktop_task({"goal": goal})
 
     @staticmethod
     def _looks_like_electron(app: str) -> bool:
@@ -1716,6 +1880,7 @@ class OverlayController(QObject):
         except Exception as exc:
             return {"ok": False, "message": f"Couldn't save that: {str(exc)[:120]}"}
         self._refresh_knowledge_block()  # so the next (re)connect injects it
+        self._notify_live_memory_updated()
         self.cursorStateRequested.emit("listening")
         self._set_label("Remembered", source="live_tool", force=True)
         return {"ok": True, "message": "Got it — I'll remember that. Confirm briefly to the user."}
@@ -1731,6 +1896,7 @@ class OverlayController(QObject):
             return {"ok": False, "message": f"Couldn't forget that: {str(exc)[:120]}"}
         if removed:
             self._refresh_knowledge_block()
+            self._notify_live_memory_updated()
         self._set_label("Forgotten" if removed else "Nothing to forget", source="live_tool", force=True)
         return {"ok": True, "removed": removed,
                 "message": (f"Forgot {removed} thing(s)." if removed else "I didn't have anything matching that.")}
@@ -1752,6 +1918,24 @@ class OverlayController(QObject):
         Non-blocking (safe to call on the Live event loop via dynamic_context) — the
         cache is refreshed off-loop by the poll loop and after remember/forget."""
         return self._knowledge_block_cache
+
+    def _notify_live_memory_updated(self) -> None:
+        """Push a fresh memory block into an active Live session so remember/forget
+        takes effect without waiting for reconnect."""
+        block = self._knowledge_block_cache
+        if not block or not self._live_is_running():
+            return
+        live = self._live
+        if live is None or not hasattr(live, "send_context_update"):
+            return
+        note = (
+            "Your ORYNN MEMORY was just updated. Use these facts from now on — "
+            "don't re-ask or re-discover them:\n\n" + block
+        )
+        try:
+            live.send_context_update(note)
+        except Exception:
+            pass
 
     def _active_desktop_task(self) -> str | None:
         """Return the goal of a desktop task that's currently driving the screen, or
@@ -1807,6 +1991,15 @@ class OverlayController(QObject):
         if name == "desktop_control":
             return self._live_desktop_control(args)
         if name == "start_desktop_task":
+            goal = _clean_text(args.get("goal") or "")
+            parsed = _parse_single_click_goal(goal)
+            if parsed is not None:
+                click_args = dict(parsed)
+                if "confirmed" in args:
+                    click_args["confirmed"] = args.get("confirmed")
+                routed = self._desktop_control_route(click_args)
+                if routed is not None:
+                    return routed
             return self._live_start_desktop_task(args)
         if name == "web_search":
             return self._live_web_search(args)
@@ -1827,6 +2020,10 @@ class OverlayController(QObject):
             return {"ok": True, "stopped": stopped, "message": "Stop request accepted."}
         if name == "look_at_screen":
             return self._live_look_at_screen(args)
+        if name == "list_windows":
+            return self._live_list_windows(args)
+        if name == "capture_window":
+            return self._live_capture_window(args)
         if name == "run_terminal":
             return self._live_run_terminal(args)
         if name == "remember":
@@ -1840,6 +2037,12 @@ class OverlayController(QObject):
                 resp: dict[str, Any] = {"ok": True, "active_tasks": len(tasks)}
                 if self._active_task_goal:
                     resp["current_task"] = self._active_task_goal
+                progress = self._live_progress_snapshot()
+                if progress:
+                    resp["progress"] = {
+                        "goal": progress.get("goal", ""),
+                        "step": progress.get("step", ""),
+                    }
                 if self._last_task_result:
                     resp["last_result"] = self._last_task_result
                 return resp
@@ -1850,31 +2053,74 @@ class OverlayController(QObject):
         return {"ok": False, "message": f"Unknown tool: {name}"}
 
     @staticmethod
-    def _capture_vision_jpeg() -> bytes | None:
-        """Capture the FULL primary screen, scaled to a readable size at good quality,
-        for Live's vision. The agent's shared screenshot() CROPS the top-left 1280x800
-        at JPEG-65 (it's tuned for the agent's coordinate space) — too partial and blurry
-        for 'what's on my screen', which made the model hallucinate (a code editor read
-        as 'a photo editor with a beach'). Here we grab the WHOLE screen so it can
-        actually read what's there."""
+    def _encode_vision_jpeg(img: Any) -> bytes:
+        import io
+        from PIL import Image
+
+        quality, max_edge = _live_vision_jpeg_settings()
+        if max_edge > 0 and max(img.size) > max_edge:
+            img.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, subsampling=0, optimize=False)
+        return buf.getvalue()
+
+    @staticmethod
+    def _capture_window_jpeg(title_query: str, index: int = 0) -> tuple[bytes | None, str]:
+        """PrintWindow capture of a background window by partial title."""
         try:
-            import io
+            from .. import providers as prov
+
+            hwnd, full_title = prov.resolve_hwnd_for_title_query(title_query, index)
+            if not hwnd:
+                return None, ""
+            quality, max_edge = _live_vision_jpeg_settings()
+            cap_max = max_edge if max_edge > 0 else 0
+            img = prov._capture_hwnd_image(hwnd, max_edge=cap_max)
+            return OverlayController._encode_vision_jpeg(img), full_title
+        except Exception:
+            return None, ""
+
+    @staticmethod
+    def _capture_vision_jpeg() -> tuple[bytes | None, str, str]:
+        """Capture for Live vision. Returns (jpeg_bytes, window_title, mode).
+
+        Default ORYNN_LIVE_SCREEN_CAPTURE=window uses PrintWindow on the foreground
+        app only (native Windows API — not the whole desktop). Falls back to the
+        primary monitor via mss when no suitable window is found."""
+        try:
             import mss
             from PIL import Image
-            with mss.mss() as sct:
-                mons = sct.monitors
-                mon = mons[1] if len(mons) > 1 else mons[0]  # primary monitor, full
-                shot = sct.grab(mon)
-                img = Image.frombytes("RGB", shot.size, shot.rgb)
-                # High fidelity on purpose — Live's free tier is generous (64k TPM), so we
-                # don't trade quality for tokens. A crisp near-full-res frame lets the model
-                # actually read code/text on screen instead of guessing.
-                img.thumbnail((1920, 1920))
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=92)
-                return buf.getvalue()
+
+            from .. import providers as prov
+
+            _, max_edge = _live_vision_jpeg_settings()
+            hwnd, title, mode = prov.resolve_hwnd_for_live_vision()
+            cap_max = max_edge if max_edge > 0 else 0
+            if mode == "window" and hwnd:
+                img = prov._capture_hwnd_image(hwnd, max_edge=cap_max)
+            else:
+                with mss.mss() as sct:
+                    mons = sct.monitors
+                    mon = mons[1] if len(mons) > 1 else mons[0]
+                    shot = sct.grab(mon)
+                    img = Image.frombytes("RGB", shot.size, shot.rgb)
+                if not title:
+                    title = OverlayController._foreground_window_title()
+            data = OverlayController._encode_vision_jpeg(img)
+            return data, title, mode
         except Exception:
-            return None
+            return None, "", "monitor"
+
+    @staticmethod
+    def _foreground_window_title() -> str:
+        try:
+            import win32gui  # type: ignore
+            hwnd = win32gui.GetForegroundWindow()
+            if hwnd:
+                return (win32gui.GetWindowText(hwnd) or "").strip()[:120]
+        except Exception:
+            pass
+        return ""
 
     def _live_look_at_screen(self, args: dict[str, Any]) -> dict[str, Any]:
         """Capture a screenshot and hand it to Live's own vision so it can SEE the
@@ -1885,19 +2131,97 @@ class OverlayController(QObject):
         question = _clean_text(args.get("question") or "")
         self.cursorStateRequested.emit("thinking")
         self._set_label("Looking at the screen", source="live_tool", force=True)
-        data = self._capture_vision_jpeg()
-        if not data:
-            return {"ok": False, "message": "Couldn't capture the screen."}
-        if not bool(live.send_screen_image(data)):
-            return {"ok": False, "message": "Couldn't send the screen image."}
-        # The FunctionResponse is the SINGLE prompt that drives the model to describe the
-        # frame just sent — send_screen_image deliberately sends no extra turn, so this
-        # isn't a double-prompt. Carry the user's actual question here.
+        ok, fg = self._push_live_screen_frame(question)
+        if not ok:
+            return {"ok": False, "message": "Couldn't capture or send the screen image."}
+        fg_note = f" Foreground window when captured: {fg}." if fg else ""
         return {"ok": True, "message": (
-            "The user's screen is now in view. "
+            "The user's screen is now in view."
+            + fg_note
+            + " "
             + (question or "Describe what's on it.")
-            + " Answer out loud in one or two short, natural sentences."
+            + " Answer out loud in one or two short, natural sentences — only from "
+            "what you see in the screenshot, not from guesswork or earlier turns."
         )}
+
+    def _live_list_windows(self, args: dict[str, Any]) -> dict[str, Any]:
+        from .. import providers as prov
+
+        include_min = args.get("include_minimized")
+        if include_min is None:
+            include = True
+        else:
+            include = self._live_bool(include_min)
+        rows = prov.list_open_windows(include_minimized=include)
+        public = [
+            {"title": w.get("title", ""), "minimized": bool(w.get("minimized"))}
+            for w in rows
+        ]
+        self.cursorStateRequested.emit("thinking")
+        self._set_label(f"{len(public)} open windows", source="live_tool", force=True)
+        return {
+            "ok": True,
+            "count": len(public),
+            "windows": public,
+            "message": (
+                "Open windows on the PC. Use capture_window with a partial title "
+                "match to peek at one (even in the background) without the user alt-tabbing."
+            ),
+        }
+
+    def _live_capture_window(self, args: dict[str, Any]) -> dict[str, Any]:
+        live = self._live
+        if live is None or not hasattr(live, "send_screen_image"):
+            return {"ok": False, "message": "Live vision isn't available right now."}
+        title = _clean_text(args.get("title") or "")
+        if not title:
+            return {"ok": False, "message": "Need a window title (partial match is OK)."}
+        try:
+            index = int(args.get("index") or 0)
+        except Exception:
+            index = 0
+        question = _clean_text(args.get("question") or "")
+        self.cursorStateRequested.emit("thinking")
+        self._set_label("Peeking at " + _short(title, 40), source="live_tool", force=True)
+        data, win_title = self._capture_window_jpeg(title, index)
+        if not data:
+            return {
+                "ok": False,
+                "message": f"No open window matched '{title}'. Try list_windows first.",
+            }
+        send = getattr(live, "send_screen_image", None)
+        if not send or not send(data, wait=True):
+            return {"ok": False, "message": "Captured the window but couldn't send it to Live."}
+        note = (
+            f"[Fresh PrintWindow capture of \"{win_title}\" — background peek, user may "
+            "be focused elsewhere. Describe ONLY this frame.]"
+        )
+        if question:
+            note += f" User asked: {_short(question, 140)}"
+        if hasattr(live, "send_context_update"):
+            live.send_context_update(note)
+        return {
+            "ok": True,
+            "window": win_title,
+            "message": (
+                f"Window \"{win_title}\" is now in view via PrintWindow (background peek)."
+                + (f" {question}" if question else " Describe what you see out loud.")
+            ),
+        }
+
+    def _notify_live_background_started(self, goal: str) -> None:
+        live = self._live
+        if live is None or not hasattr(live, "send_task_update"):
+            return
+        g = _short(_clean_text(goal), 90)
+        try:
+            live.send_task_update(
+                f'The desktop agent just started working on: "{g}". Tell the user out loud '
+                "in one short sentence that you're on it and you'll let them know when "
+                "it's done — they can keep doing whatever they're doing."
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _goal_needs_consent(goal: str) -> bool:
@@ -1958,6 +2282,12 @@ class OverlayController(QObject):
             self._active_task_running = True
             self._active_task_goal = _short(goal, 80)
             self._live_task_ids[task_id] = self._active_task_goal
+            self._live_task_progress[task_id] = {
+                "task_id": task_id,
+                "goal": self._active_task_goal,
+                "step": "on it",
+                "updated_at": time.time(),
+            }
             # Start the narration clock at launch so the first spoken milestone is
             # spaced one interval after the verbal ack (no talking over ourselves).
             self._live_narration_last = time.monotonic()
@@ -1969,6 +2299,8 @@ class OverlayController(QObject):
             # non-Live (push-to-talk / dashboard) launches where it's the only feedback.
             if not self._live_is_running():
                 self._set_label("Started: " + _short(goal, 120), source="live_tool", force=True)
+            else:
+                self._notify_live_background_started(goal)
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:200]
             self.cursorStateRequested.emit("idle")
@@ -2109,6 +2441,7 @@ class OverlayController(QObject):
         budget = self._live_float(os.getenv("ORYNN_LIVE_TASK_WAIT"), LIVE_TASK_RESULT_WAIT, 0.0, 30.0)
         deadline = time.monotonic() + budget
         status, summary = "running", ""
+        d: dict[str, Any] | None = None
         first = True
         while first or time.monotonic() < deadline:
             first = False
@@ -2130,21 +2463,30 @@ class OverlayController(QObject):
                 break
             self._stop.wait(0.5)
 
-        if status in ("done", "complete"):
-            self._finish_live_task(task_id, status, summary, ok=True)
-            self._set_label("Done: " + _short(summary or goal, 120), source="live_tool", force=True)
-            return {"ok": True, "task_id": task_id, "status": "done",
-                    "result": _short(summary, 600) or "Done.",
-                    "message": "The desktop task finished — tell the user the result."}
-        if status in ("error", "failed", "cancelled"):
-            self._finish_live_task(task_id, status, summary, ok=False)
-            return {"ok": False, "task_id": task_id, "status": status,
-                    "result": _short(summary, 600),
-                    "message": f"The desktop task {status}. Tell the user briefly what happened."}
+        complete_flag = d.get("complete") if isinstance(d, dict) else None
+        ok = _terminal_task_succeeded(status=status, complete=complete_flag)
+        if status in TERMINAL_TASK_STATES:
+            self._finish_live_task(task_id, status, summary, ok=ok)
+            if ok:
+                self._set_label("Done: " + _short(summary or goal, 120), source="live_tool", force=True)
+                return {"ok": True, "task_id": task_id, "status": "done",
+                        "result": _short(summary, 600) or "Done.",
+                        "message": ("The desktop task succeeded — tell the user what happened "
+                                    "in one or two short sentences.")}
+            fail_status = status if status in ("error", "failed", "cancelled") else "failed"
+            self._set_label("Failed: " + _short(summary or goal, 120), source="live_tool", force=True)
+            return {"ok": False, "task_id": task_id, "status": fail_status,
+                    "result": _short(summary, 600) or "The task didn't complete.",
+                    "message": ("The desktop task FAILED or did not fully succeed. Tell the "
+                                "user honestly what went wrong. Do NOT say it's done, finished, "
+                                "or opened — explain the problem plainly.")}
         return {"ok": True, "task_id": task_id, "status": "running",
-                "message": ("Orynn is working on it in the background; it isn't done yet. "
-                            "Tell the user you've started — you can check later with "
-                            "get_companion_status.")}
+                "message": ("The desktop agent is working on this in the background. "
+                            "Tell the user OUT LOUD in one short sentence that you've "
+                            "started it and you'll report when it's done — they can keep "
+                            "gaming or chatting. Do NOT tell them to wait in silence or "
+                            "keep asking you for updates; you'll get an automatic alert "
+                            "when it finishes.")}
 
     def _finish_live_task(self, task_id: str, status: str, summary: str, ok: bool) -> None:
         self._active_task_running = False
@@ -2166,21 +2508,67 @@ class OverlayController(QObject):
             return
         goal = self._live_task_ids.get(task_id, "")
         summary = _clean_text(ev.get("reason") or ev.get("message") or "")
-        ok = et in ("done", "complete")
+        ok = _terminal_task_succeeded(event_type=et, complete=ev.get("complete"))
         self._finish_live_task(task_id, et, summary, ok=ok)
-        # Proactively tell Live a long job just finished so it can announce it
-        # ("hey, that's done") instead of the user having to ask.
+        # Proactively tell Live when a long background job ends so the user hears
+        # the real outcome — success OR failure, never a false "all done".
         live = self._live
         if live is not None and hasattr(live, "send_task_update"):
-            verb = "finished" if ok else et
-            note = f'Heads up: the background task "{goal or "you started"}" just {verb}.'
-            if summary:
-                note += f" Result: {_short(summary, 200)}"
-            note += " Let the user know in one short, natural sentence."
+            if ok:
+                note = f'Heads up: the background task "{goal or "you started"}" succeeded.'
+                if summary:
+                    note += f" Result: {_short(summary, 200)}"
+                note += (" Tell the user what happened in one or two short sentences. "
+                         "Do not say you are still working on it.")
+            else:
+                note = f'Heads up: the background task "{goal or "you started"}" FAILED.'
+                if summary:
+                    note += f" Error: {_short(summary, 200)}"
+                note += (" Tell the user honestly that it did NOT work — explain what "
+                         "went wrong. Do NOT say finished, done, opened, or success.")
             try:
                 live.send_task_update(note)
             except Exception:
                 pass
+
+    def _clicky_phrase_for_event(self, ev: dict[str, Any]) -> str:
+        """Short, human phrase for Clicky-style cursor progress — not dashboard logs."""
+        phrase = self._narration_phrase_for_event(ev)
+        if phrase:
+            return phrase
+        label = self._label_for_event(ev)
+        if label and label.lower().startswith("failed"):
+            return label
+        return _short(label, 52) if label else ""
+
+    def _update_live_task_progress(self, ev: dict[str, Any]) -> None:
+        """Track subagent milestones for get_companion_status (no overlay UI)."""
+        task_id = str(ev.get("task_id") or "")
+        if not task_id or task_id not in self._live_task_ids:
+            return
+        et = str(ev.get("type") or "")
+        if et in TERMINAL_TASK_STATES:
+            self._live_task_progress.pop(task_id, None)
+            return
+        phrase = self._clicky_phrase_for_event(ev)
+        if not phrase:
+            return
+        self._live_task_progress[task_id] = {
+            "task_id": task_id,
+            "goal": self._live_task_ids.get(task_id, ""),
+            "step": phrase,
+            "updated_at": time.time(),
+        }
+
+    def _live_progress_snapshot(self) -> dict[str, Any] | None:
+        """Latest subagent progress for get_companion_status."""
+        if not self._live_task_progress:
+            return None
+        # Most recently updated Live-launched task.
+        return max(
+            self._live_task_progress.values(),
+            key=lambda p: float(p.get("updated_at") or 0),
+        )
 
     def _narration_phrase_for_event(self, ev: dict[str, Any]) -> str:
         """A short, speech-friendly milestone for a running task, or "" if this event
@@ -2238,7 +2626,7 @@ class OverlayController(QObject):
         if live is None or not hasattr(live, "send_task_update"):
             return
         note = (f"Quick progress note while you work: {phrase}. Say it to the user in "
-                "one short, natural sentence, and don't repeat yourself.")
+                "one short, natural sentence — they may be busy elsewhere.")
         try:
             live.send_task_update(note)
         except Exception:
@@ -2345,6 +2733,7 @@ class OverlayController(QObject):
                             self._set_label(label, source=self._label_source_for_event(ev))
                             idle_label_shown = True
                     self._update_cursor_state_from_event(ev)
+                    self._update_live_task_progress(ev)
                     self._maybe_narrate_to_live(ev)
                     self._capture_live_task_outcome(ev)
                     self._maybe_finalize(ev)
@@ -2538,7 +2927,10 @@ class OverlayController(QObject):
         if event_type in {"approval_timeout", "permission_timeout"}:
             return "Approval timed out"
         if event_type in {"done", "complete"}:
-            return _short(_strip_markdown(ev.get("reason") or "Done"), 200)
+            reason = _short(_strip_markdown(ev.get("reason") or "Done"), 200)
+            if ev.get("complete") is False:
+                return "Failed: " + reason if reason else "Task failed"
+            return reason
         if event_type in {"error", "failed"}:
             return _short(_strip_markdown(ev.get("reason") or ev.get("message") or "Task failed"))
         if event_type == "cancelled":

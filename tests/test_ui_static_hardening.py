@@ -1012,7 +1012,7 @@ def test_clicky_textbox_overlay_is_click_through_and_event_driven():
     assert "keyboard.add_hotkey(\"ctrl+shift+m\"" in textbox
     assert "voice.listen(timeout=8.0)" in textbox
     assert "build_task_payload" in textbox
-    assert "DESKTOP_HARDENING + goal" in textbox
+    assert "DESKTOP_HARDENING + payload_goal" in textbox
     # A failed global-hotkey registration must NOT fail silently — the user is told
     # in the bubble + a tray toast, not left with a dead push-to-talk/Live key.
     assert '"Orynn ready" if hotkey_ready else "Orynn ready"' not in textbox

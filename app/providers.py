@@ -474,6 +474,211 @@ def _get_active_window_rect(sw: int, sh: int) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _is_orynn_owned_hwnd(hwnd: int) -> bool:
+    """True for Orynn dashboard/overlay windows that would pollute a screen capture."""
+    try:
+        import os
+        import win32gui  # type: ignore
+        import win32process  # type: ignore
+    except Exception:
+        return False
+    if not hwnd or not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+        return False
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if pid == os.getpid():
+            return True
+    except Exception:
+        pass
+    title = (win32gui.GetWindowText(hwnd) or "").lower()
+    return "orynn" in title
+
+
+def _minimize_orynn_owned_windows() -> None:
+    try:
+        import win32con  # type: ignore
+        import win32gui  # type: ignore
+    except Exception:
+        return
+
+    def _cb(hwnd: int, _: Any) -> None:
+        if _is_orynn_owned_hwnd(hwnd):
+            try:
+                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            except Exception:
+                pass
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        pass
+
+
+_SHELL_WINDOW_CLASSES = frozenset({
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+})
+
+
+def _hwnd_class_name(hwnd: int) -> str:
+    try:
+        import win32gui  # type: ignore
+        return str(win32gui.GetClassName(hwnd) or "")
+    except Exception:
+        return ""
+
+
+def _hwnd_client_area(hwnd: int) -> int:
+    try:
+        import win32gui  # type: ignore
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        return max(0, right - left) * max(0, bottom - top)
+    except Exception:
+        return 0
+
+
+def _is_shell_or_junk_hwnd(hwnd: int) -> bool:
+    """True for desktop shell, taskbar, and other non-app windows unfit for vision."""
+    if not hwnd:
+        return True
+    try:
+        import win32gui  # type: ignore
+        if not win32gui.IsWindow(hwnd):
+            return True
+    except Exception:
+        return True
+    if _hwnd_class_name(hwnd) in _SHELL_WINDOW_CLASSES:
+        return True
+    try:
+        import win32gui  # type: ignore
+        title = (win32gui.GetWindowText(hwnd) or "").strip()
+    except Exception:
+        title = ""
+    if not title:
+        return True
+    if _hwnd_client_area(hwnd) < 120 * 120:
+        return True
+    return False
+
+
+def _best_app_window_for_vision() -> tuple[int, str]:
+    """When foreground is Orynn/shell/taskbar, pick the largest real app window."""
+    best_hwnd, best_title, best_area = 0, "", 0
+    for row in list_open_windows(include_minimized=False, max_results=80):
+        hwnd = int(row.get("hwnd") or 0)
+        title = str(row.get("title") or "").strip()
+        if not hwnd or not title:
+            continue
+        if _is_orynn_owned_hwnd(hwnd) or _is_shell_or_junk_hwnd(hwnd):
+            continue
+        area = _hwnd_client_area(hwnd)
+        if area > best_area:
+            best_area, best_hwnd, best_title = area, hwnd, title
+    return best_hwnd, best_title
+
+
+def resolve_hwnd_for_live_vision() -> tuple[int, str, str]:
+    """Pick what Live vision should capture.
+
+    Returns (hwnd, title, mode) where mode is 'window' (PrintWindow) or 'monitor'
+    (full-screen mss fallback). Default ORYNN_LIVE_SCREEN_CAPTURE=window uses the
+    foreground app only — native Windows PrintWindow, not the whole desktop."""
+    import time
+    import win32gui  # type: ignore
+
+    mode_env = (os.getenv("ORYNN_LIVE_SCREEN_CAPTURE") or "window").strip().lower()
+    if mode_env in ("monitor", "screen", "full", "desktop"):
+        return 0, "", "monitor"
+
+    hwnd = int(win32gui.GetForegroundWindow() or 0)
+    title = (win32gui.GetWindowText(hwnd) or "").strip() if hwnd else ""
+    if _is_orynn_owned_hwnd(hwnd):
+        _minimize_orynn_owned_windows()
+        time.sleep(0.12)
+        hwnd = int(win32gui.GetForegroundWindow() or 0)
+        title = (win32gui.GetWindowText(hwnd) or "").strip() if hwnd else ""
+    if _is_orynn_owned_hwnd(hwnd) or _is_shell_or_junk_hwnd(hwnd):
+        pick_hwnd, pick_title = _best_app_window_for_vision()
+        if pick_hwnd:
+            return pick_hwnd, pick_title, "window"
+        if _is_orynn_owned_hwnd(hwnd):
+            return 0, title, "monitor"
+        return 0, title, "monitor"
+    if hwnd and win32gui.IsWindow(hwnd):
+        return hwnd, title, "window"
+    pick_hwnd, pick_title = _best_app_window_for_vision()
+    if pick_hwnd:
+        return pick_hwnd, pick_title, "window"
+    return 0, "", "monitor"
+
+
+def list_open_windows(
+    *,
+    include_minimized: bool = True,
+    max_results: int = 40,
+) -> list[dict[str, Any]]:
+    """Return visible top-level windows for Live (title + minimized flag only)."""
+    try:
+        import win32con  # type: ignore
+        import win32gui  # type: ignore
+    except Exception:
+        return []
+
+    rows: list[dict[str, Any]] = []
+
+    def _cb(hwnd: int, _: Any) -> None:
+        if not win32gui.IsWindow(hwnd):
+            return
+        if _is_orynn_owned_hwnd(hwnd):
+            return
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = (win32gui.GetWindowText(hwnd) or "").strip()
+        if len(title) < 2:
+            return
+        minimized = False
+        try:
+            placement = win32gui.GetWindowPlacement(hwnd)
+            minimized = placement[1] == win32con.SW_SHOWMINIMIZED
+        except Exception:
+            pass
+        if minimized and not include_minimized:
+            return
+        rows.append({"hwnd": hwnd, "title": title[:120], "minimized": minimized})
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        return []
+    rows.sort(key=lambda w: (bool(w.get("minimized")), str(w.get("title", "")).lower()))
+    return rows[: max(1, min(max_results, 80))]
+
+
+def resolve_hwnd_for_title_query(title_query: str, index: int = 0) -> tuple[int, str]:
+    """Find a window by partial title match without focusing it."""
+    q = (title_query or "").strip()
+    if not q:
+        return 0, ""
+    matches = [
+        w for w in list_open_windows(include_minimized=True, max_results=80)
+        if q.lower() in str(w.get("title") or "").lower()
+    ]
+    if not matches:
+        hwnd = _get_hwnd_for_title(q)
+        if hwnd:
+            try:
+                import win32gui  # type: ignore
+                return int(hwnd), (win32gui.GetWindowText(hwnd) or q).strip()[:120]
+            except Exception:
+                return int(hwnd), q
+        return 0, ""
+    idx = max(0, min(int(index or 0), len(matches) - 1))
+    pick = matches[idx]
+    return int(pick.get("hwnd") or 0), str(pick.get("title") or q)
+
+
 def _get_hwnd_for_title(partial_title: str) -> Optional[int]:
     """Find a visible HWND by partial title match; checks top-level then child windows."""
     try:
@@ -510,7 +715,7 @@ def _get_hwnd_for_title(partial_title: str) -> Optional[int]:
 
 def _capture_hwnd_screenshot_b64(hwnd: int) -> str:
     """Capture a screenshot of the given HWND via PrintWindow so fullscreen overlays don't block it."""
-    image = _capture_hwnd_image(hwnd)
+    image = _capture_hwnd_image(hwnd, max_edge=None)
     try:
         buf = io.BytesIO()
         image.save(buf, format="JPEG", quality=75)
@@ -623,7 +828,7 @@ def _run_with_timeout(fn: Any, timeout_seconds: float, *, label: str) -> Any:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _capture_hwnd_image(hwnd: int) -> Image.Image:
+def _capture_hwnd_image(hwnd: int, *, max_edge: int | None = None) -> Image.Image:
     import ctypes
     import win32con  # type: ignore
     import win32gui  # type: ignore
@@ -689,9 +894,12 @@ def _capture_hwnd_image(hwnd: int) -> Image.Image:
         image = raw_image.copy()
         raw_image.close()
         del bmp_bytes  # release the large Win32 bitmap buffer ASAP
-        target_w, target_h = _pick_capture_cap(width, height)
-        if image.size[0] > target_w or image.size[1] > target_h:
-            image.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+        if max_edge is None:
+            target_w, target_h = _pick_capture_cap(width, height)
+            if image.size[0] > target_w or image.size[1] > target_h:
+                image.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+        elif max_edge > 0 and max(image.size) > max_edge:
+            image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         return image
     finally:
         if bitmap is not None:

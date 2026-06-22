@@ -35,6 +35,12 @@ GEMINI_LIVE_TOOL_TIMEOUT = 15.0
 GEMINI_LIVE_MAX_AUDIO_FAILS = 40
 # Maximum retry delay capped at 30 seconds for connection robustness.
 GEMINI_LIVE_MAX_RETRY_DELAY = 30.0
+# Prefix for background alerts injected into Live — model must speak without user prompt.
+LIVE_PROACTIVE_PREFIX = (
+    "[ORYNN — speak out loud NOW. This is an automatic system alert, not the user "
+    "talking. The user may be idle, gaming, or mid-conversation. Respond with spoken "
+    "audio immediately in one or two short sentences. Do NOT wait for them to ask.] "
+)
 
 _DEBUG_SESSION = "eec63b"
 _DEBUG_LOG = (
@@ -105,6 +111,28 @@ def gemini_api_key() -> str:
 
 def _env_flag(name: str) -> bool:
     return (os.environ.get(name) or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _live_thinking_level(types: Any) -> Any:
+    """Gemini 3.1 Live thinking depth. Default MEDIUM for reliable tool routing;
+    LOW/MINIMAL for lower latency. Override with GEMINI_LIVE_THINKING or
+    GEMINI_LIVE_THINKING_LEVEL (minimal|low|medium|high)."""
+    raw = (
+        os.environ.get("GEMINI_LIVE_THINKING")
+        or os.environ.get("GEMINI_LIVE_THINKING_LEVEL")
+        or "medium"
+    ).strip().lower()
+    level = getattr(types, "ThinkingLevel", None)
+    if level is None:
+        return None
+    mapping = {
+        "minimal": getattr(level, "MINIMAL", None),
+        "low": getattr(level, "LOW", None),
+        "medium": getattr(level, "MEDIUM", None),
+        "high": getattr(level, "HIGH", None),
+    }
+    chosen = mapping.get(raw) or mapping.get("medium") or mapping.get("low")
+    return chosen
 
 
 def _live_greeting_enabled() -> bool:
@@ -196,6 +224,7 @@ class GeminiLiveCallbacks:
     on_audio_level: LevelCallback = _noop
     on_error: StatusCallback = _noop
     on_stopped: StatusCallback = _noop
+    on_turn_complete: StatusCallback = _noop
     on_tool: ToolCallback | None = None
 
 
@@ -542,7 +571,7 @@ class GeminiLiveCompanion:
                 )
             ),
             thinking_config=types.ThinkingConfig(
-                thinking_level=types.ThinkingLevel.MINIMAL
+                thinking_level=_live_thinking_level(types),
             ),
             system_instruction=instruction,
             tools=tools,
@@ -603,9 +632,20 @@ class GeminiLiveCompanion:
             pass
 
     def send_task_update(self, text: str) -> None:
-        """Push a background-task status into the live conversation so the model can
-        proactively narrate a long job finishing ("hey, that download's done").
-        Thread-safe (called from the poll thread); best-effort."""
+        """Push a background alert that Live should speak out loud (task done, progress).
+        Thread-safe; best-effort."""
+        note = str(text or "").strip()
+        if not note:
+            return
+        if not note.startswith("[ORYNN"):
+            note = LIVE_PROACTIVE_PREFIX + note
+        self._send_client_note(note)
+
+    def send_context_update(self, text: str) -> None:
+        """Alias for memory/knowledge refreshes mid-session (not spoken alerts)."""
+        self._send_client_note(text)
+
+    def _send_client_note(self, text: str) -> None:
         loop = self._loop
         session = self._session
         if loop is None or session is None or self._stop.is_set() or not str(text or "").strip():
@@ -626,9 +666,14 @@ class GeminiLiveCompanion:
         except Exception:
             pass
 
-    def send_screen_image(self, jpeg_bytes: bytes) -> bool:
+    def send_screen_image(self, jpeg_bytes: bytes, *, wait: bool = False) -> bool:
         """Push a screenshot FRAME into the live session so the model can SEE the screen
-        (Gemini's own vision — no local OCR). Thread-safe; returns True if scheduled.
+        (Gemini's own vision — no local OCR). Thread-safe.
+
+        When ``wait`` is True, blocks until the frame is on the wire (and briefly after)
+        before returning — look_at_screen uses this so the FunctionResponse cannot race
+        ahead of the video frame (which made the model guess 'empty desktop' on the
+        first try and only see Chrome after the user pushed back).
 
         Sends ONLY the frame, over the realtime-input VIDEO channel. Two things matter:
         (1) an image MUST go over realtime input, not a send_client_content blob — the
@@ -650,6 +695,10 @@ class GeminiLiveCompanion:
                 await session.send_realtime_input(
                     video=types.Blob(data=jpeg_bytes, mime_type="image/jpeg")
                 )
+                if wait:
+                    # Brief pause so Live can attach the frame before FunctionResponse
+                    # triggers the describe turn (smoke test awaits send before response).
+                    await asyncio.sleep(0.25)
             except Exception as exc:  # noqa: BLE001
                 # region agent log
                 _agent_debug_log(
@@ -658,9 +707,12 @@ class GeminiLiveCompanion:
                     {"error": str(exc)[:200]},
                 )
                 # endregion
+                raise
 
         try:
-            asyncio.run_coroutine_threadsafe(_send(), loop)
+            future = asyncio.run_coroutine_threadsafe(_send(), loop)
+            if wait:
+                future.result(timeout=5.0)
             return True
         except Exception:
             return False
@@ -757,6 +809,10 @@ class GeminiLiveCompanion:
                 # text + finished = silent finalize (no re-render of the old input).
                 self.callbacks.on_input_transcript("", True)
                 self.callbacks.on_status("Gemini Live listening")
+                try:
+                    self.callbacks.on_turn_complete("")
+                except Exception:
+                    pass
                 if not getattr(getattr(message, "tool_call", None), "function_calls", None):
                     # region agent log
                     _agent_debug_log(
@@ -793,14 +849,26 @@ class GeminiLiveCompanion:
             )
             # endregion
             responses = []
+            _DESKTOP_TOOLS = frozenset({"desktop_control", "start_desktop_task"})
+            desktop_used = False
             for call in calls:
                 name = str(getattr(call, "name", "") or "")
                 args, arg_error = _coerce_tool_args(getattr(call, "args", None))
                 if arg_error:
                     self.callbacks.on_status("Live tool call failed")
                     result = {"ok": False, "message": arg_error}
+                elif name in _DESKTOP_TOOLS and desktop_used:
+                    result = {
+                        "ok": False,
+                        "message": (
+                            "Only one desktop action per turn — pick desktop_control "
+                            "OR start_desktop_task, not both. Wait for the result first."
+                        ),
+                    }
                 else:
                     result = await self._execute_tool(name, args or {})
+                    if name in _DESKTOP_TOOLS:
+                        desktop_used = True
                 responses.append(
                     types.FunctionResponse(
                         name=name,
@@ -909,14 +977,13 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="desktop_control",
             description=(
-                "Run ONE bounded, local Orynn desktop action — fast (~1-3s), no agent. "
-                "Use it for a SINGLE clear action in an app that's already open: click a "
-                "named button (click), type into one field (type), a keyboard shortcut "
-                "(press_keys), scroll, focus/await a window, or read controls "
-                "(observe/find/wait). If a click/type can't be done (button missing or a "
-                "locked app like Cursor/Discord), it automatically escalates to the full "
-                "agent. Use start_desktop_task instead for opening apps or anything "
-                "multi-step (\"do X and then Y\")."
+                "ONE fast action (~1-3s) in an app already open: click a named button/"
+                "link/menu item, type into one field, a keyboard shortcut, scroll, focus "
+                "a window, or read what's on screen (observe/find). Use for 'click that "
+                "button' — NOT start_desktop_task. Do NOT also call start_desktop_task "
+                "for the same request. Auto-escalates to the full agent if "
+                "the action can't land. NOT for opening/launching apps, files, or "
+                "multi-step work."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -973,10 +1040,11 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="look_at_screen",
             description=(
-                "Take a screenshot and actually LOOK at what's on the user's screen "
-                "with your own vision, then answer their question about it. Use this "
-                "for visual things UI inspection can't read — images, photos, videos, "
-                "games, charts, error dialogs, or 'what does this say / what's this'."
+                "Capture and SEE what's on screen with vision. Default: the foreground "
+                "window. Use when the question is about what's visible in front of the "
+                "user. Call BEFORE describing anything on screen; never guess from memory. "
+                "For a BACKGROUND app while they're doing something else (gaming, etc.), "
+                "use list_windows then capture_window instead. Read-only; safe mid-task."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -989,13 +1057,58 @@ def _function_declarations(types: Any) -> list[Any]:
             },
         ),
         types.FunctionDeclaration(
+            name="list_windows",
+            description=(
+                "List open visible windows on the PC (title + minimized flag). Use when "
+                "the user asks about an app that may NOT be in front — e.g. 'is Claude "
+                "done' while they're gaming — or to pick which window to peek at. Does "
+                "NOT capture yet; follow with capture_window."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "include_minimized": {
+                        "type": "boolean",
+                        "description": "Include minimized windows (default true).",
+                    },
+                },
+            },
+        ),
+        types.FunctionDeclaration(
+            name="capture_window",
+            description=(
+                "Screenshot a specific open window by partial title match using PrintWindow "
+                "— often WITHOUT stealing focus from what the user is doing. Sends the "
+                "frame into vision so you can answer. Use after list_windows when the "
+                "target app is in the background. Read-only; safe mid-task."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Partial window title to match (e.g. 'Cursor', 'Claude').",
+                    },
+                    "index": {
+                        "type": "integer",
+                        "description": "If several windows match, which one (0 = first).",
+                    },
+                    "question": {
+                        "type": "string",
+                        "description": "What to look for in that window.",
+                    },
+                },
+                "required": ["title"],
+            },
+        ),
+        types.FunctionDeclaration(
             name="start_desktop_task",
             description=(
-                "Start a full Orynn desktop task (the agent: plans, multiple steps, "
-                "files, browser, terminal, app-unlocking). Use it for opening/launching "
-                "an app, multi-step chores (\"open X and do Y, then Z\"), or vague/"
-                "setup goals. For a single clear click or typing into one field in an "
-                "already-open app, prefer desktop_control — it's much faster."
+                "Full desktop agent: open/launch apps, files, multi-step goals "
+                "('open X and do Y'), or vague setup work. Do NOT also call "
+                "desktop_control for the same request. NOT for a single click/type "
+                "in an already-open app. Don't web-search for local files or open "
+                "Notepad just to display a filename."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1053,7 +1166,12 @@ def _function_declarations(types: Any) -> list[Any]:
         ),
         types.FunctionDeclaration(
             name="get_companion_status",
-            description="Check whether Orynn currently has active desktop tasks.",
+            description=(
+                "Check active desktop tasks and subagent progress. Returns "
+                "active_tasks count, current_task goal, progress.step (what the "
+                "worker is doing now — the user also sees this on the cursor pill), "
+                "and last_result when a recent job finished."
+            ),
             parameters_json_schema={
                 "type": "object",
                 "properties": {},
@@ -1062,10 +1180,9 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="web_search",
             description=(
-                "Search the web for real-time information, weather, news, facts, or questions. "
-                "Call this directly in the same turn instead of starting a desktop task. The "
-                "result includes the sources it came from — when you answer, say which source "
-                "you're citing out loud (e.g. 'according to <site>') so the user can trust it."
+                "Real-time web facts: news, weather, scores, current events. One call "
+                "per question — cite the source out loud when you answer. NOT for files "
+                "on their PC (use run_terminal or start_desktop_task)."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1124,57 +1241,60 @@ def _function_declarations(types: Any) -> list[Any]:
 
 
 def _default_system_instruction() -> str:
+    """Live system prompt — voice-first (Clicky-style), routing via examples + tool
+    declarations (Google Gemini 3.x: concise instructions, few-shot examples, don't
+    duplicate tool specs here). ORYNN MEMORY is appended separately on connect."""
     return (
-        "You are Orynn, a warm, easy-going voice companion living on the user's "
-        "Windows PC. You're talking out loud, so speak the way a helpful friend "
-        "would: short, natural sentences, contractions, no lists or markdown, no "
-        "emoji, and never read out symbols or tool names.\n"
-        "When the user asks you to actually do something on the computer, DON'T "
-        "pretend you did it. For a SINGLE clear action in an app that's already open — "
-        "click a named button, type into one field, a keyboard shortcut, scroll, or "
-        "read what's on a window — use desktop_control; it's fast and if a click can't "
-        "be done it escalates to the full agent on its own. For opening or launching an "
-        "app, or anything multi-step (\"do X and then Y\"), or a vague/setup goal, say a "
-        "quick natural acknowledgement out loud and in the same turn call "
-        "start_desktop_task with a clear, specific goal — that's the full agent. To READ, "
-        "open, or work with a file or its contents (e.g. 'read gemini_live.py and explain "
-        "it'), use start_desktop_task — the agent finds the file and reads it; do NOT open "
-        "Notepad and type the filename, and don't web-search for a local file. "
-        "When the user refers to something on screen you can't place from what you "
-        "already know (a button, menu, or area by name like 'cowork'), call "
-        "look_at_screen FIRST to actually see it, then act — don't guess or make the "
-        "user spell out where it is. To actually "
-        "SEE the screen — images, videos, games, charts, an error dialog, 'what does "
-        "this say' — call look_at_screen with the question; you'll then see the "
-        "screenshot and can describe it. You have an organized memory: when the user "
-        "teaches you something or states a rule/preference, call remember (owner 'user'); "
-        "and when YOU work out where something is by looking — an app, a button, a "
-        "feature like 'slack' or 'cowork' — call remember with owner 'assistant' and "
-        "category 'location' so you learn their setup and won't have to look again. Use "
-        "forget to drop things. Always lean on what you already know before asking or "
-        "looking. For searching the web or checking facts, news, "
-        "weather, or real-time info, call web_search directly in the same turn — and when "
-        "you give the answer, name the source you got it from out loud ('according to …') "
-        "so the user can trust and verify it; never state a web fact you can't attribute. For a "
-        "quick shell command (git status, listing/reading files, versions, running a "
-        "script) call run_terminal and read back the result; destructive commands are "
-        "blocked. If the user says stop, cancel, or never "
-        "mind, call stop_current_task right away and confirm you stopped.\n"
-        "If they're just chatting or asking a question, simply answer — briefly and "
-        "conversationally — without using any tool. Ask a short clarifying question "
-        "only when you genuinely can't act otherwise. For anything risky or "
-        "irreversible — deleting files, sending a message, submitting a form, paying, "
-        "or relaunching an app — ask the user out loud to confirm first. If "
-        "start_desktop_task comes back saying it needs consent, that's your cue: ask "
-        "them plainly, and only if they clearly say yes call start_desktop_task again "
-        "with the same goal and confirmed set to true; if they say no, drop it.\n"
-        "When start_desktop_task returns it tells you the result: if status is "
-        "'done' or 'failed', tell the user what actually happened; if it's still "
-        "'running' it was a longer job, so say you've started it and you'll keep "
-        "going (you can check later with get_companion_status). Only ONE desktop "
-        "task can run at a time: "
-        "if you try to act on the computer while one is still running, the tool tells "
-        "you it's busy and names what's in progress — when that happens, say what's "
-        "running and ask whether to stop it (stop_current_task) or wait, instead of "
-        "trying again. Chatting and answering questions are always fine, even mid-task."
+        "You are Orynn — a warm voice companion on the user's Windows PC. You're "
+        "speaking out loud: short natural sentences, contractions, friendly and direct. "
+        "Write for the ear — no lists, markdown, emoji, or reading code or tool names "
+        "aloud. Never say \"simply\" or \"just\".\n\n"
+        "DEFAULT — JUST TALK\n"
+        "Most messages are conversation. If they're chatting, asking something general, "
+        "or thinking out loud, answer in voice only with no tools.\n\n"
+        "WHEN THEY WANT SOMETHING DONE\n"
+        "Use at most ONE tool per request — each tool's description says when to use "
+        "it. Never call start_desktop_task and desktop_control for the same goal (pick "
+        "one; quick clicks auto-escalate if they fail). Check ORYNN MEMORY before "
+        "looking things up or asking where something is. Save new facts with remember.\n\n"
+        "Examples:\n"
+        "- \"hey\" / \"explain recursion\" → voice only, no tools\n"
+        "- \"who won the game last night\" → web_search once; cite the source out loud\n"
+        "- \"git status\" / \"list my Downloads\" → run_terminal once\n"
+        "- \"what's this error on my screen\" / \"look at my screen\" → look_at_screen "
+        "once BEFORE describing anything visible; never guess\n"
+        "- \"is Claude/Cursor done\" / peek at a background app while user games → "
+        "list_windows once, then capture_window with the matching title\n"
+        "- \"click that button\" / \"click Save\" / \"click Usage\" (one control, app "
+        "already open) → desktop_control once — NOT start_desktop_task\n"
+        "- \"click Save in Notepad\" (app already open) → desktop_control once\n"
+        "- \"open Notepad\" / \"open Chrome and search X\" / \"edit my file\" → "
+        "start_desktop_task once\n"
+        "- \"remember cowork is top right\" → remember\n"
+        "- \"stop\" / \"cancel\" / \"never mind\" → stop_current_task\n\n"
+        "WHILE WORKING\n"
+        "Commands: one short ack (\"On it\", \"Sure\"), then let tools run — they see "
+        "on-screen progress. Don't narrate every step. Speak again on done/failed, "
+        "consent needed, or if they talk to you.\n\n"
+        "BACKGROUND TASKS & PROACTIVE UPDATES\n"
+        "When start_desktop_task keeps running in the background, tell the user OUT LOUD "
+        "you've started it and you'll report when it's done — they can keep gaming or "
+        "chatting. Messages prefixed [ORYNN — speak out loud NOW] are automatic alerts "
+        "(task finished, progress, subagent output) — NOT the user. Respond with SPOKEN "
+        "AUDIO immediately; never wait for them to ask \"is it done\". You stay listening; "
+        "delivering these updates unprompted is expected.\n\n"
+        "OUTCOMES\n"
+        "If ok is false or failed: say plainly it did NOT work — never claim done, "
+        "finished, or opened. If ok is true: one or two sentences on what happened.\n\n"
+        "CONSENT\n"
+        "Before delete/send/submit/pay/relaunch, ask out loud. If a tool returns "
+        "needs_consent, ask; retry with confirmed=true only after a clear yes.\n\n"
+        "One desktop task at a time — if busy, say what's running and offer stop or wait. "
+        "Chatting is always fine mid-task.\n\n"
+        "VISION\n"
+        "What's on screen is ONLY what the latest screenshot shows. The user switches "
+        "apps and tabs constantly — never describe a page from an earlier turn. "
+        "Foreground peek: look_at_screen. Background peek (user busy elsewhere): "
+        "list_windows → capture_window. If you haven't seen a fresh frame for this "
+        "question, capture before answering."
     )
