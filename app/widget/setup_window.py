@@ -275,20 +275,15 @@ def _build():  # imports deferred so importing this module never needs Qt
         def mouseReleaseEvent(self, e):
             self._drag = None
 
-        def showEvent(self, e):
-            super().showEvent(e)
-            try:
-                from .qt_shell import _apply_acrylic
-                _apply_acrylic(int(self.winId()), 0x1C1C24_00)
-            except Exception:
-                pass
-
         def _qss(self) -> str:
+            # No DWM acrylic on purpose: it blurs the whole RECTANGULAR window and
+            # bleeds a second outline past the rounded card (the old capsule bug). Just
+            # a solid dark card on a transparent window — one clean rounded edge.
             return f"""
             #card {{
-                background: rgba(22,22,28,0.96);
-                border: 1px solid rgba(255,255,255,0.07);
-                border-radius: 22px;
+                background: #191920;
+                border: 1px solid rgba(255,255,255,0.06);
+                border-radius: 20px;
             }}
             QLineEdit#field {{
                 background: {FIELD_BG};
