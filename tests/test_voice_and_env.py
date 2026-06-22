@@ -234,10 +234,13 @@ def test_detect_app_launch_intent():
     assert d("open task manager please") == ("start taskmgr", "Task Manager")
     assert d("open the ms paint app") == ("start mspaint", "Paint")
     assert d("hey orynn, open notepad") == ("start notepad", "Notepad")
+    # Chrome + Spotify are in the expanded registry now (WS1 launch coverage).
+    assert d("open chrome") == ("start chrome", "Google Chrome")
+    assert d("open spotify") == ("start spotify:", "Spotify")
 
     # Not pure launches / unknown -> None (planner handles these).
     assert d("open notepad and type hello") is None
-    assert d("open chrome") is None            # not in the curated registry
+    assert d("open photoshop") is None          # not in the curated registry
     assert d("what's open in notepad") is None  # not a launch verb
     assert d("type hello") is None
     assert d("open notepad to write a note") is None
