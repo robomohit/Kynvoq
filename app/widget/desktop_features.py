@@ -1924,6 +1924,57 @@ def invoke_ui_element(query: str, app_hint: str = "", allow_pixel_fallback: bool
                     "rect": rect}
     except Exception:
         pass
+    # 2b. Editable inputs (Edit/Combo/Document): the "click" intent is to FOCUS them
+    #     (address bars, search boxes). SetFocus does that with NO mouse move -- and it
+    #     works in the no-pixel fast path, so "click the search bar" stops escalating.
+    if str(info.get("control_type")) in ("EditControl", "ComboBoxControl", "DocumentControl"):
+        try:
+            ctrl.SetFocus()
+            return {"ok": True, "method": "set_focus",
+                    "target": target, "control_type": info["control_type"], "rect": rect}
+        except Exception:
+            pass
+    # 2c. Actionable ancestor -- the Chromium/Electron win. Cursor/Discord/VS Code and
+    #     web content wrap a real clickable Button/Link around a text or icon label, so
+    #     the matched control has no pattern but its PARENT does. Walk up a few levels
+    #     for a CLICKABLE ancestor with InvokePattern/Toggle and activate THAT -- clean,
+    #     no mouse (this is what makes Cursor's "New Agent" activate without a pixel
+    #     click). Restricted to clickable control types so we never fire a container.
+    _CLICKABLE = ("ButtonControl", "HyperlinkControl", "MenuItemControl",
+                  "SplitButtonControl", "ListItemControl", "TabItemControl",
+                  "CheckBoxControl", "RadioButtonControl")
+    try:
+        node = ctrl
+        for _ in range(3):
+            node = node.GetParentControl()
+            if node is None:
+                break
+            if str(getattr(node, "ControlTypeName", "")) not in _CLICKABLE:
+                continue
+            ip2 = _uia_pattern(node, "InvokePattern")
+            if ip2 is not None:
+                ip2.Invoke()
+                return {"ok": True, "method": "ancestor_invoke",
+                        "target": target, "control_type": info["control_type"], "rect": rect}
+            tp2 = _uia_pattern(node, "TogglePattern")
+            if tp2 is not None:
+                tp2.Toggle()
+                return {"ok": True, "method": "ancestor_toggle",
+                        "target": target, "control_type": info["control_type"], "rect": rect}
+    except Exception:
+        pass
+    # 2d. LegacyIAccessible.DoDefaultAction -- native (non-Chromium) controls that lack
+    #     Invoke but carry a working default action. (On Chromium this raises COMError,
+    #     handled below, so it's a no-op there and we fall through to the pixel click.)
+    try:
+        lp = _uia_pattern(ctrl, "LegacyIAccessiblePattern")
+        if lp is not None and hasattr(lp, "DoDefaultAction"):
+            lp.DoDefaultAction()
+            return {"ok": True, "method": "legacy_default_action",
+                    "target": target, "control_type": info["control_type"],
+                    "rect": rect}
+    except Exception:
+        pass
     # 3. Coordinate click â€” only if the control now has a real on-screen rect.
     #    This is the one tier that steals the real mouse, so be polite about it.
     if not allow_pixel_fallback:

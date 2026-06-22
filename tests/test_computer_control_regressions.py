@@ -19,6 +19,20 @@ from app.models import Action, ActionType, HierarchicalPlan, SubTask, ToolResult
 from app.providers import PlannerProvider, detect_task_mode, infer_isolated_app_name
 
 
+def test_invoke_ui_element_has_clean_chromium_tiers():
+    """UIA fine-tune for Cursor/Chrome/Electron: focus editable inputs (set_focus) and
+    invoke the actionable ANCESTOR of a Chromium text/icon label (ancestor_invoke) --
+    both BEFORE the mouse-stealing coordinate click, so these activate cleanly with no
+    cursor hijack and work in the no-pixel fast path."""
+    import inspect
+    from app.widget import desktop_features
+
+    src = inspect.getsource(desktop_features.invoke_ui_element)
+    assert "set_focus" in src and "ancestor_invoke" in src
+    assert src.index("ancestor_invoke") < src.index("click_fallback")
+    assert src.index("set_focus") < src.index("click_fallback")
+
+
 class DummyLogEmitter:
     async def emit(self, *args, **kwargs):
         return None
