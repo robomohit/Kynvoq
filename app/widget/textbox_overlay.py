@@ -1347,28 +1347,13 @@ class OverlayController(QObject):
         send = getattr(live, "send_screen_image", None)
         if not send or not send(data, wait=True):
             return False, fg
-        capture_kind = "foreground window (PrintWindow)" if mode == "window" else "primary monitor"
-        note = (
-            f"[Fresh screenshot attached RIGHT NOW — {capture_kind}"
-            + (f": {fg}" if fg else "")
-            + ". Describe ONLY what you see in THIS frame. The user may have "
-            "switched apps or tabs since earlier turns — never answer from memory "
-            "of old pages. If you don't see what they named, say so plainly (e.g. "
-            "\"I don't see X on this screen\") and tell them what IS visible instead "
-            "— never invent it or give generic directions for something not in this "
-            "frame. You can see the WHOLE screen here — use it for context. A thin red "
-            "ring (outline only — NOT part of the screen, don't mention the ring) circles "
-            "where the user's MOUSE is pointing; the element INSIDE the ring is what they "
-            "mean by 'this/here/that'. Read that exact element (the specific button/word/"
-            "link inside the ring), using the rest of the screen for context — but do NOT "
-            "default to the page title or biggest heading; the ringed element is the "
-            "answer.]"
-        )
-        q = _clean_text(question)
-        if q:
-            note += f" User asked: {_short(q, 140)}"
-        if hasattr(live, "send_context_update"):
-            live.send_context_update(note)
+        # IMPORTANT: do NOT send a per-frame client_content note here. That posted a new
+        # user turn (turn_complete=True) which INTERRUPTED the model mid-reply — the
+        # "cuts itself off / jammed '?that' words" bug. The frame goes over the realtime
+        # VIDEO channel (which does NOT interrupt the turn); the standing vision guidance
+        # (answer from the latest frame, the red pointer ring, whole-screen context) now
+        # lives in the system prompt, and look_at_screen's own FunctionResponse carries
+        # the actual ask. So: send the frame, say nothing that starts a turn.
         return True, fg
 
     def _live_output_transcript(self, text: str, finished: bool, generation: int | None = None) -> None:
