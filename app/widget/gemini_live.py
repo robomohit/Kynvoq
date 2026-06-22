@@ -1240,6 +1240,72 @@ def _function_declarations(types: Any) -> list[Any]:
                 "required": ["query"],
             },
         ),
+        types.FunctionDeclaration(
+            name="run_workflow",
+            description=(
+                "Run a saved multi-step WORKFLOW by name (see ORYNN WORKFLOWS in your "
+                "context for what exists). Use this instead of start_desktop_task when the "
+                "user's request matches a saved workflow — it's the fast, reliable repeat. "
+                "If a workflow needs confirmation it returns needs_consent; ask, then call "
+                "again with confirmed=true."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the workflow to run."},
+                    "confirmed": {"type": "boolean", "description": "True only after a spoken yes."},
+                },
+                "required": ["name"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="save_workflow",
+            description=(
+                "Save a reusable multi-step workflow so you can repeat it later by name "
+                "(e.g. the user says 'remember how to post my edit' or after you do a "
+                "multi-step task they'll want again). Steps run through the verified "
+                "desktop tiers; reference controls by their on-screen NAME, never pixels."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short name for the workflow."},
+                    "description": {"type": "string", "description": "One line on what it does."},
+                    "triggers": {"type": "array", "items": {"type": "string"},
+                                 "description": "Phrases the user might say to run it."},
+                    "steps": {
+                        "type": "array",
+                        "description": "Ordered steps.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string",
+                                           "description": "open|click|type|press_keys|scroll|focus|run|wait"},
+                                "app": {"type": "string"},
+                                "target": {"type": "string", "description": "Control name to act on."},
+                                "text": {"type": "string"},
+                                "keys": {"type": "string"},
+                                "command": {"type": "string"},
+                                "seconds": {"type": "number"},
+                            },
+                            "required": ["action"],
+                        },
+                    },
+                },
+                "required": ["name", "steps"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="forget_workflow",
+            description="Delete a saved workflow by name.",
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Name of the workflow to delete."},
+                },
+                "required": ["name"],
+            },
+        ),
     ]
 
 
@@ -1275,6 +1341,10 @@ def _default_system_instruction() -> str:
         "- \"open Notepad\" / \"open Chrome and search X\" / \"edit my file\" → "
         "start_desktop_task once\n"
         "- \"remember cowork is top right\" → remember\n"
+        "- \"post my edit\" / \"do my morning setup\" when it matches an ORYNN WORKFLOW "
+        "→ run_workflow with that name (the fast reliable repeat — not start_desktop_task)\n"
+        "- \"save that as a workflow called X\" / \"remember how to do this\" → "
+        "save_workflow with clear named steps\n"
         "- \"stop\" / \"cancel\" / \"never mind\" → stop_current_task\n\n"
         "WHILE WORKING\n"
         "Commands: one short ack (\"On it\", \"Sure\"), then let tools run — they see "

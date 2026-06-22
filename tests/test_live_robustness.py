@@ -87,6 +87,7 @@ _BAD_ARGS = [
 _TOOL_NAMES = [
     "desktop_control", "start_desktop_task", "look_at_screen", "run_terminal",
     "web_search", "stop_current_task", "get_companion_status", "remember", "forget",
+    "run_workflow", "save_workflow", "forget_workflow",
     "", None, 123, "unknown_tool_xyz", "DESKTOP_CONTROL",
 ]
 

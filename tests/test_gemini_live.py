@@ -63,6 +63,9 @@ def test_function_declarations_cover_desktop_tools():
         "run_terminal",
         "remember",
         "forget",
+        "run_workflow",
+        "save_workflow",
+        "forget_workflow",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")

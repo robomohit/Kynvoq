@@ -1184,9 +1184,10 @@ class OverlayController(QObject):
                 on_tool=lambda name, args, gen=generation: self._live_tool_for_generation(gen, name, args),
             )
             live = GeminiLiveCompanion(callbacks)
-            # Inject Orynn's knowledge memory into the Live system prompt on every
-            # (re)connect, so it knows the user's setup/vocabulary in conversation.
-            live.dynamic_context = self._live_knowledge_block
+            # Inject Orynn's memory into the Live system prompt on every (re)connect:
+            # the FACT layer (knowledge -- the user's setup/vocab) plus the PROCEDURE
+            # layer (saved workflows it can run), so it knows the user AND what it can do.
+            live.dynamic_context = self._live_context_block
             self._live = live
             if live.start():
                 self._live_cancel.clear()
@@ -1930,6 +1931,136 @@ class OverlayController(QObject):
         return {"ok": True, "removed": removed,
                 "message": (f"Forgot {removed} thing(s)." if removed else "I didn't have anything matching that.")}
 
+    # ---- Workflows: the PROCEDURE layer (save + run saved multi-step tasks) --------
+    def _live_save_workflow(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Save a reusable multi-step workflow Live can run later by name."""
+        from app import workflows
+        name = _clean_text(args.get("name") or "")
+        steps = args.get("steps")
+        if not name:
+            return {"ok": False, "message": "What should I call this workflow?"}
+        saved = workflows.add_workflow(
+            name,
+            description=_clean_text(args.get("description") or ""),
+            triggers=args.get("triggers"),
+            steps=steps,
+            owner="user",
+        )
+        if saved is None:
+            return {"ok": False, "message": (
+                "I couldn't save that — a workflow needs a name and at least one valid "
+                "step (open/click/type/press_keys/scroll/focus/run/wait).")}
+        self._set_label(f"Saved workflow: {_short(saved['title'], 50)}", source="live_tool", force=True)
+        return {"ok": True, "name": saved["name"], "steps": len(saved["steps"]),
+                "message": (f"Saved the '{saved['title']}' workflow ({len(saved['steps'])} steps). "
+                            "Tell the user they can ask you to run it anytime.")}
+
+    def _live_forget_workflow(self, args: dict[str, Any]) -> dict[str, Any]:
+        from app import workflows
+        query = _clean_text(args.get("name") or args.get("query") or "")
+        if not query:
+            return {"ok": False, "message": "Which workflow should I forget?"}
+        removed = workflows.forget_workflow(query)
+        self._set_label("Workflow forgotten" if removed else "No such workflow",
+                        source="live_tool", force=True)
+        return {"ok": True, "removed": removed,
+                "message": (f"Forgot {removed} workflow(s)." if removed else "I didn't have a workflow matching that.")}
+
+    def _run_workflow_step(self, step: dict[str, Any]) -> dict[str, Any]:
+        """Execute ONE workflow step synchronously through Orynn's already-verified
+        tiers (so a workflow never adds new, untested behavior). Returns {ok, label}."""
+        action = _clean_text(step.get("action") or "").lower()
+        app = _clean_text(step.get("app") or "")
+        target = _clean_text(step.get("target") or "")
+        tools = self._live_desktop_tools()
+        if action == "wait":
+            try:
+                time.sleep(float(step.get("seconds") or 1.0))
+            except Exception:
+                pass
+            return {"ok": True, "label": "Waited"}
+        if action == "run":
+            cmd = _clean_text(step.get("command") or "")
+            if not cmd:
+                return {"ok": False, "label": "Empty command"}
+            res = tools.run_command(cmd)
+            return {"ok": bool(getattr(res, "ok", False)), "label": f"Ran: {_short(cmd, 40)}"}
+        if action == "open":
+            name = app or target
+            if not name:
+                return {"ok": False, "label": "Open which app?"}
+            try:
+                res = tools.focus_window(name)
+                if not bool(getattr(res, "ok", False)):
+                    tools.run_command(f'start "" "{name}"')
+                    tools.wait_for_window(name, timeout=8.0)
+            except Exception:
+                pass
+            return {"ok": True, "label": f"Opened {_short(name, 40)}"}
+        # click / type / press_keys / scroll / focus -> the synchronous verified path
+        # (UIA invoke/ancestor/legacy -> OCR -> grid-locate -> click), NOT the async
+        # escalation route, so steps run in order and each completes before the next.
+        dargs: dict[str, Any] = {"action": action}
+        if target:
+            dargs["query"] = target
+        if app:
+            dargs["app"] = app
+        if step.get("text"):
+            dargs["text"] = _clean_text(step.get("text"))
+        if step.get("keys"):
+            dargs["keys"] = _clean_text(step.get("keys"))
+        res = self._live_desktop_control(dargs)
+        ok = bool(isinstance(res, dict) and res.get("ok"))
+        return {"ok": ok, "label": f"{action} {_short(target or app, 40)}".strip()}
+
+    def _live_run_workflow(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Run a saved workflow's steps in order. Stops and reports honestly on the
+        first failed step (never claims it finished if it didn't). Disruptive workflows
+        need a spoken yes first."""
+        from app import workflows
+        name = _clean_text(args.get("name") or args.get("query") or "")
+        if not name:
+            return {"ok": False, "message": "Which workflow should I run?"}
+        wf = workflows.get(name) or (workflows.relevant(name, 1)[0] if workflows.relevant(name, 1) else None)
+        if not wf:
+            return {"ok": False, "message": f"I don't have a workflow called '{name}'. "
+                    "You can teach me one with save_workflow."}
+        steps = wf.get("steps", [])
+        # Consent gate: if any step would change/send something hard to undo, get a
+        # spoken yes first (same contract as a disruptive one-shot action).
+        disruptive = next((s for s in steps if self._goal_needs_consent(
+            " ".join(_clean_text(s.get(k)) for k in ("target", "text", "command", "app")))), None)
+        if disruptive is not None and not self._live_bool(args.get("confirmed")):
+            self.cursorStateRequested.emit("thinking")
+            self._set_label("Needs your OK", source="live_tool", force=True)
+            return {"ok": False, "needs_consent": True, "message": (
+                f"The '{wf['title']}' workflow includes something that changes or sends "
+                "data. Ask the user to confirm out loud; only on a clear yes, call "
+                "run_workflow again with the same name and confirmed set to true.")}
+        if self._busy_response() is not None:
+            return self._busy_response()
+        total = len(steps)
+        self.cursorStateRequested.emit("thinking")
+        for i, step in enumerate(steps, 1):
+            if self._live_cancel_requested():
+                self._set_label("Stopped", source="live_stop", force=True)
+                return {"ok": False, "stopped_at": i,
+                        "message": f"Stopped during '{wf['title']}' at step {i} of {total}."}
+            self._set_label(f"{wf['title']}: step {i}/{total}", source="live_tool", force=True)
+            outcome = self._run_workflow_step(step)
+            if not outcome.get("ok"):
+                workflows.mark_run(wf["name"])
+                return {"ok": False, "completed_steps": i - 1, "total": total,
+                        "failed_step": outcome.get("label"),
+                        "message": (f"I got {i - 1} of {total} steps into '{wf['title']}' but "
+                                    f"couldn't do step {i} ({outcome.get('label')}). Tell the "
+                                    "user plainly where it stopped — do NOT say it finished.")}
+            time.sleep(0.25)  # let the UI settle between steps
+        workflows.mark_run(wf["name"])
+        self._set_label(f"Done: {_short(wf['title'], 50)}", source="live_tool", force=True)
+        return {"ok": True, "total": total,
+                "message": f"Ran all {total} steps of '{wf['title']}'. Confirm done to the user briefly."}
+
     def _refresh_knowledge_block(self) -> None:
         """Fetch Orynn's known-facts prompt block from the backend into the cache.
         BLOCKING (urllib) — only call from the poll thread or a tool worker thread,
@@ -1947,6 +2078,23 @@ class OverlayController(QObject):
         Non-blocking (safe to call on the Live event loop via dynamic_context) — the
         cache is refreshed off-loop by the poll loop and after remember/forget."""
         return self._knowledge_block_cache
+
+    def _live_context_block(self) -> str:
+        """Everything Live should carry in its system prompt: the FACT layer (cached
+        knowledge) + the PROCEDURE layer (saved workflows it can run). Workflows are a
+        tiny local JSON read, so it's safe on the Live event loop."""
+        parts: list[str] = []
+        kb = self._knowledge_block_cache
+        if kb:
+            parts.append(kb)
+        try:
+            from app import workflows
+            wb = workflows.as_prompt_block()
+            if wb:
+                parts.append(wb)
+        except Exception:
+            pass
+        return "\n\n".join(parts)
 
     def _notify_live_memory_updated(self) -> None:
         """Push a fresh memory block into an active Live session so remember/forget
@@ -2059,6 +2207,12 @@ class OverlayController(QObject):
             return self._live_remember(args)
         if name == "forget":
             return self._live_forget(args)
+        if name == "run_workflow":
+            return self._live_run_workflow(args)
+        if name == "save_workflow":
+            return self._live_save_workflow(args)
+        if name == "forget_workflow":
+            return self._live_forget_workflow(args)
         if name == "get_companion_status":
             try:
                 data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
