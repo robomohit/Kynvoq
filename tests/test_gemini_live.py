@@ -839,6 +839,32 @@ def test_failed_desktop_action_label_hides_raw_diagnostics():
     assert c._live_tool_display_label("observe", False, raw, {}) == "Couldn't read the screen"
 
 
+def test_type_without_target_escalates_quietly():
+    """'type X' with text but no target field can't use the UIA fast path — it must
+    escalate to the agent WITHOUT flashing the raw 'Missing query for type' diagnostic
+    in the bubble (the user just sees a clean 'Typing that in')."""
+    calls = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            calls.append(path)
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+    labels = []
+    c.labelRequested.connect(lambda s: labels.append(str(s)))
+
+    res = c._live_tool_for_generation(
+        None, "desktop_control", {"action": "type", "text": "hello world"}
+    )
+    assert "/api/tasks" in calls  # escalated to the agent
+    assert "Missing query" not in " ".join(labels)
+    assert "Missing query" not in str(res)
+
+
 def test_live_toggle_success_resets_stale_session_state(monkeypatch):
     from app.widget import gemini_live as gl
 

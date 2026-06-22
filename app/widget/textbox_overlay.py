@@ -1797,6 +1797,15 @@ class OverlayController(QObject):
                     "with the same goal and confirmed set to true. If they say no, drop it."
                 ),
             }
+        # A type with text but no target field can't use the UIA fast path (it needs a
+        # control to target) — "type into the focused field" is an agent job. Escalate
+        # QUIETLY instead of letting the fast path flash its raw "Missing query for type"
+        # diagnostic in the bubble before escalating anyway.
+        if action == "type" and not query:
+            self.cursorStateRequested.emit("thinking")
+            if not self._live_is_running():
+                self._set_label("Typing that in", source="live_tool", force=True)
+            return self._live_tool("start_desktop_task", {"goal": goal})
         # FAST path: UIA-only (no pixel fallback), so a click either lands cleanly via
         # an accessibility pattern — instant, no mouse-jump — or fails fast. A click
         # that "worked" only by stealing the mouse is exactly the flaky Electron case,

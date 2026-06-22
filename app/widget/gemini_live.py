@@ -1180,9 +1180,12 @@ def _function_declarations(types: Any) -> list[Any]:
         types.FunctionDeclaration(
             name="web_search",
             description=(
-                "Real-time web facts: news, weather, scores, current events. One call "
-                "per question — cite the source out loud when you answer. NOT for files "
-                "on their PC (use run_terminal or start_desktop_task)."
+                "Real-time web facts: news, weather, scores, prices, current events, or "
+                "anything you genuinely don't know or that CHANGES over time. One call "
+                "per question — cite the source out loud when you answer. Do NOT search "
+                "for basic knowledge you already know (capitals, simple math, definitions, "
+                "history, common facts) — answer those instantly without a tool. NOT for "
+                "files on their PC (use run_terminal or start_desktop_task)."
             ),
             parameters_json_schema={
                 "type": "object",
@@ -1258,7 +1261,8 @@ def _default_system_instruction() -> str:
         "one; quick clicks auto-escalate if they fail). Check ORYNN MEMORY before "
         "looking things up or asking where something is. Save new facts with remember.\n\n"
         "Examples:\n"
-        "- \"hey\" / \"explain recursion\" → voice only, no tools\n"
+        "- \"hey\" / \"explain recursion\" / \"capital of France\" / \"what's 8x7\" → "
+        "voice only, no tools (basic knowledge — answer instantly, don't web_search)\n"
         "- \"who won the game last night\" → web_search once; cite the source out loud\n"
         "- \"git status\" / \"list my Downloads\" → run_terminal once\n"
         "- \"what's this error on my screen\" / \"look at my screen\" → look_at_screen "
