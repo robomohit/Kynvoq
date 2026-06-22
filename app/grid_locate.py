@@ -24,8 +24,16 @@ ZOOM_RADIUS = 1                         # cells each side of the stage-1 pick ->
 _MAX_INFER_W = 1280                     # downscale wide screens for the vision call
 
 
-def _model() -> str:
-    return (os.environ.get("ORYNN_GRID_MODEL") or "gemini-flash-latest").strip()
+def _models() -> list[str]:
+    """Vision models to try in order. grid-locate runs on generate_content, which is
+    rate-limited PER MODEL and separately from the (unlimited) Live model — so we keep
+    a fallback chain: a capable model first, then higher-quota lite models, so a 429 on
+    one bucket falls through instead of failing the click. Override with ORYNN_GRID_MODEL
+    (single) or ORYNN_GRID_MODELS (comma-separated)."""
+    raw = (os.environ.get("ORYNN_GRID_MODELS") or os.environ.get("ORYNN_GRID_MODEL") or "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    return ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-flash-lite-latest"]
 
 
 def _enabled() -> bool:
@@ -81,26 +89,36 @@ def _parse_cell(text: str, max_n: int) -> Optional[int]:
 
 
 def _ask_cell(jpeg_bytes: bytes, target: str, max_n: int, key: str) -> Optional[int]:
-    """Ask the vision model which numbered cell holds the target. None on any failure."""
+    """Ask the vision model which numbered cell holds the target. Tries the model chain
+    in order; a 429/error on one model falls through to the next. A model that responds
+    but can't place it (cell 0) is a real answer -> None (no further calls)."""
     try:
         from google import genai
         from google.genai import types
-
-        prompt = (
-            f"This screenshot has a red numbered grid; cells are numbered 1 to {max_n}, "
-            "left-to-right then top-to-bottom.\n"
-            f'Which SINGLE numbered cell most precisely contains this UI element: "{target}"?\n'
-            'Reply with ONLY this JSON, nothing else: {"cell": <number>}. '
-            'If that element is not visible anywhere in the image, reply exactly {"cell": 0}.'
-        )
         client = genai.Client(api_key=key)
-        resp = client.models.generate_content(
-            model=_model(),
-            contents=[prompt, types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")],
-        )
-        return _parse_cell(getattr(resp, "text", "") or "", max_n)
     except Exception:
         return None
+    prompt = (
+        f"This screenshot has a red numbered grid; cells are numbered 1 to {max_n}, "
+        "left-to-right then top-to-bottom.\n"
+        f'Which SINGLE numbered cell most precisely contains this UI element: "{target}"?\n'
+        'Reply with ONLY this JSON, nothing else: {"cell": <number>}. '
+        'If that element is not visible anywhere in the image, reply exactly {"cell": 0}.'
+    )
+    img = types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg")
+    debug = bool(os.environ.get("ORYNN_GRID_DEBUG"))
+    for model in _models():
+        try:
+            resp = client.models.generate_content(model=model, contents=[prompt, img])
+        except Exception as exc:  # noqa: BLE001 — quota/availability: fall through
+            if debug:
+                print(f"[grid] {model} ERROR {type(exc).__name__}: {str(exc)[:110]}")
+            continue
+        text = getattr(resp, "text", "") or ""
+        if debug:
+            print(f"[grid] {model} max_n={max_n} reply={text[:60]!r}")
+        return _parse_cell(text, max_n)  # the model saw it — trust its answer (or None)
+    return None
 
 
 def locate(target: str) -> Optional[tuple[int, int]]:
