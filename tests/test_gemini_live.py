@@ -2489,6 +2489,20 @@ def _has_red_ring(img):
     return any(r > 200 and g < 100 and b < 100 for _, (r, g, b) in cols)
 
 
+def test_user_pointing_flag_tracks_the_users_words(monkeypatch):
+    """The pointer ring rides every frame this turn based on what THE USER said, so a
+    model look_at_screen with a generic question still gets the ring (the 'pointed at
+    Cowork, it said Orynn' bug)."""
+    import app.widget.textbox_overlay as tbo
+
+    monkeypatch.setattr(tbo, "_live_auto_screen_mode", lambda: "off")
+    c = _controller()
+    c._live_input_transcript("what's this", True)
+    assert c._live_turn_points_at_cursor is True
+    c._live_input_transcript("read me the news", True)   # new, not pointing
+    assert c._live_turn_points_at_cursor is False
+
+
 def test_points_at_cursor_detection():
     from app.widget.textbox_overlay import _utterance_points_at_cursor as p
     # pointing -> focus on the mouse (full-monitor + ring)

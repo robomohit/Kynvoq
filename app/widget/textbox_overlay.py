@@ -713,6 +713,10 @@ class OverlayController(QObject):
         # One auto-screen frame per utterance — sent as the user STARTS speaking so it
         # reaches the model before end-of-turn (not racing its reply).
         self._live_turn_auto_screened = False
+        # Did THE USER point at something this turn ("what's this")? If so every frame
+        # this turn (auto-screen AND a model look_at_screen) gets the pointer ring, so
+        # the model can't lose it just because its own tool question lacked "this".
+        self._live_turn_points_at_cursor = False
         self._label_protect_until = 0.0
         self._label_protect_source = ""
         # Last text actually painted + when, so an unchanged label can't repaint and
@@ -1276,6 +1280,9 @@ class OverlayController(QObject):
             self._live_input_done = False
             self._live_turn_auto_screened = False   # new utterance -> one fresh frame
         self._live_input_buffer = _merge_streamed_text(self._live_input_buffer, chunk)
+        # Track whether the user is pointing this turn, from THEIR words (not the model's
+        # later tool phrasing), so the ring rides every frame this turn.
+        self._live_turn_points_at_cursor = _utterance_points_at_cursor(self._live_input_buffer)
         # The bubble is Gemini Live's CONVERSATION (it's the front desk) — do NOT echo
         # the user's own words back at them ("Hearing: hi" / "Heard: …"). That read as
         # robotic and redundant. Keep the listening cue + the buffer (for auto-screen
@@ -1333,7 +1340,8 @@ class OverlayController(QObject):
         live = self._live
         if live is None or not hasattr(live, "send_screen_image"):
             return False, ""
-        data, fg, mode = self._capture_vision_jpeg(_utterance_points_at_cursor(question))
+        prefer_monitor = _utterance_points_at_cursor(question) or self._live_turn_points_at_cursor
+        data, fg, mode = self._capture_vision_jpeg(prefer_monitor)
         if not data:
             return False, ""
         send = getattr(live, "send_screen_image", None)
@@ -1349,9 +1357,11 @@ class OverlayController(QObject):
             "\"I don't see X on this screen\") and tell them what IS visible instead "
             "— never invent it or give generic directions for something not in this "
             "frame. A small red ring marks the user's MOUSE POINTER (it is NOT part of "
-            "the screen — don't describe the ring itself). If they say 'this', 'here', "
-            "'that', or ask what they're pointing at, focus on whatever is under or "
-            "nearest that ring.]"
+            "the screen — don't describe the ring itself). When they say 'this/here/"
+            "that' or ask what they're pointing at, identify EXACTLY the element under "
+            "the ring's center — read that specific button/word/link — even if other "
+            "text is larger or more prominent. Do NOT default to the page title or the "
+            "biggest heading; the ring is the answer.]"
         )
         q = _clean_text(question)
         if q:
