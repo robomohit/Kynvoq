@@ -2528,6 +2528,57 @@ class PlannerProvider:
             return {"complete": False, "reason": "Evaluation failed to parse LLM response."}
 
 
+def ocr_live_capture(*, question: str = "") -> dict[str, Any]:
+    """OCR pass for Live look_at_screen mid-tier (WS7). Returns text + confidence."""
+    import time as _time
+
+    started = _time.monotonic()
+    try:
+        import mss
+        from PIL import Image
+
+        hwnd, title, mode = resolve_hwnd_for_live_vision()
+        if mode == "window" and hwnd:
+            img = _capture_hwnd_image(hwnd, max_edge=1280)
+        else:
+            with mss.mss() as sct:
+                mons = sct.monitors
+                mon = mons[1] if len(mons) > 1 else mons[0]
+                shot = sct.grab(mon)
+                img = Image.frombytes("RGB", shot.size, shot.rgb)
+        try:
+            import pytesseract
+            from pytesseract import Output
+
+            data = pytesseract.image_to_data(img, output_type=Output.DICT)
+            texts = []
+            confs = []
+            for i, txt in enumerate(data.get("text") or []):
+                t = str(txt or "").strip()
+                if not t:
+                    continue
+                try:
+                    c = float(data["conf"][i])
+                except Exception:
+                    c = -1.0
+                if c >= 0:
+                    texts.append(t)
+                    confs.append(c)
+            full = " ".join(texts).strip()
+            confidence = (sum(confs) / len(confs) / 100.0) if confs else 0.0
+            return {
+                "ok": bool(full),
+                "text": full,
+                "confidence": min(1.0, max(0.0, confidence)),
+                "frame_age_ms": int((_time.monotonic() - started) * 1000),
+                "window": title,
+            }
+        except ImportError:
+            return {"ok": False, "text": "", "confidence": 0.0, "error": "pytesseract missing"}
+    except Exception as exc:
+        return {"ok": False, "text": "", "confidence": 0.0, "error": str(exc)[:200]}
+
+
 __all__ = [
     "PlannerProvider",
     "detect_task_mode",

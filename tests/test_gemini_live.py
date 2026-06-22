@@ -53,6 +53,7 @@ def test_function_declarations_cover_desktop_tools():
     names = {d.name for d in decls}
     assert names == {
         "desktop_control",
+        "launch_app",
         "start_desktop_task",
         "stop_current_task",
         "get_companion_status",
@@ -1215,7 +1216,7 @@ def test_live_tool_desktop_control_type_requires_non_empty_text():
 
     assert res["ok"] is False
     assert "missing text" in res["message"].lower()
-    assert labels == ["Missing text for type."]
+    assert labels == []  # internal validation — model recovers by voice, not bubble
 
 
 def test_model_click_uses_fast_path_no_agent():
@@ -2385,7 +2386,7 @@ def test_live_tool_unknown_name_is_reported_not_raised():
     res = c._live_tool("teleport_the_user", {"x": 1})
 
     assert res["ok"] is False and "unknown" in res["message"].lower()
-    assert labels == ["Unsupported Live tool"]
+    assert labels == []  # unknown tool is an internal model error, not user-facing
     assert states == ["thinking"]
 
 
@@ -2399,7 +2400,7 @@ def test_live_tool_unknown_desktop_action_sets_visible_label():
 
     assert res["ok"] is False
     assert "unknown desktop action" in res["message"].lower()
-    assert labels == ["Unsupported desktop action"]
+    assert labels == []  # unknown action is internal — no robotic bubble flash
     assert states == ["thinking"]
 
 
@@ -2452,8 +2453,9 @@ def test_live_input_transcript_shows_partial_and_final_hearing():
     c._live_input_transcript("open", False)
     c._live_input_transcript(" notepad", True)
 
-    assert labels == ["Hearing: open", "Heard: open notepad"]
+    assert labels == []  # input echo muted — bubble is for Live's replies only
     assert states == ["listening", "listening"]
+    assert c._live_input_buffer == "open notepad"
 
 
 def test_live_input_transcript_handles_cumulative_chunks():
@@ -2465,11 +2467,8 @@ def test_live_input_transcript_handles_cumulative_chunks():
     c._live_input_transcript("open notepad", False)
     c._live_input_transcript("open notepad please", True)
 
-    assert labels == [
-        "Hearing: open",
-        "Hearing: open notepad",
-        "Heard: open notepad please",
-    ]
+    assert labels == []  # cumulative chunks update the buffer, not the bubble
+    assert c._live_input_buffer == "open notepad please"
 
 
 def test_live_listening_status_does_not_overwrite_fresh_input():
@@ -2481,7 +2480,7 @@ def test_live_listening_status_does_not_overwrite_fresh_input():
     c._live_input_transcript("open notepad", False)
     c._live_status("Gemini Live listening")
 
-    assert labels == ["Hearing: open notepad"]
+    assert labels == []  # neither input echo nor "listening" text in the bubble
     assert states[-1] == "listening"
 
 
@@ -2517,8 +2516,9 @@ def test_live_input_transcript_resets_across_turns_on_finalize():
     c._live_input_transcript("", True)                   # turn boundary -> silent close
     c._live_input_transcript("what time is it", False)   # turn 2: brand-new utterance
 
-    assert labels == ["Hearing: hello there", "Hearing: what time is it"]
-    assert "hello there" not in labels[-1]
+    assert labels == []  # turn boundaries are silent in the bubble
+    assert c._live_input_buffer == "what time is it"
+    assert "hello there" not in c._live_input_buffer
 
 
 def test_input_turn_finalize_does_not_rerender():
@@ -2565,11 +2565,11 @@ def test_live_tool_failure_status_overrides_fresh_transcript():
     c._live_input_transcript("open notepad", True)
     c._live_status("Live tool call failed")
 
-    assert labels == ["Heard: open notepad", "Live tool call failed"]
+    assert labels == ["Live tool call failed"]  # input echo muted; tool failure still shows
     assert states[-1] == "thinking"
 
 
-def test_live_listening_status_is_clean_when_visible():
+def test_live_listening_status_is_cursor_only():
     c = _controller()
     labels, states = [], []
     c.labelRequested.connect(lambda s: labels.append(s))
@@ -2577,7 +2577,7 @@ def test_live_listening_status_is_clean_when_visible():
 
     c._live_status("Gemini Live listening")
 
-    assert labels == ["Listening"]
+    assert labels == []  # listening is cursor-only — no robotic status in the bubble
     assert states == ["listening"]
 
 
@@ -2714,13 +2714,13 @@ def test_live_spawned_task_does_not_flash_over_the_conversation():
     # 5. Live goes back to listening between commands.
     c._live_status("Gemini Live listening")
 
-    # Only the live conversation reached the bubble — no task churn, no flashing.
-    assert labels == ["Heard: open notepad and type hello", "Okay, I'm getting it."]
+    # Only Live's spoken reply reached the bubble — no input echo, no task churn.
+    assert labels == ["Okay, I'm getting it."]
 
     # 6. The task finishes: its result is muted too while Live drives — Live narrates
     #    the outcome by voice, so the bubble stays on the conversation (no raw flash).
     assert c._set_label("Notepad is open with hello typed.", source="task_result") is False
-    assert labels == ["Heard: open notepad and type hello", "Okay, I'm getting it."]
+    assert labels == ["Okay, I'm getting it."]
 
 
 def test_live_owns_cursor_state_while_running():

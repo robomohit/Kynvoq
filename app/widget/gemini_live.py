@@ -849,26 +849,39 @@ class GeminiLiveCompanion:
             )
             # endregion
             responses = []
-            _DESKTOP_TOOLS = frozenset({"desktop_control", "start_desktop_task"})
-            desktop_used = False
+            from app.specialists.registry import EXCLUSION_GROUPS
+
+            used_groups: set[str] = set()
             for call in calls:
                 name = str(getattr(call, "name", "") or "")
                 args, arg_error = _coerce_tool_args(getattr(call, "args", None))
+                blocked_group = ""
+                for group, tools in EXCLUSION_GROUPS.items():
+                    if name in tools and group in used_groups:
+                        blocked_group = group
+                        break
                 if arg_error:
                     self.callbacks.on_status("Live tool call failed")
                     result = {"ok": False, "message": arg_error}
-                elif name in _DESKTOP_TOOLS and desktop_used:
+                elif blocked_group:
+                    group_msg = {
+                        "desktop": (
+                            "Only one desktop action per turn — pick desktop_control, "
+                            "launch_app, OR start_desktop_task, not both. Wait for the result first."
+                        ),
+                    }
                     result = {
                         "ok": False,
-                        "message": (
-                            "Only one desktop action per turn — pick desktop_control "
-                            "OR start_desktop_task, not both. Wait for the result first."
+                        "message": group_msg.get(
+                            blocked_group,
+                            f"Only one {blocked_group} tool per turn — wait for the result before calling another.",
                         ),
                     }
                 else:
                     result = await self._execute_tool(name, args or {})
-                    if name in _DESKTOP_TOOLS:
-                        desktop_used = True
+                    for group, tools in EXCLUSION_GROUPS.items():
+                        if name in tools:
+                            used_groups.add(group)
                 responses.append(
                     types.FunctionResponse(
                         name=name,
@@ -1099,6 +1112,28 @@ def _function_declarations(types: Any) -> list[Any]:
                     },
                 },
                 "required": ["title"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="launch_app",
+            description=(
+                "Open or switch to an app by name (Spotify, Notepad, Settings, etc.). "
+                "Prefer for pure 'open X' — verifies the window before success. "
+                "Do NOT also call start_desktop_task for the same request."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "app": {
+                        "type": "string",
+                        "description": "App to open, e.g. Spotify, Notepad, Calculator.",
+                    },
+                    "settings_page": {
+                        "type": "string",
+                        "description": "Optional: display, sound, bluetooth, network, etc.",
+                    },
+                },
+                "required": ["app"],
             },
         ),
         types.FunctionDeclaration(
@@ -1338,7 +1373,9 @@ def _default_system_instruction() -> str:
         "- \"click that button\" / \"click Save\" / \"click Usage\" (one control, app "
         "already open) → desktop_control once — NOT start_desktop_task\n"
         "- \"click Save in Notepad\" (app already open) → desktop_control once\n"
-        "- \"open Notepad\" / \"open Chrome and search X\" / \"edit my file\" → "
+        "- \"open Notepad\" / \"open Spotify\" / \"open Settings display\" → "
+        "launch_app once (NOT start_desktop_task for a pure open)\n"
+        "- \"open Chrome and search X\" / \"edit my file\" → "
         "start_desktop_task once\n"
         "- \"remember cowork is top right\" → remember\n"
         "- \"post my edit\" / \"do my morning setup\" when it matches an ORYNN WORKFLOW "
@@ -1358,8 +1395,9 @@ def _default_system_instruction() -> str:
         "AUDIO immediately; never wait for them to ask \"is it done\". You stay listening; "
         "delivering these updates unprompted is expected.\n\n"
         "OUTCOMES\n"
-        "If ok is false or failed: say plainly it did NOT work — never claim done, "
-        "finished, or opened. If ok is true: one or two sentences on what happened.\n\n"
+        "Never claim success, finished, or opened until a tool returns ok:true "
+        "(launch_app verifies the window). If ok is false or failed: say plainly it "
+        "did NOT work. If ok is true: one or two sentences on what happened.\n\n"
         "CONSENT\n"
         "Before delete/send/submit/pay/relaunch, ask out loud. If a tool returns "
         "needs_consent, ask; retry with confirmed=true only after a clear yes.\n\n"

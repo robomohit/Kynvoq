@@ -706,6 +706,12 @@ def _start_task_from_spec(spec: Dict[str, Any]) -> TaskRecord:
         thinking_budget=spec.get("thinking_budget") or "off",
         history=spec.get("history") or [],
     )
+    ug = spec.get("user_goal") or spec["goal"]
+    pg = spec.get("prompt_goal") or spec["goal"]
+    record.user_goal = ug
+    record.prompt_goal = pg
+    record.goal = ug
+    record.context.goal = pg
     _tasks[record.id] = record
     _save_task_record(record)
     log_emitter.emit(record.id, "task_started", {
@@ -851,6 +857,8 @@ class TaskIn(BaseModel):
     autonomy_level: Literal["careful", "balanced", "fast", "autonomous"] = "balanced"
     thinking_budget: Literal["off", "standard", "extended"] = "off"
     readiness_override: bool = False
+    user_goal: Optional[str] = None
+    prompt_goal: Optional[str] = None
     # Prior conversation turns ([{role: "user"|"assistant", content}]) so a
     # follow-up message continues the chat instead of starting cold.
     history: List[Dict[str, str]] = Field(default_factory=list)
@@ -2307,9 +2315,13 @@ async def create_task(body: TaskIn):
     )
 
     try:
+        user_goal = (body.user_goal or body.goal).strip()
+        prompt_goal = (body.prompt_goal or body.goal).strip()
         spec = {
             "task_id": body.task_id,
-            "goal": body.goal,
+            "goal": prompt_goal,
+            "user_goal": user_goal,
+            "prompt_goal": prompt_goal,
             "screen_width": body.screen_width,
             "screen_height": body.screen_height,
             "model": selected_model,
@@ -2339,7 +2351,9 @@ async def create_task(body: TaskIn):
                 id=body.task_id,
                 status="queued",
                 context=context,
-                goal=body.goal,
+                goal=user_goal,
+                user_goal=user_goal,
+                prompt_goal=prompt_goal,
                 model=selected_model,
                 mode=execution_mode,
                 plan_first=body.plan_first,

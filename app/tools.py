@@ -454,6 +454,30 @@ _KNOWN_LAUNCH_APPS: Dict[str, tuple] = {
     "wordpad": ("start wordpad", "WordPad"),
     "settings": ("start ms-settings:", "Settings"),
     "task manager": ("start taskmgr", "Task Manager"),
+    # WS1 registry expansion — third-party + common Windows apps
+    "spotify": ("start spotify:", "Spotify"),
+    "edge": ("start msedge", "Edge"),
+    "microsoft edge": ("start msedge", "Edge"),
+    "chrome": ("start chrome", "Google Chrome"),
+    "google chrome": ("start chrome", "Google Chrome"),
+    "firefox": ("start firefox", "Mozilla Firefox"),
+    "explorer": ("start explorer", "File Explorer"),
+    "file explorer": ("start explorer", "File Explorer"),
+    "cmd": ("start cmd", "Command Prompt"),
+    "command prompt": ("start cmd", "Command Prompt"),
+    "powershell": ("start powershell", "Windows PowerShell"),
+    "terminal": ("start wt", "Windows Terminal"),
+    "photos": ("start ms-photos:", "Photos"),
+    "snipping tool": ("start snippingtool", "Snipping Tool"),
+    "clock": ("start ms-clock:", "Clock"),
+    "mail": ("start outlookmail:", "Mail"),
+    "store": ("start ms-windows-store:", "Store"),
+    "discord": ("start discord:", "Discord"),
+    "vscode": ("start code", "Visual Studio Code"),
+    "visual studio code": ("start code", "Visual Studio Code"),
+    "cursor": ("start cursor", "Cursor"),
+    "teams": ("start msteams:", "Microsoft Teams"),
+    "onenote": ("start onenote:", "OneNote"),
 }
 
 _LAUNCH_VERB_RE = re.compile(
@@ -485,7 +509,18 @@ def detect_app_launch_intent(goal: str) -> Optional[tuple]:
         return None
     rest = _LAUNCH_FILLER_RE.sub(" ", rest)
     rest = re.sub(r"\s+", " ", rest).strip()
-    return _KNOWN_LAUNCH_APPS.get(rest)
+    hit = _KNOWN_LAUNCH_APPS.get(rest)
+    if hit:
+        return hit
+    try:
+        from .launch import resolve_launch_target
+
+        entry = resolve_launch_target(rest)
+        if entry and entry.kind in ("curated", "settings", "protocol"):
+            return entry.launch_command, entry.window_title
+    except Exception:
+        pass
+    return None
 
 
 class ToolExecutor:
@@ -1513,6 +1548,16 @@ class ToolExecutor:
             ok=False,
             output=f"Ran '{command}' but no '{title}' window appeared in time.",
         )
+
+    def open_settings(self, page: str = "display") -> ToolResult:
+        """Open a Windows Settings pane via ms-settings: URI (WS1)."""
+        try:
+            from .launch import open_settings_uri
+
+            cmd, title = open_settings_uri(page)
+        except Exception as exc:
+            return ToolResult(ok=False, output=f"Unknown settings page: {exc}")
+        return self.open_known_app(cmd, title, timeout=12.0)
 
     def _auto_wait_after_launch(self, command: str):
         title_hint = self._guess_launch_target_title(command)
@@ -3066,6 +3111,7 @@ class ToolExecutor:
                 build_affordance_graph,
                 classify_surface_runtime,
                 format_affordance_graph,
+                format_playbook_hint,
                 format_recovery_plan,
                 format_runtime_plan,
                 meaningful_runtime_control_count,
@@ -3222,6 +3268,9 @@ class ToolExecutor:
             data["recovered_by"] = recovered_by
         output = format_affordance_graph(graph)
         output += "\n" + format_runtime_plan(runtime_plan)
+        pb = format_playbook_hint(observed_app)
+        if pb:
+            output += "\n" + pb
         if recovered_by:
             output += f"\nRecovered empty UIA map via {recovered_by}."
         if graph["named_control_count"] == 0:

@@ -1,0 +1,3 @@
+{"ts": 1.0, "action": "shown", "source": "live_tool", "reason": "", "live": true, "text": "On it"}
+{"ts": 1.1, "action": "muted", "source": "task_action", "reason": "task_outcome_under_live", "live": true, "text": "Started: open spotify"}
+{"ts": 1.2, "action": "muted", "source": "task_result", "reason": "bubble_sanitizer_denylist", "live": true, "text": "Failed: Server restarted or task was abandoned."}

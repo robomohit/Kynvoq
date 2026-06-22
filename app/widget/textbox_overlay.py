@@ -19,6 +19,7 @@ from PySide6.QtGui import QAction, QColor, QGuiApplication, QIcon, QPainter, QPi
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .virtual_cursor import VirtualCursorOverlay
+from ..bubble_sanitizer import sanitize_bubble_text
 
 
 DESKTOP_HARDENING = (
@@ -563,6 +564,8 @@ def build_task_payload(goal: str) -> dict[str, Any]:
     return {
         "task_id": "clicky-" + secrets.token_hex(5),
         "goal": payload_goal,
+        "user_goal": goal,
+        "prompt_goal": payload_goal,
         "mode": mode,
         "screen_width": width,
         "screen_height": height,
@@ -652,6 +655,7 @@ class OverlayController(QObject):
         # Goal of the desktop task currently running (if any), so Live can name it
         # when it refuses to start a second, colliding action on top of it.
         self._active_task_goal: str = ""
+        self._busy_since: float | None = None
         self._consecutive_failures = 0
         # Tasks Live launched (task_id -> short goal), so when one finishes we can
         # feed the outcome back to the conversation instead of losing it.
@@ -861,6 +865,12 @@ class OverlayController(QObject):
         label = _clean_text(text)
         if not label:
             return False
+        sanitized = sanitize_bubble_text(label, source=source)
+        if not sanitized:
+            if label != sanitized:
+                _log_label(label, source, "muted", "bubble_sanitizer_denylist", self._live_is_running())
+            return False
+        label = sanitized
         with self._label_lock:
             now = time.monotonic()
             protected = now < self._label_protect_until
@@ -1219,7 +1229,10 @@ class OverlayController(QObject):
             self._set_label(msg, source="live_tool", force=True)
             return
         if "listening" in msg.lower():
+            # The cursor orb already shows 'listening' — don't put robotic "Gemini Live
+            # listening" text in the conversation bubble (front desk = Live's own words).
             self.cursorStateRequested.emit("listening")
+            return
         self._set_label(_short(msg, 150), source="live_status")
 
     def _live_input_transcript(self, text: str, finished: bool, generation: int | None = None) -> None:
@@ -1242,11 +1255,11 @@ class OverlayController(QObject):
             self._live_input_buffer = ""
             self._live_input_done = False
         self._live_input_buffer = _merge_streamed_text(self._live_input_buffer, chunk)
-        heard = _short(_strip_markdown(self._live_input_buffer).strip(), 150)
-        if heard:
-            prefix = "Heard: " if finished else "Hearing: "
-            self.cursorStateRequested.emit("listening")
-            self._set_label(prefix + heard, source="live_input", force=True)
+        # The bubble is Gemini Live's CONVERSATION (it's the front desk) — do NOT echo
+        # the user's own words back at them ("Hearing: hi" / "Heard: …"). That read as
+        # robotic and redundant. Keep the listening cue + the buffer (for auto-screen
+        # intent); the bubble stays on Live's reply, which is what the user came for.
+        self.cursorStateRequested.emit("listening")
         if finished:
             self._live_input_done = True
             self._live_reply_done = True
@@ -1778,13 +1791,13 @@ class OverlayController(QObject):
         if busy is not None:
             return busy
         query = _clean_text(args.get("query") or "")
+        # Missing-arg validation is an INTERNAL model error — return it so the model
+        # re-asks the user by voice; never flash robotic "Missing target…" in the bubble.
         if action == "click" and not query:
             self.cursorStateRequested.emit("thinking")
-            self._set_label("Missing target to click", source="live_tool", force=True)
             return {"ok": False, "action": action, "message": "Missing query for click."}
         if action == "type" and not str(args.get("text") or "").strip():
             self.cursorStateRequested.emit("thinking")
-            self._set_label("Missing text for type.", source="live_tool", force=True)
             return {"ok": False, "action": action, "message": "Missing text for type."}
         goal = self._goal_from_desktop_control(action, args)
         # Disruptive targets still need a spoken yes first. A confirmed one runs via
@@ -1865,8 +1878,8 @@ class OverlayController(QObject):
     def _live_desktop_control(self, args: dict[str, Any], *, fast_invoke_only: bool = False) -> dict[str, Any]:
         action = _clean_text(args.get("action") or "").lower().replace("-", "_")
         if action not in LIVE_DESKTOP_ACTIONS:
+            # Internal model error — return it (the model recovers); no robotic bubble flash.
             self.cursorStateRequested.emit("thinking")
-            self._set_label("Unsupported desktop action", source="live_tool", force=True)
             return {"ok": False, "message": f"Unknown desktop action: {action or '(missing)'}"}
         self.cursorStateRequested.emit("thinking")
         self._set_label(LIVE_DESKTOP_ACTION_LABELS[action], source="live_tool", force=True)
@@ -2134,20 +2147,36 @@ class OverlayController(QObject):
         except Exception:
             pass
 
+    def _touch_desktop_busy(self) -> None:
+        self._active_task_running = True
+        self._busy_since = time.monotonic()
+
+    def _clear_desktop_busy(self) -> None:
+        self._active_task_running = False
+        self._active_task_goal = ""
+        self._busy_since = None
+
+    def _desktop_busy_watchdog(self) -> None:
+        """Clear stale busy flag after 30s TTL (WS3)."""
+        if not self._active_task_running or self._busy_since is None:
+            return
+        if time.monotonic() - self._busy_since > 30.0:
+            self._clear_desktop_busy()
+
     def _active_desktop_task(self) -> str | None:
         """Return the goal of a desktop task that's currently driving the screen, or
         None. Used to stop a new Live action from colliding with one already running
         (two agents on one desktop = stolen focus + interleaved keystrokes). The
         cheap local flag gates the common case; when it says "busy" we confirm once
         over HTTP so a stale flag can't lock Live out forever."""
+        self._desktop_busy_watchdog()
         if not self._active_task_running:
             return None
         try:
             data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
             tasks = data.get("tasks", []) if isinstance(data, dict) else []
             if not tasks:
-                self._active_task_running = False
-                self._active_task_goal = ""
+                self._clear_desktop_busy()
                 return None
         except Exception:
             pass  # network hiccup — trust the flag and stay safe (assume busy)
@@ -2181,10 +2210,12 @@ class OverlayController(QObject):
         # they'd fight over focus and the keyboard and corrupt each other. Surface it
         # so Live can tell the user and offer to stop it. (stop_current_task and
         # get_companion_status are intentionally NOT gated — those are how you escape.)
-        if name in ("desktop_control", "start_desktop_task"):
+        if name in ("desktop_control", "start_desktop_task", "launch_app"):
             busy = self._busy_response()
             if busy is not None:
                 return busy
+        if name == "launch_app":
+            return self._live_launch_app(args)
         if name == "desktop_control":
             return self._live_desktop_control(args)
         if name == "start_desktop_task":
@@ -2205,8 +2236,7 @@ class OverlayController(QObject):
             # unconditionally, even if the kill HTTP call then fails (network blip). A
             # stale "busy" flag must never trap the user out of issuing new commands (#9).
             self.cursorStateRequested.emit("idle")
-            self._active_task_running = False
-            self._active_task_goal = ""
+            self._clear_desktop_busy()
             self._set_label("Stopped", source="live_stop", force=True)
             try:
                 stopped = self._kill_active_tasks()
@@ -2251,8 +2281,8 @@ class OverlayController(QObject):
                 return resp
             except Exception as exc:
                 return {"ok": False, "message": str(exc)[:200]}
+        # Internal model error (unknown tool name) — return it; no robotic bubble flash.
         self.cursorStateRequested.emit("thinking")
-        self._set_label("Unsupported Live tool", source="live_tool", force=True)
         return {"ok": False, "message": f"Unknown tool: {name}"}
 
     @staticmethod
@@ -2326,26 +2356,50 @@ class OverlayController(QObject):
         return ""
 
     def _live_look_at_screen(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Capture a screenshot and hand it to Live's own vision so it can SEE the
-        screen and answer (no local OCR). Read-only — fine to use mid-task."""
+        """Capture screen; OCR mid-tier when text-heavy, else vision frame (WS7)."""
         live = self._live
         if live is None or not hasattr(live, "send_screen_image"):
             return {"ok": False, "message": "Live vision isn't available right now."}
         question = _clean_text(args.get("question") or "")
         self.cursorStateRequested.emit("thinking")
         self._set_label("Looking at the screen", source="live_tool", force=True)
+        capture_started = time.monotonic()
+        from .. import providers as prov
+
+        ocr_result = prov.ocr_live_capture(question=question)
+        frame_age_ms = int((time.monotonic() - capture_started) * 1000)
+        ocr_text = str(ocr_result.get("text") or "").strip()
+        ocr_conf = float(ocr_result.get("confidence") or 0.0)
+        if ocr_result.get("ok") and ocr_text and ocr_conf >= 0.55 and len(ocr_text) >= 8:
+            return {
+                "ok": True,
+                "ocr": True,
+                "frame_age_ms": frame_age_ms,
+                "text": _short(ocr_text, 1200),
+                "message": (
+                    f"Read from screen via OCR (confidence {ocr_conf:.0%}): "
+                    f"{_short(ocr_text, 400)}. "
+                    + (question or "Summarize this for the user out loud.")
+                ),
+            }
         ok, fg = self._push_live_screen_frame(question)
         if not ok:
-            return {"ok": False, "message": "Couldn't capture or send the screen image."}
+            return {"ok": False, "message": "Couldn't capture or send the screen image.",
+                    "frame_age_ms": frame_age_ms}
         fg_note = f" Foreground window when captured: {fg}." if fg else ""
-        return {"ok": True, "message": (
-            "The user's screen is now in view."
-            + fg_note
-            + " "
-            + (question or "Describe what's on it.")
-            + " Answer out loud in one or two short, natural sentences — only from "
-            "what you see in the screenshot, not from guesswork or earlier turns."
-        )}
+        return {
+            "ok": True,
+            "ocr": False,
+            "frame_age_ms": frame_age_ms,
+            "message": (
+                "The user's screen is now in view."
+                + fg_note
+                + " "
+                + (question or "Describe what's on it.")
+                + " Answer out loud in one or two short, natural sentences — only from "
+                "what you see in the screenshot, not from guesswork or earlier turns."
+            ),
+        }
 
     def _live_list_windows(self, args: dict[str, Any]) -> dict[str, Any]:
         from .. import providers as prov
@@ -2439,6 +2493,59 @@ class OverlayController(QObject):
         needs a spoken yes first — the run_terminal analog of _goal_needs_consent."""
         return _has_unnegated_match(command or "", LIVE_TERMINAL_CONSENT_RE)
 
+    def _live_launch_app(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Sync launch specialist — registry/resolver + verify before success (WS1)."""
+        from ..handoff import launch_handoff
+        from ..launch import resolve_launch_target, verify_launch_foreground
+
+        app = _clean_text(args.get("app") or "")
+        settings_page = _clean_text(args.get("settings_page") or "")
+        if settings_page:
+            app = settings_page
+        if not app:
+            return {"ok": False, "message": "Need an app name to open."}
+        entry = resolve_launch_target(app)
+        if entry is None:
+            return {
+                "ok": False,
+                "message": f"I don't know how to open '{app}' from the launch registry.",
+            }
+        self.cursorStateRequested.emit("thinking")
+        self._set_label(f"Opening {_short(entry.display_name, 40)}", source="live_tool", force=True)
+        try:
+            from ..tools import ToolExecutor
+            from pathlib import Path
+
+            tools = ToolExecutor(Path.cwd())
+            res = tools.open_known_app(entry.launch_command, entry.window_title, timeout=12.0)
+            verified, fg_title = verify_launch_foreground(entry.window_title, timeout=2.0)
+            ok = bool(res.ok and verified)
+            handoff = launch_handoff(
+                ok=ok,
+                app_name=entry.display_name,
+                window_title=fg_title or entry.window_title,
+                debug_reason=str(res.output or "")[:300],
+            )
+            if ok:
+                return {
+                    "ok": True,
+                    "window": fg_title or entry.window_title,
+                    "message": handoff["user_message"],
+                    "user_message": handoff["user_message"],
+                }
+            return {
+                "ok": False,
+                "message": handoff["user_message"],
+                "user_message": handoff["user_message"],
+            }
+        except Exception as exc:
+            handoff = launch_handoff(
+                ok=False,
+                app_name=app,
+                debug_reason=str(exc)[:200],
+            )
+            return {"ok": False, "message": handoff["user_message"]}
+
     def _live_start_desktop_task(self, args: dict[str, Any]) -> dict[str, Any]:
         goal = _clean_text(args.get("goal") or "")
         if not goal:
@@ -2482,7 +2589,7 @@ class OverlayController(QObject):
                 if preflight.get("can_override") and preflight.get("issues"):
                     payload["readiness_override"] = True
             self.client.request("POST", "/api/tasks", payload, timeout=20.0)
-            self._active_task_running = True
+            self._touch_desktop_busy()
             self._active_task_goal = _short(goal, 80)
             self._live_task_ids[task_id] = self._active_task_goal
             self._live_task_progress[task_id] = {
@@ -2695,8 +2802,7 @@ class OverlayController(QObject):
                             "when it finishes.")}
 
     def _finish_live_task(self, task_id: str, status: str, summary: str, ok: bool) -> None:
-        self._active_task_running = False
-        self._active_task_goal = ""
+        self._clear_desktop_busy()
         goal = self._live_task_ids.pop(task_id, "")
         self._last_task_result = {
             "goal": goal, "status": status, "ok": bool(ok),
@@ -2706,6 +2812,8 @@ class OverlayController(QObject):
     def _capture_live_task_outcome(self, ev: dict[str, Any]) -> None:
         """When a Live-launched task finishes AFTER the brief inline wait, record its
         outcome so get_companion_status can report it (longer jobs land here)."""
+        from ..handoff import handoff_from_terminal_event
+
         task_id = str(ev.get("task_id") or "")
         if not task_id or task_id not in self._live_task_ids:
             return
@@ -2713,25 +2821,25 @@ class OverlayController(QObject):
         if et not in TERMINAL_TASK_STATES:
             return
         goal = self._live_task_ids.get(task_id, "")
-        summary = _clean_text(ev.get("reason") or ev.get("message") or "")
-        ok = _terminal_task_succeeded(event_type=et, complete=ev.get("complete"))
+        handoff = handoff_from_terminal_event(ev, goal=goal)
+        ok = bool(handoff.get("ok"))
+        summary = handoff.get("debug_reason") or ""
         self._finish_live_task(task_id, et, summary, ok=ok)
-        # Proactively tell Live when a long background job ends so the user hears
-        # the real outcome — success OR failure, never a false "all done".
         live = self._live
         if live is not None and hasattr(live, "send_task_update"):
+            note = handoff.get("user_message") or ""
             if ok:
-                note = f'Heads up: the background task "{goal or "you started"}" succeeded.'
-                if summary:
-                    note += f" Result: {_short(summary, 200)}"
-                note += (" Tell the user what happened in one or two short sentences. "
-                         "Do not say you are still working on it.")
+                note = (
+                    f'Heads up: the background task "{goal or "you started"}" succeeded. '
+                    f"{note} Tell the user what happened in one or two short sentences. "
+                    "Do not say you are still working on it."
+                )
             else:
-                note = f'Heads up: the background task "{goal or "you started"}" FAILED.'
-                if summary:
-                    note += f" Error: {_short(summary, 200)}"
-                note += (" Tell the user honestly that it did NOT work — explain what "
-                         "went wrong. Do NOT say finished, done, opened, or success.")
+                note = (
+                    f'Heads up: the background task "{goal or "you started"}" FAILED. '
+                    f"{note} Tell the user honestly that it did NOT work. "
+                    "Do NOT say finished, done, opened, or success."
+                )
             try:
                 live.send_task_update(note)
             except Exception:
