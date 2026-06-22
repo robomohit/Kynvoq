@@ -3280,6 +3280,49 @@ class ToolExecutor:
         except Exception:
             return None
 
+    def _grid_locate_click(self, query: str, app: str):
+        """Vision grid-locate fallback (Clicky's two-stage Set-of-Mark). When UIA and
+        OCR both miss, ask a vision model which screen cell holds the target, then
+        pixel-click it. Returns a ToolResult tagged 'grid-locate', or None when it
+        can't locate (no key, model unsure, or 'not visible') so the caller reports
+        the original UIA miss instead of clicking the wrong thing."""
+        try:
+            from . import grid_locate
+            import pyautogui
+            if app:
+                try:
+                    self.focus_window(app)
+                    time.sleep(0.08)
+                except Exception:
+                    pass
+            hit = grid_locate.locate(query)
+            if not hit:
+                return None
+            x, y = int(hit[0]), int(hit[1])
+            self._input_politeness_gate()
+            pyautogui.click(x, y)
+            self._note_synthetic_input()
+            app_rect = self._app_rect_payload(app)
+            data = {"ok": True, "method": "grid_locate", "matched": query, "x": x, "y": y}
+            data["overlay"] = _overlay_payload(
+                "app_focus" if app_rect else "status", "uia_click", "click",
+                f"Clicking “{query}” (vision)", target=query, app_rect=app_rect,
+                rect={"left": x - 14, "top": y - 12, "width": 28, "height": 24},
+                control_layer="vision grid-locate",
+                control_reason="no accessible control and no OCR text — located visually",
+            )
+            self._remember_adaptive_success(
+                app,
+                failure_class="uia_no_match",
+                resolver_id="vision_grid_locate",
+                detail=f"Clicked {query} (vision)",
+            )
+            return ToolResult(ok=True, data=data, output=(
+                f"Clicked '{query}' via vision grid-locate at ({x},{y}). "
+                f"[uia:{x-14},{y-12},28,24]{self._app_rect_token(app, app_rect)}"))
+        except Exception:
+            return None
+
     def _electron_unlock_hint(self, app: str, data: dict) -> str:
         """When UIA *and* OCR both miss, check whether the target is an Electron
         app whose DOM is simply locked to UIA. If so, attach the relaunch hint to
@@ -3845,6 +3888,12 @@ class ToolExecutor:
                 ocr_result = self._ocr_click_fallback(query, app)
                 if ocr_result is not None:
                     return ocr_result
+                # Last resort before giving up: vision grid-locate (Set-of-Mark). For
+                # Electron/canvas controls with no UIA tree AND no OCR text — exactly
+                # where the old path went blind. Fails safe to None (no wrong click).
+                grid_result = self._grid_locate_click(query, app)
+                if grid_result is not None:
+                    return grid_result
             app_rect = self._app_rect_payload(app)
             data = dict(res)
             data["overlay"] = _overlay_payload(
