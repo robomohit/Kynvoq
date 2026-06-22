@@ -1449,7 +1449,7 @@ def test_label_log_records_shown_and_muted(tmp_path, monkeypatch):
     by = {(r["action"], r["source"]): r for r in rows}
     assert ("shown", "system") in by
     assert ("muted", "task_action") in by
-    assert by[("muted", "task_action")]["reason"] == "task_churn_under_live"
+    assert by[("muted", "task_action")]["reason"] == "task_outcome_under_live"
 
 
 def test_label_dedupe_skips_identical_repaint():
@@ -2593,9 +2593,11 @@ def test_live_transcript_suppresses_background_status_flicker():
     assert c._set_label("Clicking Text Editor", source="task_action") is False
     assert labels == ["Sure, opening it now."]
 
-    # A real terminal result can still surface; only background chatter is muted.
-    assert c._set_label("Done", source="task_result") is True
-    assert labels[-1] == "Done"
+    # The terminal result is ALSO muted while Live drives — Live speaks the outcome
+    # itself (success or failure) so the bubble never flashes raw backend text over
+    # the conversation. (This was the "Failed: Server restarted…" leak.)
+    assert c._set_label("Done", source="task_result") is False
+    assert labels == ["Sure, opening it now."]
 
 
 def test_live_running_suppresses_active_task_prime_label():
@@ -2642,9 +2644,10 @@ def test_live_running_mutes_task_action_and_status_churn():
     assert c._set_label("Clicking Text Editor", source="task_action") is False
     # The flying-cursor labels never reached the bubble.
     assert labels == []
-    # …but a task's final result is meaningful and still surfaces during Live.
-    assert c._set_label("Notepad is open.", source="task_result") is True
-    assert labels == ["Notepad is open."]
+    # The final result is muted too while Live drives — Live narrates the outcome by
+    # voice, so the bubble never flashes raw backend text over the conversation.
+    assert c._set_label("Notepad is open.", source="task_result") is False
+    assert labels == []
 
 
 def test_task_action_muted_while_live_tool_label_is_held():
@@ -2683,7 +2686,8 @@ def test_live_spawned_task_does_not_flash_over_the_conversation():
     between the live transcript and the task's 'Orynning…/Searching…' churn.
 
     With Live owning the bubble, the conversation text is the only thing that ever
-    reaches it; the spawned task's churn is muted and only its final result lands."""
+    reaches it; the spawned task's churn AND its final result are muted — Live speaks
+    the outcome by voice instead of flashing raw backend text over the conversation."""
     c = _controller()
     c._live = _RunningLive()
     labels = []
@@ -2713,9 +2717,10 @@ def test_live_spawned_task_does_not_flash_over_the_conversation():
     # Only the live conversation reached the bubble — no task churn, no flashing.
     assert labels == ["Heard: open notepad and type hello", "Okay, I'm getting it."]
 
-    # 6. The task finishes: its outcome is meaningful and surfaces.
-    assert c._set_label("Notepad is open with hello typed.", source="task_result") is True
-    assert labels[-1] == "Notepad is open with hello typed."
+    # 6. The task finishes: its result is muted too while Live drives — Live narrates
+    #    the outcome by voice, so the bubble stays on the conversation (no raw flash).
+    assert c._set_label("Notepad is open with hello typed.", source="task_result") is False
+    assert labels == ["Heard: open notepad and type hello", "Okay, I'm getting it."]
 
 
 def test_live_owns_cursor_state_while_running():

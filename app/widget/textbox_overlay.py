@@ -871,12 +871,16 @@ class OverlayController(QObject):
             live_running = self._live_is_running()
 
             if not force:
-                # Gemini Live owns the bubble while it drives: mute the desktop
-                # task's per-step churn so it can't flash over the conversation.
-                # (task_result — the final answer — is deliberately not in the
-                # churn set, so a task's outcome still surfaces during Live.)
-                if source in _TASK_CHURN_SOURCES and (live_running or live_holding):
-                    _log_label(label, source, "muted", "task_churn_under_live", live_running)
+                # Gemini Live owns the bubble while it drives: mute the desktop task's
+                # per-step churn AND its final task_result so raw backend text can't
+                # flash over the conversation. Live speaks the outcome itself (success
+                # OR failure) via _capture_live_task_outcome -> send_task_update, so the
+                # bubble never needs the raw "Failed: Server restarted…" string. (Was a
+                # leak: task_result was excluded from muting and surfaced verbatim.)
+                if (source in _TASK_CHURN_SOURCES or source == "task_result") and (
+                    live_running or live_holding
+                ):
+                    _log_label(label, source, "muted", "task_outcome_under_live", live_running)
                     return False
                 # Don't let the periodic "Listening" status wipe a fresher, more
                 # meaningful Live label (what the user said / the reply / a tool).
@@ -2673,7 +2677,10 @@ class OverlayController(QObject):
                         "message": ("The desktop task succeeded — tell the user what happened "
                                     "in one or two short sentences.")}
             fail_status = status if status in ("error", "failed", "cancelled") else "failed"
-            self._set_label("Failed: " + _short(summary or goal, 120), source="live_tool", force=True)
+            # Clean bubble label only — NEVER the raw backend reason (that was the leak:
+            # "Failed: Server restarted or task was abandoned."). Live speaks the real,
+            # honest explanation from the `result`/`message` below.
+            self._set_label("Couldn't complete that", source="live_tool", force=True)
             return {"ok": False, "task_id": task_id, "status": fail_status,
                     "result": _short(summary, 600) or "The task didn't complete.",
                     "message": ("The desktop task FAILED or did not fully succeed. Tell the "

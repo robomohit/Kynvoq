@@ -574,6 +574,37 @@ def _task_complete_from_log(task_id: str, status: str) -> bool:
     return status in {"done", "complete"}
 
 
+_TASK_START_GRACE = float(os.environ.get("ORYNN_TASK_START_GRACE") or "4.0")
+
+
+def _record_age_seconds(record: TaskRecord) -> Optional[float]:
+    try:
+        created = datetime.fromisoformat(str(record.created_at).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created).total_seconds()
+    except Exception:
+        return None
+
+
+def _task_done_exception(task_id: str) -> Optional[str]:
+    """The REAL reason a task's coroutine ended, if it died with an exception -- so we
+    surface the actual crash instead of the opaque 'abandoned'. None if it's still
+    running, finished cleanly, or has no record."""
+    task = service._active_tasks.get(task_id)
+    if task is None or not task.done():
+        return None
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return "the task was cancelled before it finished"
+    except Exception:
+        return None
+    if exc is not None:
+        return f"{type(exc).__name__}: {str(exc)[:160]}"
+    return None
+
+
 def _serialize_task_record(record: TaskRecord) -> dict:
     payload = record.model_dump()
     terminal = _is_terminal_status(record.status)
@@ -587,13 +618,27 @@ def _serialize_task_record(record: TaskRecord) -> dict:
         if payload["server_running"] or payload["paused"] or is_queued:
             payload["status"] = "paused" if payload["paused"] else ("queued" if is_queued else "running")
         else:
-            # Transition stale record to failed
+            # Startup grace: a just-created task whose coroutine hasn't produced its
+            # first signal yet must NOT be slapped with "abandoned" — that flashed a
+            # bogus failure into the Live bubble milliseconds after start ("Open
+            # Spotify" -> "Failed: abandoned" in ~270ms). Hold it as running briefly.
+            age = _record_age_seconds(record)
+            if age is not None and age < _TASK_START_GRACE:
+                payload["status"] = "running"
+                payload["server_running"] = True
+                return payload
+            # Surface the REAL crash if the coroutine died with an exception, instead
+            # of the opaque "abandoned" — so the user (and Live) learn why it failed.
             record.status = "failed"
-            record.reason = record.reason or "Server restarted or task was abandoned."
+            record.reason = (
+                _task_done_exception(record.id)
+                or record.reason
+                or "the task ended before it could run"
+            )
             record.finished_at = record.finished_at or datetime.now(timezone.utc).isoformat()
             record.paused = False
             _save_task_record(record)
-            
+
             payload = record.model_dump()
             payload["paused"] = False
             payload["server_running"] = False
