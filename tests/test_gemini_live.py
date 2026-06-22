@@ -2484,6 +2484,76 @@ def test_live_listening_status_does_not_overwrite_fresh_input():
     assert states[-1] == "listening"
 
 
+def _has_red_ring(img):
+    cols = img.getcolors(maxcolors=100000) or []
+    return any(r > 200 and g < 100 and b < 100 for _, (r, g, b) in cols)
+
+
+def test_points_at_cursor_detection():
+    from app.widget.textbox_overlay import _utterance_points_at_cursor as p
+    # pointing -> focus on the mouse (full-monitor + ring)
+    assert p("what's this")
+    assert p("read this for me")
+    assert p("what is that error")
+    assert p("what's under my cursor")
+    assert p("the thing right here")
+    # general / not pointing -> normal full-frame vision
+    assert not p("read me the news")
+    assert not p("what's on my screen")
+    assert not p("open notepad")
+    assert not p("")
+
+
+def test_cursor_marker_drawn_when_pointer_in_region(monkeypatch):
+    """The mouse pointer gets a red ring on the vision frame so the model can focus
+    'where I'm pointing'."""
+    import sys
+    import types as _t
+    from PIL import Image
+    from app.widget.textbox_overlay import OverlayController
+
+    fake = _t.ModuleType("win32api")
+    fake.GetCursorPos = lambda: (500, 400)        # center of a 1000x800 region
+    monkeypatch.setitem(sys.modules, "win32api", fake)
+    monkeypatch.delenv("ORYNN_LIVE_CURSOR_MARKER", raising=False)
+
+    img = Image.new("RGB", (1000, 800), (40, 40, 40))
+    out = OverlayController._draw_cursor_marker(img, 0, 0, 1000, 800)
+    assert _has_red_ring(out)
+
+
+def test_cursor_marker_skipped_when_pointer_outside_region(monkeypatch):
+    import sys
+    import types as _t
+    from PIL import Image
+    from app.widget.textbox_overlay import OverlayController
+
+    fake = _t.ModuleType("win32api")
+    fake.GetCursorPos = lambda: (5000, 400)       # off the captured surface
+    monkeypatch.setitem(sys.modules, "win32api", fake)
+    monkeypatch.delenv("ORYNN_LIVE_CURSOR_MARKER", raising=False)
+
+    img = Image.new("RGB", (1000, 800), (40, 40, 40))
+    out = OverlayController._draw_cursor_marker(img, 0, 0, 1000, 800)
+    assert not _has_red_ring(out)
+
+
+def test_cursor_marker_disabled_by_env(monkeypatch):
+    import sys
+    import types as _t
+    from PIL import Image
+    from app.widget.textbox_overlay import OverlayController
+
+    fake = _t.ModuleType("win32api")
+    fake.GetCursorPos = lambda: (500, 400)
+    monkeypatch.setitem(sys.modules, "win32api", fake)
+    monkeypatch.setenv("ORYNN_LIVE_CURSOR_MARKER", "0")
+
+    img = Image.new("RGB", (1000, 800), (40, 40, 40))
+    out = OverlayController._draw_cursor_marker(img, 0, 0, 1000, 800)
+    assert not _has_red_ring(out)
+
+
 def test_auto_screen_fires_at_utterance_start_not_just_end(monkeypatch):
     """The vision frame is sent as the user STARTS speaking (one per utterance), so it
     reaches the model before end-of-turn — not raced at 'finished' (the 'read the news

@@ -256,6 +256,23 @@ def _utterance_wants_live_screen(text: str) -> bool:
     return bool(_LIVE_SCREEN_UTTERANCE_RE.search(t))
 
 
+# The user is pointing AT something with the mouse — "what's THIS", "read this",
+# "right here", "under my cursor". For these we capture the full monitor and drop a
+# pointer ring so the model focuses where the mouse is.
+_POINTS_AT_CURSOR_RE = re.compile(
+    r"\bmy (mouse|cursor|pointer)\b|where i'?m pointing|right (here|there)|"
+    r"under (the|my) (mouse|cursor|pointer)|hover|i'?m pointing|"
+    r"\b(what'?s|what is|read|explain|describe|click|select|tell me about|what does)\s+"
+    r"(this|that|it|here|there)\b|\bwhat'?s (this|that|here|there)\b",
+    re.I,
+)
+
+
+def _utterance_points_at_cursor(text: str) -> bool:
+    t = _clean_text(text).lower()
+    return bool(t and _POINTS_AT_CURSOR_RE.search(t))
+
+
 # Disruptive / hard-to-undo intents that must get spoken user consent before Live
 # spawns an autonomous task to do them (brief §7.2): deleting, sending/submitting,
 # paying, formatting/uninstalling, and relaunching/restarting apps (the electron
@@ -1310,11 +1327,13 @@ class OverlayController(QObject):
             return
 
     def _push_live_screen_frame(self, question: str = "") -> tuple[bool, str]:
-        """Capture + send a vision frame into Live. Returns (ok, foreground title)."""
+        """Capture + send a vision frame into Live. Returns (ok, foreground title). A
+        'what's this / where I'm pointing' question switches to a full-monitor capture
+        with a pointer ring, so the model focuses on whatever the mouse is over."""
         live = self._live
         if live is None or not hasattr(live, "send_screen_image"):
             return False, ""
-        data, fg, mode = self._capture_vision_jpeg()
+        data, fg, mode = self._capture_vision_jpeg(_utterance_points_at_cursor(question))
         if not data:
             return False, ""
         send = getattr(live, "send_screen_image", None)
@@ -1329,7 +1348,10 @@ class OverlayController(QObject):
             "of old pages. If you don't see what they named, say so plainly (e.g. "
             "\"I don't see X on this screen\") and tell them what IS visible instead "
             "— never invent it or give generic directions for something not in this "
-            "frame.]"
+            "frame. A small red ring marks the user's MOUSE POINTER (it is NOT part of "
+            "the screen — don't describe the ring itself). If they say 'this', 'here', "
+            "'that', or ask what they're pointing at, focus on whatever is under or "
+            "nearest that ring.]"
         )
         q = _clean_text(question)
         if q:
@@ -2332,12 +2354,31 @@ class OverlayController(QObject):
             return None, ""
 
     @staticmethod
-    def _capture_vision_jpeg() -> tuple[bytes | None, str, str]:
+    def _monitor_under_cursor(sct):
+        """The mss monitor dict the mouse is currently on (multi-monitor correct);
+        falls back to the primary."""
+        try:
+            import win32api  # type: ignore
+            cx, cy = win32api.GetCursorPos()
+            for m in sct.monitors[1:]:
+                if (m["left"] <= cx < m["left"] + m["width"]
+                        and m["top"] <= cy < m["top"] + m["height"]):
+                    return m
+        except Exception:
+            pass
+        mons = sct.monitors
+        return mons[1] if len(mons) > 1 else mons[0]
+
+    @staticmethod
+    def _capture_vision_jpeg(prefer_monitor: bool = False) -> tuple[bytes | None, str, str]:
         """Capture for Live vision. Returns (jpeg_bytes, window_title, mode).
 
         Default ORYNN_LIVE_SCREEN_CAPTURE=window uses PrintWindow on the foreground
-        app only (native Windows API — not the whole desktop). Falls back to the
-        primary monitor via mss when no suitable window is found."""
+        app only (native Windows API — not the whole desktop). prefer_monitor forces
+        a full-monitor capture (mss) of the screen UNDER THE CURSOR — used for
+        "what's this / where I'm pointing" requests, because only there do the cursor
+        coordinates map cleanly enough to drop an accurate pointer ring (the PrintWindow
+        image and the window rect don't line up reliably)."""
         try:
             import mss
             from PIL import Image
@@ -2346,21 +2387,64 @@ class OverlayController(QObject):
 
             _, max_edge = _live_vision_jpeg_settings()
             hwnd, title, mode = prov.resolve_hwnd_for_live_vision()
+            if prefer_monitor:
+                mode, hwnd = "monitor", None
             cap_max = max_edge if max_edge > 0 else 0
             if mode == "window" and hwnd:
+                # No cursor ring here — PrintWindow pixels vs the window rect don't map
+                # reliably. Pointing requests force monitor mode (above) for an accurate ring.
                 img = prov._capture_hwnd_image(hwnd, max_edge=cap_max)
             else:
                 with mss.mss() as sct:
-                    mons = sct.monitors
-                    mon = mons[1] if len(mons) > 1 else mons[0]
+                    mon = OverlayController._monitor_under_cursor(sct)
                     shot = sct.grab(mon)
                     img = Image.frombytes("RGB", shot.size, shot.rgb)
+                # mss + win32 GetCursorPos share the physical pixel space here, so the
+                # ring lands on the real pointer.
+                img = OverlayController._draw_cursor_marker(
+                    img, int(mon["left"]), int(mon["top"]), int(mon["width"]), int(mon["height"]))
+                mode = "monitor"
                 if not title:
                     title = OverlayController._foreground_window_title()
             data = OverlayController._encode_vision_jpeg(img)
             return data, title, mode
         except Exception:
             return None, "", "monitor"
+
+    @staticmethod
+    def _draw_cursor_marker(img, region_left: int, region_top: int, region_w: int, region_h: int):
+        """Draw a ring at the user's MOUSE POINTER on the vision frame, so the model can
+        'focus where I'm pointing' when they ask about 'this/here'. Physical-pixel coords
+        (GetCursorPos, mss and the window rect are all physical in our DPI-aware process)
+        mapped as a FRACTION of the captured region, so it survives any thumbnail scaling.
+        No-op if the cursor is outside the captured region, win32 is missing, or disabled
+        via ORYNN_LIVE_CURSOR_MARKER=0."""
+        if (os.environ.get("ORYNN_LIVE_CURSOR_MARKER") or "1").strip().lower() in (
+            "0", "off", "false", "no",
+        ):
+            return img
+        try:
+            import win32api  # type: ignore
+            from PIL import ImageDraw
+            if region_w <= 0 or region_h <= 0:
+                return img
+            cx, cy = win32api.GetCursorPos()
+            fx = (cx - region_left) / region_w
+            fy = (cy - region_top) / region_h
+            if not (0.0 <= fx <= 1.0 and 0.0 <= fy <= 1.0):
+                return img  # pointer isn't on the captured surface
+            w_img, h_img = img.size
+            x, y = int(fx * w_img), int(fy * h_img)
+            r = max(16, int(min(w_img, h_img) * 0.022))
+            draw = ImageDraw.Draw(img)
+            # dark halo + bright ring so it reads on any background, + a light crosshair
+            draw.ellipse([x - r - 2, y - r - 2, x + r + 2, y + r + 2], outline=(0, 0, 0), width=5)
+            draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 45, 45), width=3)
+            draw.line([x - r - 8, y, x + r + 8, y], fill=(255, 45, 45), width=2)
+            draw.line([x, y - r - 8, x, y + r + 8], fill=(255, 45, 45), width=2)
+        except Exception:
+            pass
+        return img
 
     @staticmethod
     def _foreground_window_title() -> str:
