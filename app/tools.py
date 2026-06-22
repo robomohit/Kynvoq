@@ -3280,6 +3280,28 @@ class ToolExecutor:
         except Exception:
             return None
 
+    @staticmethod
+    def _wait_foreground(app: str, timeout: float = 1.2) -> None:
+        """Block until the foreground window's title contains `app`, then a beat to let
+        it repaint — so a full-screen capture (grid-locate) sees the right app. Bounded;
+        falls back to a fixed sleep when win32 isn't available."""
+        try:
+            import win32gui
+        except Exception:
+            time.sleep(0.45)
+            return
+        key = (app or "").lower().strip()
+        deadline = time.time() + max(0.1, timeout)
+        while time.time() < deadline:
+            try:
+                title = win32gui.GetWindowText(win32gui.GetForegroundWindow()).lower()
+            except Exception:
+                title = ""
+            if not key or key in title:
+                break
+            time.sleep(0.08)
+        time.sleep(0.18)  # repaint settle after it comes forward
+
     def _grid_locate_click(self, query: str, app: str):
         """Vision grid-locate fallback (Clicky's two-stage Set-of-Mark). When UIA and
         OCR both miss, ask a vision model which screen cell holds the target, then
@@ -3292,7 +3314,11 @@ class ToolExecutor:
             if app:
                 try:
                     self.focus_window(app)
-                    time.sleep(0.08)
+                    # grid-locate captures the WHOLE screen, so the target app must be
+                    # foreground AND repainted before we snapshot. A fixed tiny sleep
+                    # races the window coming forward (proven on Chrome — 0.08s whiffs),
+                    # so wait until it's actually foreground, then let it repaint.
+                    self._wait_foreground(app, timeout=1.2)
                 except Exception:
                     pass
             hit = grid_locate.locate(query)

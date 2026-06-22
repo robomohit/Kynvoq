@@ -84,3 +84,29 @@ def test_locate_returns_none_without_key(monkeypatch):
 def test_locate_disabled_by_env(monkeypatch):
     monkeypatch.setenv("ORYNN_GRID_LOCATE", "0")
     assert gl.locate("anything") is None
+
+
+def test_wait_foreground_returns_when_app_frontmost(monkeypatch):
+    """_wait_foreground returns as soon as the foreground title matches the app, so a
+    full-screen grid-locate capture sees the right app (not a fixed sleep that races
+    the window forward)."""
+    import sys
+    import time
+    import types as _t
+    from app.tools import ToolExecutor
+
+    polls = {"n": 0}
+    fake = _t.ModuleType("win32gui")
+    fake.GetForegroundWindow = lambda: 1
+
+    def _get_text(_h):
+        polls["n"] += 1
+        return "Some Other Window" if polls["n"] < 2 else "Make list - Google Chrome"
+
+    fake.GetWindowText = _get_text
+    monkeypatch.setitem(sys.modules, "win32gui", fake)
+
+    t0 = time.time()
+    ToolExecutor._wait_foreground("chrome", timeout=1.5)
+    assert time.time() - t0 < 1.0          # returned well before the timeout
+    assert polls["n"] >= 2                  # waited past the wrong window to the match
