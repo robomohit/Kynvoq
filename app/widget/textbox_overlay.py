@@ -1356,12 +1356,13 @@ class OverlayController(QObject):
             "of old pages. If you don't see what they named, say so plainly (e.g. "
             "\"I don't see X on this screen\") and tell them what IS visible instead "
             "— never invent it or give generic directions for something not in this "
-            "frame. A small red ring marks the user's MOUSE POINTER (it is NOT part of "
-            "the screen — don't describe the ring itself). When they say 'this/here/"
-            "that' or ask what they're pointing at, identify EXACTLY the element under "
-            "the ring's center — read that specific button/word/link — even if other "
-            "text is larger or more prominent. Do NOT default to the page title or the "
-            "biggest heading; the ring is the answer.]"
+            "frame. You can see the WHOLE screen here — use it for context. A thin red "
+            "ring (outline only — NOT part of the screen, don't mention the ring) circles "
+            "where the user's MOUSE is pointing; the element INSIDE the ring is what they "
+            "mean by 'this/here/that'. Read that exact element (the specific button/word/"
+            "link inside the ring), using the rest of the screen for context — but do NOT "
+            "default to the page title or biggest heading; the ringed element is the "
+            "answer.]"
         )
         q = _clean_text(question)
         if q:
@@ -2445,13 +2446,14 @@ class OverlayController(QObject):
                 return img  # pointer isn't on the captured surface
             w_img, h_img = img.size
             x, y = int(fx * w_img), int(fy * h_img)
-            r = max(16, int(min(w_img, h_img) * 0.022))
+            # Encircle the target rather than cover it: outline-only ring (NO crosshair or
+            # center dot), sized so a word/button sits INSIDE and stays readable. Dark
+            # halo on both sides of the red so it reads on any background.
+            r = max(24, int(min(w_img, h_img) * 0.028))
             draw = ImageDraw.Draw(img)
-            # dark halo + bright ring so it reads on any background, + a light crosshair
-            draw.ellipse([x - r - 2, y - r - 2, x + r + 2, y + r + 2], outline=(0, 0, 0), width=5)
-            draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 45, 45), width=3)
-            draw.line([x - r - 8, y, x + r + 8, y], fill=(255, 45, 45), width=2)
-            draw.line([x, y - r - 8, x, y + r + 8], fill=(255, 45, 45), width=2)
+            draw.ellipse([x - r - 3, y - r - 3, x + r + 3, y + r + 3], outline=(0, 0, 0), width=2)
+            draw.ellipse([x - r, y - r, x + r, y + r], outline=(255, 40, 40), width=3)
+            draw.ellipse([x - r + 3, y - r + 3, x + r - 3, y + r - 3], outline=(0, 0, 0), width=1)
         except Exception:
             pass
         return img
