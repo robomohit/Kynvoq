@@ -182,6 +182,19 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
 
+    # First run: if the Gemini key (Live's lifeblood) is missing, show a one-time,
+    # polished setup window to collect it (+ an optional agent key) before anything
+    # else starts. No-op once a key exists.
+    try:
+        from app.widget.setup_window import ensure_keys_configured
+        if not ensure_keys_configured():
+            print("[Desktop] Setup cancelled — no API key was provided. Exiting.")
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"[Desktop] Setup window unavailable ({exc}); continuing.", file=sys.stderr)
+
     # 1. Start the backend server in a background thread, unless one is already
     #    running (e.g. the capsule launched us to open a second native window).
     port = _start_backend(PORT)
