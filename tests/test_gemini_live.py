@@ -2985,6 +2985,7 @@ def test_maybe_greet_once_and_respects_env(monkeypatch):
     # OFF by default (no startup turn, no echo-feed): no greeting.
     monkeypatch.delenv("GEMINI_LIVE_GREETING", raising=False)
     comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    comp._is_first_live_run = False
     s = FakeSession()
     asyncio.run(comp._maybe_greet(s, types))
     assert s.sent == 0
@@ -2992,10 +2993,31 @@ def test_maybe_greet_once_and_respects_env(monkeypatch):
     # Opt in -> greets exactly once per session (not on reconnects).
     monkeypatch.setenv("GEMINI_LIVE_GREETING", "1")
     comp2 = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    comp2._is_first_live_run = False
     s2 = FakeSession()
     asyncio.run(comp2._maybe_greet(s2, types))
     asyncio.run(comp2._maybe_greet(s2, types))
     assert s2.sent == 1
+
+
+def test_maybe_greet_first_run_ignores_env(monkeypatch):
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    class FakeSession:
+        def __init__(self):
+            self.sent = 0
+
+        async def send_client_content(self, turns=None, turn_complete=None):
+            self.sent += 1
+
+    # GEMINI_LIVE_GREETING is OFF, but _is_first_live_run is True -> should still greet!
+    monkeypatch.delenv("GEMINI_LIVE_GREETING", raising=False)
+    comp = gl.GeminiLiveCompanion(gl.GeminiLiveCallbacks())
+    comp._is_first_live_run = True
+    s = FakeSession()
+    asyncio.run(comp._maybe_greet(s, types))
+    assert s.sent == 1
 
 
 def test_handle_message_go_away_schedules_graceful_reconnect():

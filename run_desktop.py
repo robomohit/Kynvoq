@@ -15,15 +15,51 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# Frozen .exe: anchor relative paths (.env, workspace/memory) to the INSTALL folder
+# next to Orynn.exe — not PyInstaller's read-only temp bundle. Must run BEFORE
+# importing app.main (which load_dotenv's ".env" at import time).
+if getattr(sys, "frozen", False):
+    from pathlib import Path as _Path
+    _exe_dir = _Path(sys.executable).resolve().parent
+    try:
+        os.chdir(_exe_dir)
+    except Exception:
+        pass
+    os.environ.setdefault("ORYNN_WORKSPACE", str(_exe_dir))
+    # A windowed PyInstaller exe has sys.stdout/stderr == None, so any print() — and
+    # uvicorn's sys.stdout.isatty() — crashes. Route them to a log file by the exe.
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            _logf = open(_exe_dir / "orynn.log", "a", encoding="utf-8", buffering=1)
+        except Exception:
+            import io as _io
+            _logf = _io.StringIO()
+        if sys.stdout is None:
+            sys.stdout = _logf
+        if sys.stderr is None:
+            sys.stderr = _logf
+
 from app.main import app
 
 PORT = int(os.getenv("ORYNN_PORT") or os.getenv("AI_COMPUTER_PORT", "8000"))
 
 
 def run_server(port: int):
-    # Run FastAPI server on a background thread
+    # Run FastAPI server on a background thread.
     # Defaults to 8000; ORYNN_PORT can override it for local testing.
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
+    except Exception:
+        # The frozen .exe is windowed (no console), so a backend crash would be
+        # invisible. Persist it next to the exe so failures are diagnosable.
+        import traceback
+        from pathlib import Path as _P
+        try:
+            (_P(os.environ.get("ORYNN_WORKSPACE") or ".") / "orynn_backend_error.log").write_text(
+                traceback.format_exc(), encoding="utf-8")
+        except Exception:
+            pass
+        raise
 
 
 def _server_healthy(port: int, timeout: float = 0.7) -> bool:

@@ -22,6 +22,7 @@ DEFAULTS: dict[str, Any] = {
     "effort": "medium",         # low | medium | high | max — trades speed for a
                                 # bigger model (free models have no reasoning knob)
     "onboarded": False,         # has the user finished first-run setup?
+    "first_live_run": True,     # is it the first time launching Gemini Live?
 }
 
 _ALLOWED = {

@@ -24,7 +24,7 @@ Full message body references `docs/implementation-storm/CHANGELOG-for-other-agen
 |-------|-------|
 | **remote** | `origin` |
 | **result** | **SUCCESS** |
-| **range** | `b429007..48364ce` |
+| **range** | `b429007..468d9cd` (main bundle `48364ce`, +COMMIT-RECORD `468d9cd`) |
 | **URL** | https://github.com/robomohit/Orynn.git |
 | **tracking** | `reliability/golden-five` → `origin/reliability/golden-five` |
 

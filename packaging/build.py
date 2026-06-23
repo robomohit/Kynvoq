@@ -35,6 +35,11 @@ HIDDEN = [
     "win32gui", "win32api", "win32con", "win32process", "win32ui", "win32com",
     "win32com.client", "pythoncom", "pywintypes", "numpy",
 ]
+# We use PySide6. Other Qt bindings (pulled in transitively by cv2/pyautogui) make
+# PyInstaller abort — "multiple Qt bindings". Exclude them + dev-only baggage.
+EXCLUDE = [
+    "PyQt5", "PyQt6", "PySide2", "tkinter", "_tkinter", "matplotlib", "pytest", "cv2",
+]
 
 
 def main() -> int:
@@ -57,6 +62,8 @@ def main() -> int:
         cmd += ["--collect-all", pkg]
     for mod in HIDDEN:
         cmd += ["--hidden-import", mod]
+    for mod in EXCLUDE:
+        cmd += ["--exclude-module", mod]
     # ship the example env + any runtime assets next to the exe
     env_example = ROOT / ".env.example"
     if env_example.exists():
@@ -64,6 +71,9 @@ def main() -> int:
     assets = ROOT / "app" / "assets"
     if assets.exists():
         cmd += ["--add-data", f"{assets};app/assets"]
+    static_dir = ROOT / "static"
+    if static_dir.exists():
+        cmd += ["--add-data", f"{static_dir};static"]
     cmd += [str(ROOT / "run_desktop.py")]
 
     print("Running:", " ".join(cmd), flush=True)

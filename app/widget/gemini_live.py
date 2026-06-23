@@ -274,6 +274,11 @@ class GeminiLiveCompanion:
         # Set when the server sends go_away so we exit the receive loop cleanly
         # (instead of waiting for a 1008 abort when the session duration expires).
         self._go_away_reconnect = False
+        try:
+            from app import preferences
+            self._is_first_live_run = preferences.get_all().get("first_live_run", True)
+        except Exception:
+            self._is_first_live_run = False
 
     def is_running(self) -> bool:
         thread = self._thread
@@ -551,7 +556,10 @@ class GeminiLiveCompanion:
         tools = [types.Tool(function_declarations=_function_declarations(types))]
         if live_search_enabled():
             tools.insert(0, types.Tool(google_search=types.GoogleSearch()))
-        instruction = self.system_instruction
+        if getattr(self, "_is_first_live_run", False):
+            instruction = _first_run_system_instruction()
+        else:
+            instruction = self.system_instruction
         if self.dynamic_context is not None:
             try:
                 extra = self.dynamic_context()
@@ -617,21 +625,41 @@ class GeminiLiveCompanion:
     async def _maybe_greet(self, session: Any, types: Any) -> None:
         """Say a short hello on first connect so the user knows Live is listening.
         Once per session (not on reconnects); silence with GEMINI_LIVE_GREETING=0."""
-        if self._greeted or not _live_greeting_enabled():
+        is_first = getattr(self, "_is_first_live_run", False)
+        if self._greeted:
+            return
+        if not is_first and not _live_greeting_enabled():
             return
         self._greeted = True
+        
+        is_first = getattr(self, "_is_first_live_run", False)
+        if is_first:
+            greet_text = (
+                "Introduce yourself warmly as Orynn, their new PC companion. Explain that you can see "
+                "their screen and do things on their PC just by voice. Ask what their name is and what "
+                "they'd like you to call them. Keep it extremely warm, natural, and to one or two short sentences."
+            )
+            try:
+                from app import preferences
+                preferences.update({"first_live_run": False})
+                self._is_first_live_run = False
+            except Exception:
+                pass
+        else:
+            greet_text = (
+                "Greet me in a warm, natural SPOKEN voice so I know you're "
+                "listening. If your ORYNN MEMORY already tells you my name, use "
+                "it (welcome me back). If your ORYNN MEMORY is EMPTY — you know "
+                "nothing about me yet, so this is our first meeting — briefly "
+                "introduce yourself: you're Orynn, you can see my screen and do "
+                "things on my PC just by voice, and ask what you should call me. "
+                "Otherwise just greet me warmly and ask my name. Keep it to one "
+                "or two short sentences; don't ask what I need yet."
+            )
+
         try:
             await session.send_client_content(
-                turns=[types.Content(role="user", parts=[types.Part(
-                    text="Greet me in a warm, natural SPOKEN voice so I know you're "
-                         "listening. If your ORYNN MEMORY already tells you my name, use "
-                         "it (welcome me back). If your ORYNN MEMORY is EMPTY — you know "
-                         "nothing about me yet, so this is our first meeting — briefly "
-                         "introduce yourself: you're Orynn, you can see my screen and do "
-                         "things on my PC just by voice, and ask what you should call me. "
-                         "Otherwise just greet me warmly and ask my name. Keep it to one "
-                         "or two short sentences; don't ask what I need yet."
-                )])],
+                turns=[types.Content(role="user", parts=[types.Part(text=greet_text)])],
                 turn_complete=True,
             )
         except Exception:
@@ -1437,4 +1465,20 @@ def _default_system_instruction() -> str:
         "click or type, CONFIRM the result from what you now see and say what changed. "
         "NEVER ask the user \"what do you see\", \"let me know what's on your screen\", "
         "or \"anything new?\" — that's your job; look_at_screen and tell THEM."
+    )
+
+
+def _first_run_system_instruction() -> str:
+    return (
+        "You are Orynn — a warm voice companion on the user's Windows PC. This is your very first "
+        "conversation with the user. Your primary goal is to get to know them: ask their name, "
+        "learn what they do on their PC, what kind of apps they use, and how you can make their life easier. "
+        "Introduce yourself as their PC companion who can see their screen and control their desktop by voice. "
+        "Speak out loud: short natural sentences, contractions, friendly and direct. Write for the ear — "
+        "no lists, markdown, emoji, or reading code/tool names aloud. Never say \"simply\" or \"just\".\n\n"
+        "KNOW THEM (MEMORY)\n"
+        "When the user shares something durable about themselves — their name, role, preferences, "
+        "or apps they use — PROACTIVELY call remember to save it (e.g. \"the user's name is Mohit\", "
+        "\"the user is an editor\"), without being asked and without announcing it. This helps you "
+        "remember them in future sessions. Keep the tone warm, curious, and welcoming."
     )
