@@ -66,6 +66,12 @@ def resolve_launch_target(name: str) -> Optional[LaunchEntry]:
         return None
     key = _LAUNCH_ALIASES.get(key, key)
 
+    # Hard reject shell metacharacters / newlines before producing any start-style command.
+    # Defense-in-depth: this function can be reached from both Live and the deterministic
+    # agent fast-path.
+    if re.search(r"[\r\n&|<>^%]", key):
+        return None
+
     curated = detect_app_launch_intent(f"open {key}")
     if curated:
         cmd, title = curated
@@ -111,14 +117,17 @@ def resolve_launch_target(name: str) -> Optional[LaunchEntry]:
             rank=70,
         )
 
-    if key.endswith(":") or "." in key:
+    # Stricter URI/protocol detection: require an explicit scheme and no whitespace.
+    # This avoids routing broad user-controlled strings into `start <...>`.
+    if re.match(r"^[a-z][a-z0-9+.-]*:[^\s]+$", key):
         cmd = f"start {key}" if not key.startswith("start ") else key
+        scheme = key.split(":", 1)[0]
         return LaunchEntry(
             display_name=key,
             normalized_key=key,
             kind="protocol",
             launch_command=cmd,
-            window_title=key.rstrip(":").title(),
+            window_title=scheme.title(),
             rank=60,
         )
 

@@ -10,6 +10,7 @@ import io
 import shutil
 import re
 import urllib.request
+import shlex
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
 import mss
@@ -505,6 +506,10 @@ def detect_app_launch_intent(goal: str) -> Optional[tuple]:
     if not m:
         return None
     rest = m.group(2).strip()
+    # Reject any launch target containing shell metacharacters/newlines so injected
+    # strings never qualify as a deterministic "pure launch".
+    if re.search(r"[\r\n&|<>^%]", rest):
+        return None
     if _LAUNCH_EXTRA_RE.search(rest):
         return None
     rest = _LAUNCH_FILLER_RE.sub(" ", rest)
@@ -1523,20 +1528,54 @@ class ToolExecutor:
             pass
         # 2. Launch detached (so it outlives this process), then verify by title.
         command = self._normalize_gui_launch_command(launch_command)
+
+        # Defense-in-depth: never execute metacharacters/newlines via a shell.
+        if re.search(r"[\r\n&|<>^%]", command):
+            return ToolResult(ok=False, output=f"Refusing to launch unsafe command: {command}")
+
         try:
             creationflags = (
                 getattr(subprocess, "DETACHED_PROCESS", 0)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             )
             popen_kwargs: Dict[str, Any] = {
-                "shell": True,
-                "cwd": self.workspace,
+                "shell": False,
+                # Use a neutral directory rather than the workspace to reduce surprising
+                # path resolution / side-effects.
+                "cwd": Path(os.environ.get("WINDIR", "C:\\Windows")) / "System32",
                 "stdout": subprocess.DEVNULL,
                 "stderr": subprocess.DEVNULL,
             }
             if creationflags:
                 popen_kwargs["creationflags"] = creationflags
-            subprocess.Popen(command, **popen_kwargs)
+
+            stripped = command.strip()
+            parts = shlex.split(stripped, posix=False)
+            parts_l = [p.lower() for p in parts]
+            # Allow both "start X" and "cmd /c start X" forms.
+            if len(parts_l) >= 3 and parts_l[0] == "cmd" and parts_l[1] == "/c":
+                parts = parts[2:]
+                parts_l = [p.lower() for p in parts]
+
+            if parts_l and parts_l[0] == "start":
+                # Extract target, supporting optional empty-title argument: start "" target
+                target = ""
+                extra: list[str] = []
+                if len(parts) >= 3 and parts[1] == "":
+                    target = parts[2]
+                    extra = parts[3:]
+                elif len(parts) >= 2:
+                    target = parts[1]
+                    extra = parts[2:]
+
+                # For URIs/protocols, bypass cmd.exe entirely.
+                if re.match(r"^[a-z][a-z0-9+.-]*:[^\s]+$", target, flags=re.IGNORECASE) or target.lower().startswith("ms-"):
+                    os.startfile(target)  # type: ignore[attr-defined]
+                else:
+                    subprocess.Popen(["cmd.exe", "/c", "start", "", target, *extra], **popen_kwargs)
+            else:
+                # Fallback: run the command as a plain executable invocation.
+                subprocess.Popen(parts or [stripped], **popen_kwargs)
         except Exception as exc:
             return ToolResult(ok=False, output=f"Couldn't launch {title or command}: {exc}")
         if not title:
