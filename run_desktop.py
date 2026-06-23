@@ -89,13 +89,12 @@ def _start_backend(preferred_port: int) -> int:
 
 def _start_textbox_overlay(port: int) -> subprocess.Popen | None:
     _stop_existing_textbox_overlays(port)
-    cmd = [
-        sys.executable,
-        "-m",
-        "app.widget.textbox_overlay",
-        "--port",
-        str(port),
-    ]
+    if getattr(sys, "frozen", False):
+        # Bundled .exe: there's no `python -m`, so relaunch OURSELVES with --overlay
+        # (run_desktop's __main__ routes that flag straight to the overlay's main()).
+        cmd = [sys.executable, "--overlay", "--port", str(port)]
+    else:
+        cmd = [sys.executable, "-m", "app.widget.textbox_overlay", "--port", str(port)]
     creationflags = 0
     if os.name == "nt":
         creationflags = (
@@ -128,7 +127,9 @@ def _stop_existing_textbox_overlays(port: int) -> int:
         import psutil
     except Exception:
         return 0
-    marker = "app.widget.textbox_overlay"
+    # Dev runs as `python -m app.widget.textbox_overlay`; the frozen build as
+    # `Orynn.exe --overlay` — match either so the one-overlay-per-port rule holds.
+    markers = ("app.widget.textbox_overlay", "--overlay")
     wanted_port = str(int(port))
     victims = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
@@ -137,7 +138,7 @@ def _stop_existing_textbox_overlays(port: int) -> int:
                 continue
             cmdline = [str(part) for part in (proc.info.get("cmdline") or [])]
             joined = " ".join(cmdline)
-            if marker not in joined:
+            if not any(m in joined for m in markers):
                 continue
             if "--port" in cmdline:
                 idx = cmdline.index("--port")
@@ -180,6 +181,18 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == "__main__":
+    # Frozen re-entry: a bundled .exe has no `python -m`, so it relaunches ITSELF with
+    # --overlay to run the companion overlay subprocess. Route that straight to the
+    # overlay's main() and exit, before any launcher logic (backend/setup/dashboard).
+    if "--overlay" in sys.argv:
+        from app.widget.textbox_overlay import main as _overlay_main
+        _ov_port = str(PORT)
+        if "--port" in sys.argv:
+            _pi = sys.argv.index("--port")
+            if _pi + 1 < len(sys.argv):
+                _ov_port = sys.argv[_pi + 1]
+        sys.exit(_overlay_main(["--port", _ov_port]))
+
     args = parse_args()
 
     # First run: if the Gemini key (Live's lifeblood) is missing, show a one-time,
