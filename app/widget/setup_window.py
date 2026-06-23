@@ -209,64 +209,59 @@ def _build():  # imports deferred so importing this module never needs Qt
         return f'<a href="{url}" style="color:{ACCENT};text-decoration:none;">{text}</a>'
 
     class BreathingOrbWidget(QWidget):
+        """Cinematic left pane: an ambient aurora field, a tall glowing blue
+        caret that breathes and blinks, and a glass command box below it where
+        prompt phrases cross-fade in and out. One blue accent, lots of space."""
+
         def __init__(self, parent=None):
             from PySide6.QtWidgets import QSizePolicy
             import random
             super().__init__(parent)
             self.setFixedWidth(400)
             self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+
             self._time = 0.0
             self._state = "idle"
-            self._c1 = QColor(79, 141, 255)
-            self._c2 = QColor(143, 85, 255)
-            self._c3 = QColor(60, 200, 255)
+
+            # Live-blue palette; lerped toward state targets each frame.
+            self._c1 = QColor(79, 141, 255)    # core blue
+            self._c2 = QColor(143, 85, 255)    # violet edge
+            self._c3 = QColor(70, 200, 255)    # cyan highlight
 
             rng = random.Random(42)
 
-            # Rotating AI messages
+            # Rotating prompt phrases — cross-faded, never typed.
             self._messages = [
                 "How can I help you today?",
-                "Opening Spotify now...",
-                "Searching the web for you...",
-                "Setting a reminder for 3pm...",
+                "Opening Spotify now\u2026",
+                "Searching the web for you\u2026",
+                "Setting a reminder for 3pm\u2026",
                 "What would you like to do?",
-                "Playing your favorite playlist...",
-                "I'm listening...",
-                "Translating that for you...",
+                "Playing your favorite playlist\u2026",
+                "I'm listening\u2026",
+                "Translating that for you\u2026",
                 "Tell me anything.",
-                "Checking the weather now...",
+                "Checking the weather now\u2026",
             ]
             self._msg_idx   = 0
-            self._msg_chars = 0.0
+            self._msg_phase = "in"      # in -> hold -> out
+            self._msg_t     = 0.0
             self._msg_alpha = 0.0
-            self._msg_phase = "typing"
-            self._msg_hold  = 0.0
+            self._msg_slide = 10.0
 
-            # Drifting background particles
-            self._particles = [
-                [rng.uniform(0, 400), rng.uniform(0, 640),
-                 rng.uniform(0.3, 1.0), rng.uniform(1.2, 2.8), rng.uniform(0.2, 0.65)]
-                for _ in range(28)
+            # Drifting aurora blobs (x, y, radius, drift speed, phase).
+            self._aurora = [
+                [rng.uniform(60, 340), rng.uniform(120, 460),
+                 rng.uniform(150, 230), rng.uniform(0.06, 0.16), rng.uniform(0, 6.28)]
+                for _ in range(3)
             ]
 
-            # Waveform bar seeds
-            self._bar_phases = [rng.uniform(0, 6.28) for _ in range(24)]
-            self._bar_speeds = [rng.uniform(1.5, 3.2) for _ in range(24)]
-
-            # Horizontal light sweep
-            self._sweep_x    = -500.0
-            self._sweep_on   = False
-            self._next_sweep = rng.uniform(1.0, 3.0)
-
-            # Chromatic glitch
-            self._glitch_on   = False
-            self._glitch_life = 0.0
-            self._next_glitch = rng.uniform(5, 12)
-            self._glitch_rx   = 0.0
-            self._glitch_bx   = 0.0
-
-            # Sonar ring
-            self._ring_phase = rng.uniform(0, 1.0)
+            # Rising dust motes (x, y, vy, size, base alpha).
+            self._motes = [
+                [rng.uniform(0, 400), rng.uniform(0, 640),
+                 rng.uniform(6, 16), rng.uniform(0.8, 1.8), rng.uniform(0.12, 0.45)]
+                for _ in range(22)
+            ]
 
             self._pixmap = None
             self.timer = QTimer(self)
@@ -277,80 +272,73 @@ def _build():  # imports deferred so importing this module never needs Qt
             if state in ("idle", "verifying", "error", "success"):
                 self._state = state
 
+        @staticmethod
+        def _ease_out(x):
+            return 1.0 - (1.0 - x) ** 3
+
+        @staticmethod
+        def _ease_in(x):
+            return x * x * x
+
         def _tick(self):
-            import math, sys
+            import math
             import random as _rand
             try:
                 DT = 0.016
-                self._time += 0.032
+                self._time += DT
                 t = self._time
 
+                # Smoothly retarget the palette to the current state.
                 if self._state == "idle":
-                    tc1 = QColor(79+int(20*math.sin(t*0.28)), 141+int(30*math.sin(t*0.45+1)), 255)
-                    tc2 = QColor(143+int(28*math.sin(t*0.38+3)), 85+int(20*math.sin(t*0.22+2)), 255)
-                    tc3 = QColor(55+int(15*math.sin(t*0.28+1.5)), 195+int(15*math.sin(t*0.32)), 255)
+                    tc1 = QColor(79 + int(18 * math.sin(t * 0.6)),
+                                 141 + int(26 * math.sin(t * 0.9 + 1)), 255)
+                    tc2 = QColor(143 + int(24 * math.sin(t * 0.75 + 3)),
+                                 85 + int(18 * math.sin(t * 0.45 + 2)), 255)
+                    tc3 = QColor(62 + int(14 * math.sin(t * 0.6 + 1.5)),
+                                 198 + int(14 * math.sin(t * 0.65)), 255)
                 elif self._state == "verifying":
-                    tc1, tc2, tc3 = QColor(255,176,32), QColor(224,96,0), QColor(255,220,60)
+                    tc1, tc2, tc3 = QColor(255, 176, 32), QColor(224, 96, 0), QColor(255, 220, 60)
                 elif self._state == "error":
-                    tc1, tc2, tc3 = QColor(255,60,60), QColor(180,10,10), QColor(255,100,80)
+                    tc1, tc2, tc3 = QColor(255, 70, 70), QColor(180, 20, 20), QColor(255, 110, 90)
                 else:
-                    tc1, tc2, tc3 = QColor(0,220,140), QColor(0,160,90), QColor(60,255,180)
+                    tc1, tc2, tc3 = QColor(0, 220, 140), QColor(0, 160, 90), QColor(60, 255, 180)
 
                 def lp(c, tc):
-                    return QColor(int(c.red()+(tc.red()-c.red())*0.05),
-                                  int(c.green()+(tc.green()-c.green())*0.05),
-                                  int(c.blue()+(tc.blue()-c.blue())*0.05))
+                    return QColor(int(c.red() + (tc.red() - c.red()) * 0.06),
+                                  int(c.green() + (tc.green() - c.green()) * 0.06),
+                                  int(c.blue() + (tc.blue() - c.blue()) * 0.06))
                 self._c1 = lp(self._c1, tc1)
                 self._c2 = lp(self._c2, tc2)
                 self._c3 = lp(self._c3, tc3)
 
-                msg = self._messages[self._msg_idx]
-                if self._msg_phase == "typing":
-                    self._msg_alpha = min(1.0, self._msg_alpha + 0.07)
-                    self._msg_chars = min(float(len(msg)), self._msg_chars + 0.28)
-                    if self._msg_chars >= len(msg):
-                        self._msg_phase = "hold"
-                        self._msg_hold  = 0.0
+                # Cross-fading prompt phrases.
+                self._msg_t += DT
+                if self._msg_phase == "in":
+                    p = min(1.0, self._msg_t / 0.55)
+                    self._msg_alpha = self._ease_out(p)
+                    self._msg_slide = 10.0 * (1.0 - self._ease_out(p))
+                    if p >= 1.0:
+                        self._msg_phase, self._msg_t = "hold", 0.0
                 elif self._msg_phase == "hold":
-                    self._msg_hold += DT
-                    if self._msg_hold > 2.5:
-                        self._msg_phase = "fading"
+                    self._msg_alpha, self._msg_slide = 1.0, 0.0
+                    if self._msg_t > 2.4:
+                        self._msg_phase, self._msg_t = "out", 0.0
                 else:
-                    self._msg_alpha = max(0.0, self._msg_alpha - 0.036)
-                    if self._msg_alpha == 0.0:
-                        self._msg_idx   = (self._msg_idx + 1) % len(self._messages)
-                        self._msg_chars = 0.0
-                        self._msg_phase = "typing"
+                    p = min(1.0, self._msg_t / 0.5)
+                    self._msg_alpha = 1.0 - self._ease_in(p)
+                    self._msg_slide = -10.0 * self._ease_in(p)
+                    if p >= 1.0:
+                        self._msg_idx = (self._msg_idx + 1) % len(self._messages)
+                        self._msg_phase, self._msg_t = "in", 0.0
 
-                for dp in self._particles:
-                    dp[1] -= dp[2]
-                    if dp[1] < -10:
-                        dp[1] = 650.0
-                        dp[0] = _rand.uniform(0, 400)
-
-                self._next_sweep -= DT
-                if self._next_sweep <= 0 and not self._sweep_on:
-                    self._sweep_x  = -480.0
-                    self._sweep_on = True
-                    self._next_sweep = _rand.uniform(4, 9)
-                if self._sweep_on:
-                    self._sweep_x += 5.5
-                    if self._sweep_x > 900:
-                        self._sweep_on = False
-
-                self._next_glitch -= DT
-                if self._next_glitch <= 0:
-                    self._glitch_on   = True
-                    self._glitch_life = _rand.uniform(0.08, 0.18)
-                    self._next_glitch = _rand.uniform(5, 14)
-                    self._glitch_rx   = _rand.uniform(-9, 9)
-                    self._glitch_bx   = _rand.uniform(-9, 9)
-                if self._glitch_on:
-                    self._glitch_life -= DT
-                    if self._glitch_life <= 0:
-                        self._glitch_on = False
-
-                self._ring_phase = (self._ring_phase + 0.0055) % 1.0
+                # Drift aurora, rise motes.
+                for a in self._aurora:
+                    a[4] += a[3] * DT
+                for m in self._motes:
+                    m[1] -= m[2] * DT * 3.0
+                    if m[1] < -8:
+                        m[1] = 650.0
+                        m[0] = _rand.uniform(0, 400)
 
                 self._render_to_pixmap()
                 self.update()
@@ -365,7 +353,7 @@ def _build():  # imports deferred so importing this module never needs Qt
             p.drawPixmap(0, 0, self._pixmap)
 
         def _render_to_pixmap(self):
-            from PySide6.QtGui import QLinearGradient, QPixmap
+            from PySide6.QtGui import QLinearGradient, QRadialGradient, QPixmap, QFontMetrics
             import math
 
             w, h = self.width(), self.height()
@@ -379,6 +367,7 @@ def _build():  # imports deferred so importing this module never needs Qt
             p.setRenderHint(QPainter.Antialiasing)
             p.setRenderHint(QPainter.TextAntialiasing)
 
+            # Clip to the card's rounded-left corners (right edge is square).
             clip = QPainterPath()
             clip.moveTo(w, 0); clip.lineTo(20, 0)
             clip.arcTo(0, 0, 40, 40, 90, 90)
@@ -390,172 +379,110 @@ def _build():  # imports deferred so importing this module never needs Qt
 
             t   = self._time
             cx  = w / 2
-            ccy = h * 0.42
+            c1, c2, c3 = self._c1, self._c2, self._c3
 
-            p.fillRect(QRect(0, 0, w, h), QColor(5, 5, 13))
+            # --- Deep background: vertical gradient into near-black ---
+            bg = QLinearGradient(0, 0, 0, h)
+            bg.setColorAt(0.0, QColor(9, 11, 24))
+            bg.setColorAt(0.5, QColor(6, 7, 16))
+            bg.setColorAt(1.0, QColor(3, 3, 9))
+            p.fillRect(QRect(0, 0, w, h), QBrush(bg))
 
-            dot_sp = 22
-            drift  = int(t * 1.8) % dot_sp
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(self._c1.red(), self._c1.green(), self._c1.blue(), 16)))
-            for gx in range(-dot_sp + drift, w + dot_sp, dot_sp):
-                for gy in range(0, h + dot_sp, dot_sp):
-                    p.drawEllipse(gx, gy, 1, 1)
+            # --- Ambient: a couple of soft, slow blue glows for quiet depth ---
+            for a in self._aurora:
+                ax = a[0] + math.cos(a[4]) * 26
+                ay = a[1] + math.sin(a[4] * 0.8) * 22
+                rad = a[2] + 14 * math.sin(a[4] * 1.3)
+                glow = QRadialGradient(ax, ay, rad)
+                glow.setColorAt(0.0, QColor(c2.red(), c2.green(), c2.blue(), 13))
+                glow.setColorAt(0.5, QColor(c1.red(), c1.green(), c1.blue(), 6))
+                glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+                p.setPen(Qt.NoPen)
+                p.setBrush(QBrush(glow))
+                p.drawEllipse(int(ax - rad), int(ay - rad), int(rad * 2), int(rad * 2))
 
-            for dp in self._particles:
-                da = max(0, min(255, int(dp[4] * 105)))
-                p.setBrush(QBrush(QColor(self._c3.red(), self._c3.green(), self._c3.blue(), da)))
-                p.drawEllipse(int(dp[0]-dp[3]/2), int(dp[1]-dp[3]/2), int(dp[3]), int(dp[3]))
+            # --- A few slow dust motes for life (very faint) ---
+            for m in self._motes:
+                ma = int(max(0, m[4] * (0.5 + 0.5 * math.sin(t * 1.0 + m[0]))) * 55)
+                if ma <= 0:
+                    continue
+                p.setBrush(QBrush(QColor(170, 195, 235, ma)))
+                p.setPen(Qt.NoPen)
+                p.drawEllipse(int(m[0] - m[3] / 2), int(m[1] - m[3] / 2), int(m[3]), int(m[3]))
 
-            ag = QRadialGradient(cx, ccy, 215)
-            ag.setColorAt(0.0, QColor(self._c1.red(), self._c1.green(), self._c1.blue(), 30))
-            ag.setColorAt(0.45, QColor(self._c2.red(), self._c2.green(), self._c2.blue(), 12))
-            ag.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.setBrush(QBrush(ag))
-            p.drawEllipse(int(cx-215), int(ccy-215), 430, 430)
+            # --- Voice pill: a soft glass capsule holding a dot-matrix waveform
+            # and the spoken phrase. Voice-first, so there is no send button. ---
+            BOX_MX = 44
+            box_x  = float(BOX_MX)
+            box_w  = float(w - 2 * BOX_MX)
+            box_h  = 50.0
+            box_y  = float(int(h * 0.46 - box_h / 2))
+            radius = box_h / 2.0
+            row_cy = box_y + box_h / 2.0
 
-            rp = self._ring_phase
-            rr = 38 + rp * 185
-            ra = int((1.0 - rp)**1.7 * 52)
-            if ra > 0:
-                p.setBrush(Qt.NoBrush)
-                p.setPen(QPen(QColor(self._c1.red(), self._c1.green(), self._c1.blue(), ra), 1.0))
-                p.drawEllipse(int(cx - rr), int(ccy - rr * 0.42), int(rr*2), int(rr*0.84))
-            p.setPen(Qt.NoPen)
-
-            hg = QLinearGradient(0, ccy, w, ccy)
-            ha = int(28 + 18 * math.sin(t * 0.55))
-            hg.setColorAt(0.0,  QColor(0, 0, 0, 0))
-            hg.setColorAt(0.18, QColor(self._c2.red(), self._c2.green(), self._c2.blue(), ha))
-            hg.setColorAt(0.5,  QColor(self._c1.red(), self._c1.green(), self._c1.blue(), int(ha * 1.6)))
-            hg.setColorAt(0.82, QColor(self._c2.red(), self._c2.green(), self._c2.blue(), ha))
-            hg.setColorAt(1.0,  QColor(0, 0, 0, 0))
-            p.fillRect(0, int(ccy) - 1, w, 2, QBrush(hg))
-
-            N       = 24
-            BW, BG  = 3, 5
-            total_w = N * (BW + BG) - BG
-            bx0     = cx - total_w / 2
-            MAX_BH  = 58
-            CUR_H   = 60
-            cur_top = ccy - CUR_H / 2
-            cur_bot = ccy + CUR_H / 2
-
-            for i in range(N):
-                bx  = bx0 + i * (BW + BG)
-                ph  = self._bar_phases[i % 24]
-                sp  = self._bar_speeds[i % 24]
-                env = math.sin((i / (N - 1)) * math.pi)
-                raw = abs(math.sin(t * sp + ph))
-                bh  = max(2, int(MAX_BH * env * (0.18 + 0.82 * raw)))
-                ba  = int(50 + 115 * env * raw)
-
-                for (y0, y1) in ((cur_top - 4, cur_top - 4 - bh),
-                                 (cur_bot + 4, cur_bot + 4 + bh)):
-                    bg2 = QLinearGradient(bx, y0, bx, y1)
-                    bg2.setColorAt(0.0, QColor(self._c1.red(), self._c1.green(), self._c1.blue(), ba))
-                    bg2.setColorAt(0.55, QColor(self._c3.red(), self._c3.green(), self._c3.blue(), int(ba * 0.55)))
-                    bg2.setColorAt(1.0, QColor(self._c2.red(), self._c2.green(), self._c2.blue(), 0))
-                    top_y = int(min(y0, y1))
-                    p.fillRect(int(bx), top_y, BW, abs(bh), QBrush(bg2))
-
-            CW   = 3
-            cx_c = cx - CW / 2
-            cy_c = cur_top
-
-            blink = t % 1.1
-            if blink < 0.65:
-                ci = blink/0.06 if blink < 0.06 else ((0.65 - blink)/0.06 if blink > 0.59 else 1.0)
-            else:
-                ci = 0.0
-
-            if ci > 0:
-                for gw, gam in ((40, 0.06), (20, 0.20), (9, 0.50), (CW, 1.0)):
-                    ga = int(ci * 255 * gam)
-                    cg2 = QLinearGradient(cx_c, cy_c, cx_c, cy_c + CUR_H)
-                    cg2.setColorAt(0.0,  QColor(self._c3.red(), self._c3.green(), self._c3.blue(), 0))
-                    cg2.setColorAt(0.12, QColor(self._c1.red(), self._c1.green(), self._c1.blue(), ga))
-                    cg2.setColorAt(0.5,  QColor(255, 255, 255, ga))
-                    cg2.setColorAt(0.88, QColor(self._c1.red(), self._c1.green(), self._c1.blue(), ga))
-                    cg2.setColorAt(1.0,  QColor(self._c3.red(), self._c3.green(), self._c3.blue(), 0))
-                    off = (gw - CW) // 2
-                    p.fillRect(int(cx_c - off), int(cy_c), gw, CUR_H, QBrush(cg2))
-
-            BOX_MX = 24
-            box_x  = BOX_MX
-            box_y  = int(cur_bot + 22)
-            box_w  = w - 2 * BOX_MX
-            box_h  = 44
-
-            box_pulse = 0.55 + 0.45 * math.sin(t * 0.7)
-            p.setBrush(QBrush(QColor(self._c1.red(), self._c1.green(), self._c1.blue(), 10)))
-            p.setPen(QPen(QColor(self._c1.red(), self._c1.green(), self._c1.blue(),
-                                 int(55 * box_pulse)), 1.0))
             box_path = QPainterPath()
-            box_path.addRoundedRect(box_x, box_y, box_w, box_h, 8, 8)
+            box_path.addRoundedRect(box_x, box_y, box_w, box_h, radius, radius)
+            fill = QLinearGradient(0, box_y, 0, box_y + box_h)
+            fill.setColorAt(0.0, QColor(255, 255, 255, 13))
+            fill.setColorAt(1.0, QColor(255, 255, 255, 6))
+            p.fillPath(box_path, QBrush(fill))
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
             p.drawPath(box_path)
-            p.setPen(Qt.NoPen)
 
-            for sl in range(box_y, box_y + box_h, 4):
-                p.fillRect(box_x, sl, box_w, 1, QColor(0, 0, 0, 18))
-
-            msg     = self._messages[self._msg_idx]
-            display = msg[:int(self._msg_chars)]
-            if self._msg_phase == "typing" and len(display) < len(msg):
-                display += "▌"
-            ta     = int(self._msg_alpha * 228)
-            text_y = box_y + (box_h - 14) // 2
+            msg = self._messages[self._msg_idx]
+            ta  = int(max(0.0, min(1.0, self._msg_alpha)) * 255)
 
             font = p.font()
             font.setPointSize(12)
             font.setFamily("Segoe UI")
-            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.3)
+            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.2)
             p.setFont(font)
 
-            if self._glitch_on and ta > 50:
-                p.setPen(QColor(255, 50, 50, int(ta * 0.40)))
-                p.drawText(int(self._glitch_rx), text_y, w, 22, Qt.AlignHCenter, display)
-                p.setPen(QColor(50, 180, 255, int(ta * 0.40)))
-                p.drawText(int(self._glitch_bx), text_y, w, 22, Qt.AlignHCenter, display)
+            fm = QFontMetrics(font)
+            text_w_px = fm.horizontalAdvance(msg)
 
-            p.setPen(QColor(self._c3.red(), self._c3.green(), self._c3.blue(), ta))
-            p.drawText(0, text_y, w, 22, Qt.AlignHCenter, display)
+            # Mini voice waveform (mirrors the capsule's dot-matrix bars).
+            WF_COLS = 5
+            WF_GAP  = 6.0
+            WF_W    = (WF_COLS - 1) * WF_GAP
+            GAP_TW  = 16.0          # gap between waveform and text
+            group_w = WF_W + GAP_TW + text_w_px
+            gx0     = cx - group_w / 2.0
 
-            if self._sweep_on:
-                sw  = 115
-                sg2 = QLinearGradient(self._sweep_x - sw, 0, self._sweep_x + sw, 0)
-                sg2.setColorAt(0.0, QColor(255, 255, 255, 0))
-                sg2.setColorAt(0.4, QColor(self._c3.red(), self._c3.green(), self._c3.blue(), 14))
-                sg2.setColorAt(0.5, QColor(255, 255, 255, 28))
-                sg2.setColorAt(0.6, QColor(self._c3.red(), self._c3.green(), self._c3.blue(), 14))
-                sg2.setColorAt(1.0, QColor(255, 255, 255, 0))
-                p.fillRect(int(self._sweep_x - sw), 0, sw * 2, h, QBrush(sg2))
+            # Waveform dots/bars — animated, soft cyan, gently breathing.
+            for i in range(WF_COLS):
+                env = math.sin((i / (WF_COLS - 1)) * math.pi)        # tallest in middle
+                amp = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 3.4 + i * 0.9))
+                bh  = 5 + 13 * env * amp
+                bx  = gx0 + i * WF_GAP
+                ba  = int(150 + 90 * env * amp)
+                bar = QPainterPath()
+                bar.addRoundedRect(bx - 1.4, row_cy - bh / 2, 2.8, bh, 1.4, 1.4)
+                p.fillPath(bar, QBrush(QColor(c3.red(), c3.green(), c3.blue(), ba)))
 
-            vg = QRadialGradient(cx, h * 0.5, max(w, h) * 0.74)
+            # The spoken phrase, cross-fading next to the waveform.
+            if ta > 0:
+                text_x = int(gx0 + WF_W + GAP_TW)
+                ty     = int(row_cy - 11 + self._msg_slide * 0.4)
+                p.setPen(QColor(222, 230, 244, ta))
+                p.drawText(QRect(text_x, ty, text_w_px + 6, 22),
+                           Qt.AlignVCenter | Qt.AlignLeft, msg)
+
+            # --- Vignette for depth (soft) ---
+            vg = QRadialGradient(cx, h * 0.46, max(w, h) * 0.80)
             vg.setColorAt(0.0,  QColor(0, 0, 0, 0))
-            vg.setColorAt(0.52, QColor(0, 0, 0, 0))
-            vg.setColorAt(1.0,  QColor(0, 0, 0, 148))
+            vg.setColorAt(0.55, QColor(0, 0, 0, 0))
+            vg.setColorAt(1.0,  QColor(0, 0, 0, 130))
             p.fillRect(QRect(0, 0, w, h), QBrush(vg))
 
-            la  = int((0.55 + 0.45 * math.sin(t * 0.82)) * 148)
-            lg2 = QLinearGradient(0, 0, w, 0)
-            lg2.setColorAt(0.0,  QColor(0, 0, 0, 0))
-            lg2.setColorAt(0.25, QColor(self._c2.red(), self._c2.green(), self._c2.blue(), la))
-            lg2.setColorAt(0.5,  QColor(self._c3.red(), self._c3.green(), self._c3.blue(), la))
-            lg2.setColorAt(0.75, QColor(self._c2.red(), self._c2.green(), self._c2.blue(), la))
-            lg2.setColorAt(1.0,  QColor(0, 0, 0, 0))
-            p.fillRect(0, h - 2, w, 1, QBrush(lg2))
-
-            p.setPen(QColor(255, 255, 255, 200))
+            # --- Wordmark ---
+            p.setPen(QColor(236, 240, 250, 200))
             font.setPointSize(16); font.setBold(True)
-            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3.0)
+            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3.2)
             p.setFont(font)
-            p.drawText(0, h - 82, w, 28, Qt.AlignCenter, "O R Y N N")
-            font.setPointSize(9); font.setBold(False)
-            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.0)
-            p.setFont(font)
-            p.setPen(QColor(139, 140, 153, 145))
-            p.drawText(0, h - 56, w, 20, Qt.AlignCenter, "Gemini Live · Voice & Vision")
+            p.drawText(0, h - 70, w, 28, Qt.AlignCenter, "O R Y N N")
+
             p.end()
 
     class _SetupWindow(QWidget):
