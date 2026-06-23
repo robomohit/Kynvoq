@@ -12,7 +12,7 @@ import os
 import re
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 _log = logging.getLogger(__name__)
 
@@ -474,6 +474,211 @@ def _get_active_window_rect(sw: int, sh: int) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _is_orynn_owned_hwnd(hwnd: int) -> bool:
+    """True for Orynn dashboard/overlay windows that would pollute a screen capture."""
+    try:
+        import os
+        import win32gui  # type: ignore
+        import win32process  # type: ignore
+    except Exception:
+        return False
+    if not hwnd or not win32gui.IsWindow(hwnd) or not win32gui.IsWindowVisible(hwnd):
+        return False
+    try:
+        _, pid = win32process.GetWindowThreadProcessId(hwnd)
+        if pid == os.getpid():
+            return True
+    except Exception:
+        pass
+    title = (win32gui.GetWindowText(hwnd) or "").lower()
+    return "orynn" in title
+
+
+def _minimize_orynn_owned_windows() -> None:
+    try:
+        import win32con  # type: ignore
+        import win32gui  # type: ignore
+    except Exception:
+        return
+
+    def _cb(hwnd: int, _: Any) -> None:
+        if _is_orynn_owned_hwnd(hwnd):
+            try:
+                win32gui.ShowWindow(hwnd, win32con.SW_MINIMIZE)
+            except Exception:
+                pass
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        pass
+
+
+_SHELL_WINDOW_CLASSES = frozenset({
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+})
+
+
+def _hwnd_class_name(hwnd: int) -> str:
+    try:
+        import win32gui  # type: ignore
+        return str(win32gui.GetClassName(hwnd) or "")
+    except Exception:
+        return ""
+
+
+def _hwnd_client_area(hwnd: int) -> int:
+    try:
+        import win32gui  # type: ignore
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        return max(0, right - left) * max(0, bottom - top)
+    except Exception:
+        return 0
+
+
+def _is_shell_or_junk_hwnd(hwnd: int) -> bool:
+    """True for desktop shell, taskbar, and other non-app windows unfit for vision."""
+    if not hwnd:
+        return True
+    try:
+        import win32gui  # type: ignore
+        if not win32gui.IsWindow(hwnd):
+            return True
+    except Exception:
+        return True
+    if _hwnd_class_name(hwnd) in _SHELL_WINDOW_CLASSES:
+        return True
+    try:
+        import win32gui  # type: ignore
+        title = (win32gui.GetWindowText(hwnd) or "").strip()
+    except Exception:
+        title = ""
+    if not title:
+        return True
+    if _hwnd_client_area(hwnd) < 120 * 120:
+        return True
+    return False
+
+
+def _best_app_window_for_vision() -> tuple[int, str]:
+    """When foreground is Orynn/shell/taskbar, pick the largest real app window."""
+    best_hwnd, best_title, best_area = 0, "", 0
+    for row in list_open_windows(include_minimized=False, max_results=80):
+        hwnd = int(row.get("hwnd") or 0)
+        title = str(row.get("title") or "").strip()
+        if not hwnd or not title:
+            continue
+        if _is_orynn_owned_hwnd(hwnd) or _is_shell_or_junk_hwnd(hwnd):
+            continue
+        area = _hwnd_client_area(hwnd)
+        if area > best_area:
+            best_area, best_hwnd, best_title = area, hwnd, title
+    return best_hwnd, best_title
+
+
+def resolve_hwnd_for_live_vision() -> tuple[int, str, str]:
+    """Pick what Live vision should capture.
+
+    Returns (hwnd, title, mode) where mode is 'window' (PrintWindow) or 'monitor'
+    (full-screen mss fallback). Default ORYNN_LIVE_SCREEN_CAPTURE=window uses the
+    foreground app only — native Windows PrintWindow, not the whole desktop."""
+    import time
+    import win32gui  # type: ignore
+
+    mode_env = (os.getenv("ORYNN_LIVE_SCREEN_CAPTURE") or "window").strip().lower()
+    if mode_env in ("monitor", "screen", "full", "desktop"):
+        return 0, "", "monitor"
+
+    hwnd = int(win32gui.GetForegroundWindow() or 0)
+    title = (win32gui.GetWindowText(hwnd) or "").strip() if hwnd else ""
+    if _is_orynn_owned_hwnd(hwnd):
+        _minimize_orynn_owned_windows()
+        time.sleep(0.12)
+        hwnd = int(win32gui.GetForegroundWindow() or 0)
+        title = (win32gui.GetWindowText(hwnd) or "").strip() if hwnd else ""
+    if _is_orynn_owned_hwnd(hwnd) or _is_shell_or_junk_hwnd(hwnd):
+        pick_hwnd, pick_title = _best_app_window_for_vision()
+        if pick_hwnd:
+            return pick_hwnd, pick_title, "window"
+        if _is_orynn_owned_hwnd(hwnd):
+            return 0, title, "monitor"
+        return 0, title, "monitor"
+    if hwnd and win32gui.IsWindow(hwnd):
+        return hwnd, title, "window"
+    pick_hwnd, pick_title = _best_app_window_for_vision()
+    if pick_hwnd:
+        return pick_hwnd, pick_title, "window"
+    return 0, "", "monitor"
+
+
+def list_open_windows(
+    *,
+    include_minimized: bool = True,
+    max_results: int = 40,
+) -> list[dict[str, Any]]:
+    """Return visible top-level windows for Live (title + minimized flag only)."""
+    try:
+        import win32con  # type: ignore
+        import win32gui  # type: ignore
+    except Exception:
+        return []
+
+    rows: list[dict[str, Any]] = []
+
+    def _cb(hwnd: int, _: Any) -> None:
+        if not win32gui.IsWindow(hwnd):
+            return
+        if _is_orynn_owned_hwnd(hwnd):
+            return
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        title = (win32gui.GetWindowText(hwnd) or "").strip()
+        if len(title) < 2:
+            return
+        minimized = False
+        try:
+            placement = win32gui.GetWindowPlacement(hwnd)
+            minimized = placement[1] == win32con.SW_SHOWMINIMIZED
+        except Exception:
+            pass
+        if minimized and not include_minimized:
+            return
+        rows.append({"hwnd": hwnd, "title": title[:120], "minimized": minimized})
+
+    try:
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        return []
+    rows.sort(key=lambda w: (bool(w.get("minimized")), str(w.get("title", "")).lower()))
+    return rows[: max(1, min(max_results, 80))]
+
+
+def resolve_hwnd_for_title_query(title_query: str, index: int = 0) -> tuple[int, str]:
+    """Find a window by partial title match without focusing it."""
+    q = (title_query or "").strip()
+    if not q:
+        return 0, ""
+    matches = [
+        w for w in list_open_windows(include_minimized=True, max_results=80)
+        if q.lower() in str(w.get("title") or "").lower()
+    ]
+    if not matches:
+        hwnd = _get_hwnd_for_title(q)
+        if hwnd:
+            try:
+                import win32gui  # type: ignore
+                return int(hwnd), (win32gui.GetWindowText(hwnd) or q).strip()[:120]
+            except Exception:
+                return int(hwnd), q
+        return 0, ""
+    idx = max(0, min(int(index or 0), len(matches) - 1))
+    pick = matches[idx]
+    return int(pick.get("hwnd") or 0), str(pick.get("title") or q)
+
+
 def _get_hwnd_for_title(partial_title: str) -> Optional[int]:
     """Find a visible HWND by partial title match; checks top-level then child windows."""
     try:
@@ -510,7 +715,7 @@ def _get_hwnd_for_title(partial_title: str) -> Optional[int]:
 
 def _capture_hwnd_screenshot_b64(hwnd: int) -> str:
     """Capture a screenshot of the given HWND via PrintWindow so fullscreen overlays don't block it."""
-    image = _capture_hwnd_image(hwnd)
+    image = _capture_hwnd_image(hwnd, max_edge=None)
     try:
         buf = io.BytesIO()
         image.save(buf, format="JPEG", quality=75)
@@ -623,7 +828,7 @@ def _run_with_timeout(fn: Any, timeout_seconds: float, *, label: str) -> Any:
         executor.shutdown(wait=False, cancel_futures=True)
 
 
-def _capture_hwnd_image(hwnd: int) -> Image.Image:
+def _capture_hwnd_image(hwnd: int, *, max_edge: int | None = None) -> Image.Image:
     import ctypes
     import win32con  # type: ignore
     import win32gui  # type: ignore
@@ -689,9 +894,12 @@ def _capture_hwnd_image(hwnd: int) -> Image.Image:
         image = raw_image.copy()
         raw_image.close()
         del bmp_bytes  # release the large Win32 bitmap buffer ASAP
-        target_w, target_h = _pick_capture_cap(width, height)
-        if image.size[0] > target_w or image.size[1] > target_h:
-            image.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+        if max_edge is None:
+            target_w, target_h = _pick_capture_cap(width, height)
+            if image.size[0] > target_w or image.size[1] > target_h:
+                image.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
+        elif max_edge > 0 and max(image.size) > max_edge:
+            image.thumbnail((max_edge, max_edge), Image.Resampling.LANCZOS)
         return image
     finally:
         if bitmap is not None:
@@ -972,6 +1180,68 @@ def _normalize_hierarchical_plan(payload: Any) -> Any:
     return normalized
 
 
+def _execute_with_retry(
+    request_fn: Callable[[], httpx.Response],
+    log_prefix: str,
+    max_attempts: int = 3,
+    base_delay: float = 2.0,
+) -> httpx.Response:
+    """Execute an HTTP request function with unified retry logic and exponential backoff.
+
+    Catches rate limit errors (HTTP 429), timeouts (HTTP 408), temporary server failures (HTTP 5xx),
+    and network/transport exceptions (httpx.TransportError).
+    """
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = request_fn()
+            
+            # Check for soft errors in JSON response if it's OpenRouter/Groq
+            try:
+                resp_json = resp.json()
+                if isinstance(resp_json, dict) and "error" in resp_json:
+                    err_msg = resp_json["error"].get("message", str(resp_json["error"]))
+                    # Soft error is raised as status error so it can be retried or escalated
+                    raise httpx.HTTPStatusError(
+                        message=f"Soft API Error: {err_msg}",
+                        request=resp.request,
+                        response=resp
+                    )
+            except (ValueError, KeyError, TypeError) as e:
+                if "Soft API Error" in str(e):
+                    raise e
+                pass
+
+            if resp.status_code in (408, 429) or resp.status_code >= 500:
+                resp.raise_for_status()
+
+            return resp
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            last_err = e
+            status_code = "transport_error"
+            if isinstance(e, httpx.HTTPStatusError) and e.response is not None:
+                status_code = str(e.response.status_code)
+                # If it's a hard status error that we don't retry (not 408, 429, and not 5xx)
+                # and not a soft API error we raised ourselves
+                if e.response.status_code not in (408, 429) and e.response.status_code < 500:
+                    if "Soft API Error" not in str(e):
+                        raise e
+
+            if attempt == max_attempts:
+                break
+
+            delay = base_delay ** attempt
+            _log.warning(
+                "%s failed (status=%s, attempt %d/%d). Retrying in %.1fs... Error: %s",
+                log_prefix, status_code, attempt, max_attempts, delay, str(e)
+            )
+            time.sleep(delay)
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("HTTP request failed after max attempts")
+
+
 def _extract_chat_message_text(payload: Dict[str, Any]) -> str:
     """Extract assistant text from OpenAI-compatible chat responses."""
     choices = payload.get("choices")
@@ -1040,6 +1310,18 @@ DEFAULT_OPENROUTER_MODEL = "openrouter/openai/gpt-oss-120b:free"
 # "sometimes works." Caps total backoff at ~68s; the user can always cancel.
 _CHAIN_RETRY_MAX = 3
 _CHAIN_RETRY_BACKOFFS = [8, 20, 40]  # seconds between chain retry attempts
+
+
+def _ttft_failover_seconds() -> float:
+    """Time-to-first-token budget (#10). If a model streams NO token within this many
+    seconds, abandon it and fail over to the next model in the chain (same machinery as
+    a 429). 0 disables it — the default, because free-tier TTFT is legitimately 5-15s and
+    a too-eager budget would thrash off a slow-but-working model. Opt in with
+    ORYNN_TTFT_FAILOVER_SECONDS=<n> (e.g. 30 to rescue a truly hung model)."""
+    try:
+        return max(0.0, float(os.getenv("ORYNN_TTFT_FAILOVER_SECONDS", "0") or 0))
+    except (TypeError, ValueError):
+        return 0.0
 
 # Speed tiers — each is an ordered free-model fallback chain. A user picks a
 # tier ("tier:quick" / "tier:balanced") instead of a raw model; the chain
@@ -1135,6 +1417,46 @@ def _ollama_name(model: str) -> str:
     return raw
 
 
+def _llm_read_timeout() -> float:
+    """Max seconds to wait for a model response. Env-overridable.
+
+    Was effectively 300s (a single flat httpx timeout), which let a desktop step
+    hang for 5 minutes before failing. 120s is generous for a slow free model yet
+    bounded enough that a genuine stall surfaces quickly.
+    """
+    try:
+        val = float(os.environ.get("ORYNN_LLM_TIMEOUT") or "120")
+        return val if val > 0 else 120.0
+    except (TypeError, ValueError):
+        return 120.0
+
+
+def _build_llm_http_client() -> "httpx.Client":
+    """A hardened httpx client for every LLM call.
+
+    Why this exists: a long-running backend kept a *persistent* httpx.Client with a
+    flat 300s timeout. After the process sat idle for hours, a request reused a dead
+    pooled keep-alive connection and hung until that 300s timeout fired — the exact
+    "stuck for 5 minutes on step 1" symptom, gone after a restart. This config makes
+    that impossible:
+      • connect/pool capped at 10s  -> a dead/contended connection fails fast,
+      • keepalive_expiry=15s        -> idle connections are dropped, never reused stale,
+      • transport retries=2         -> a connection-level failure retries on a FRESH
+                                       socket automatically (self-healing),
+      • read bounded by _llm_read_timeout() instead of 300s.
+    """
+    transport = httpx.HTTPTransport(
+        retries=2,
+        limits=httpx.Limits(
+            max_keepalive_connections=10, max_connections=50, keepalive_expiry=15.0
+        ),
+    )
+    return httpx.Client(
+        timeout=httpx.Timeout(connect=10.0, read=_llm_read_timeout(), write=20.0, pool=10.0),
+        transport=transport,
+    )
+
+
 class PlannerProvider:
     def __init__(self, model: str = DEFAULT_OPENROUTER_MODEL):
         # A speed-tier selection ("tier:quick"/"tier:balanced") resolves to its
@@ -1153,8 +1475,10 @@ class PlannerProvider:
         self._total_input_tokens: int = 0
         self._total_output_tokens: int = 0
         self.thinking_budget: str = "off"
-        # Persistent HTTP client — reuses TCP connections and avoids SSL handshake per call
-        self._http_client = httpx.Client(timeout=300)
+        # Persistent HTTP client — reuses TCP connections and avoids SSL handshake per
+        # call, but hardened so a stale pooled connection can't hang a request (see
+        # _build_llm_http_client). Closed in close()/__del__ so sockets don't leak.
+        self._http_client = _build_llm_http_client()
         # Cache provider type so _is_X() string checks don't repeat every call
         m = model.lower()
         self._is_anthropic_model = "anthropic" in m or "claude" in m
@@ -1162,6 +1486,20 @@ class PlannerProvider:
         self._is_openrouter_model = "openrouter" in m or ("/" in m and not self._is_anthropic_model and not self._is_openai_model)
         self._is_groq_model = "groq" in m
         self._is_ollama_model = m.startswith("ollama/")
+
+    def close(self) -> None:
+        """Release the pooled HTTP connections. Safe to call more than once."""
+        client = getattr(self, "_http_client", None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        # Safety net so a provider that isn't explicitly closed still frees its
+        # sockets when garbage-collected, rather than leaking over a long session.
+        self.close()
 
     @property
     def total_tokens(self) -> int:
@@ -1262,6 +1600,12 @@ class PlannerProvider:
                     time.sleep(2 ** attempt)
                     continue
                 raise
+            except httpx.TransportError as e:
+                # Connection/read-timeout error (e.g. a dead pooled connection or a
+                # slow free model). Retry rather than let it hang or crash the task.
+                last_err = e
+                time.sleep(2 ** attempt)
+                continue
         raise last_err or RuntimeError("All API retries exhausted")
 
     def _chat_openai(self, system: str, prompt: str, screenshot_b64: Optional[str] = None) -> str:
@@ -1299,6 +1643,12 @@ class PlannerProvider:
                     time.sleep(2 ** attempt)
                     continue
                 raise
+            except httpx.TransportError as e:
+                # Connection/read-timeout error (e.g. a dead pooled connection or a
+                # slow free model). Retry rather than let it hang or crash the task.
+                last_err = e
+                time.sleep(2 ** attempt)
+                continue
         raise last_err or RuntimeError("All API retries exhausted")
 
     def _chat_openrouter(self, system: str, prompt: str, screenshot_b64: Optional[str] = None, _model_override: Optional[str] = None) -> str:
@@ -1333,38 +1683,25 @@ class PlannerProvider:
                 payload = {"model": current_model, "messages": messages}
 
                 is_last_model = (current_model == models_to_try[-1])
-                for attempt in range(3 if is_last_model else 1):
-                    try:
-                        resp = self._http_client.post(
+                try:
+                    resp = _execute_with_retry(
+                        lambda: self._http_client.post(
                             "https://openrouter.ai/api/v1/chat/completions",
                             headers={"Authorization": f"Bearer {self._openrouter_key}"},
                             json=payload,
-                        )
-                        if resp.status_code != 200:
-                            print(f"OPENROUTER ERROR ({current_model}):", resp.text)
-                        resp.raise_for_status()
-                        resp_json = resp.json()
-                        if "error" in resp_json:
-                            err_msg = resp_json["error"].get("message", str(resp_json["error"]))
-                            print(f"OPENROUTER SOFT ERROR ({current_model}): {err_msg}")
-                            # Rate/quota error on non-final model → skip to next model immediately
-                            if not is_last_model:
-                                break
-                            if attempt < 2:
-                                time.sleep(2 ** (attempt + 1))
-                                continue
-                            raise RuntimeError(f"OpenRouter error: {err_msg}")
-                        if "choices" not in resp_json:
-                            raise RuntimeError(f"Unexpected OpenRouter response: {str(resp_json)[:200]}")
-                        return _extract_chat_message_text(resp_json)
-                    except httpx.HTTPStatusError as e:
-                        last_err = e
-                        if e.response.status_code in (402, 429) or e.response.status_code >= 500:
-                            if not is_last_model:
-                                break  # fail fast to next model
-                            time.sleep(2 ** (attempt + 1))
-                            continue
-                        break
+                        ),
+                        log_prefix=f"OpenRouter call ({current_model})",
+                        max_attempts=3 if is_last_model else 1
+                    )
+                    resp_json = resp.json()
+                    if "choices" not in resp_json:
+                        raise RuntimeError(f"Unexpected OpenRouter response: {str(resp_json)[:200]}")
+                    return _extract_chat_message_text(resp_json)
+                except (httpx.HTTPStatusError, httpx.TransportError, RuntimeError) as e:
+                    last_err = e
+                    if not is_last_model:
+                        # Fail over to next model
+                        continue
 
                 # If we reach here, this model failed all retries or hit a hard error.
                 # The loop will continue to the next model in models_to_try.
@@ -1492,7 +1829,7 @@ class PlannerProvider:
         last_err = None
         for attempt in range(3):
             try:
-                with httpx.Client(timeout=300) as client:
+                with _build_llm_http_client() as client:
                     resp = client.post(
                         f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self._google_key}",
                         json=payload,
@@ -1505,6 +1842,12 @@ class PlannerProvider:
                     time.sleep(2 ** attempt)
                     continue
                 raise
+            except httpx.TransportError as e:
+                # Connection/read-timeout error (e.g. a dead pooled connection or a
+                # slow free model). Retry rather than let it hang or crash the task.
+                last_err = e
+                time.sleep(2 ** attempt)
+                continue
         raise last_err or RuntimeError("All API retries exhausted")
 
     def _chat_groq(self, system: str, prompt: str, screenshot_b64: Optional[str] = None) -> str:
@@ -1525,24 +1868,22 @@ class PlannerProvider:
         ]
         payload = {"model": model, "max_tokens": 4096, "messages": messages}
         
-        last_err = None
-        for attempt in range(3):
-            try:
-                with httpx.Client(timeout=300) as client:
-                    resp = client.post(
+        try:
+            def run():
+                with _build_llm_http_client() as client:
+                    return client.post(
                         "https://api.groq.com/openai/v1/chat/completions",
                         headers={"Authorization": f"Bearer {self._groq_key}"},
                         json=payload,
                     )
-                    resp.raise_for_status()
-                    return _extract_chat_message_text(resp.json())
-            except httpx.HTTPStatusError as e:
-                last_err = e
-                if e.response.status_code in (402, 429) or e.response.status_code >= 500:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise
-        raise last_err or RuntimeError("All API retries exhausted")
+            resp = _execute_with_retry(
+                run,
+                log_prefix=f"Groq call ({model})",
+                max_attempts=3
+            )
+            return _extract_chat_message_text(resp.json())
+        except (httpx.HTTPStatusError, httpx.TransportError) as e:
+            raise RuntimeError(f"Groq API call failed: {e}") from e
 
     # Fallback model chain: when a provider 429s, try the next one
     _FALLBACK_MODELS = [
@@ -1571,11 +1912,14 @@ class PlannerProvider:
 
         try:
             return primary_fn(system, prompt, screenshot_b64)
-        except (httpx.HTTPStatusError, RuntimeError) as primary_err:
-            # Check if this is a rate-limit (429) or server error (5xx)
+        except (httpx.HTTPStatusError, httpx.TransportError, RuntimeError) as primary_err:
+            # Check if this is a rate-limit (429), server error (5xx), or a
+            # connection/timeout error — any of which should fail over to OpenRouter.
             is_retryable = False
             if isinstance(primary_err, httpx.HTTPStatusError):
                 is_retryable = primary_err.response.status_code in (402, 429) or primary_err.response.status_code >= 500
+            elif isinstance(primary_err, httpx.TransportError):
+                is_retryable = True  # dead connection / timeout — try the fallback chain
             elif "rate" in str(primary_err).lower() or "429" in str(primary_err) or "402" in str(primary_err):
                 is_retryable = True
 
@@ -1778,19 +2122,40 @@ class PlannerProvider:
         _groq_fallback_ready = self._is_groq() and bool(self._openrouter_key)
         try:
             last_err: Optional[Exception] = None
+            _ttft_budget = _ttft_failover_seconds()
             for _chain_attempt in range(_CHAIN_RETRY_MAX + 1):
                 last_err = None
                 _streamed_any = False
                 try:
-                    async for event in self._stream_chat_with_tools_single(
+                    _agen = self._stream_chat_with_tools_single(
                         system, messages, tools, screenshot_b64
-                    ):
+                    )
+                    # Bound only the FIRST token: a model that hangs before saying
+                    # anything fails over like a 429 (#10). Once the stream is flowing
+                    # we never interrupt it. Budget 0 → no bound (default).
+                    while True:
+                        try:
+                            if _ttft_budget > 0 and not _streamed_any:
+                                event = await asyncio.wait_for(_agen.__anext__(), timeout=_ttft_budget)
+                            else:
+                                event = await _agen.__anext__()
+                        except StopAsyncIteration:
+                            break
+                        except asyncio.TimeoutError:
+                            try:
+                                await _agen.aclose()
+                            except Exception:
+                                pass
+                            raise RuntimeError(
+                                f"model produced no token within {_ttft_budget:g}s (TTFT failover)"
+                            )
                         _streamed_any = True
                         yield event
                     return  # chain succeeded
                 except Exception as e:
                     last_err = e
-                    _is_rate_limit = (
+                    _is_ttft = isinstance(e, RuntimeError) and "TTFT failover" in str(e)
+                    _is_rate_limit = _is_ttft or (
                         isinstance(e, _httpx.HTTPStatusError)
                         and e.response.status_code in (402, 429)
                     ) or isinstance(e, RuntimeError) and (
@@ -2161,6 +2526,57 @@ class PlannerProvider:
             return result
         except Exception:
             return {"complete": False, "reason": "Evaluation failed to parse LLM response."}
+
+
+def ocr_live_capture(*, question: str = "") -> dict[str, Any]:
+    """OCR pass for Live look_at_screen mid-tier (WS7). Returns text + confidence."""
+    import time as _time
+
+    started = _time.monotonic()
+    try:
+        import mss
+        from PIL import Image
+
+        hwnd, title, mode = resolve_hwnd_for_live_vision()
+        if mode == "window" and hwnd:
+            img = _capture_hwnd_image(hwnd, max_edge=1280)
+        else:
+            with mss.mss() as sct:
+                mons = sct.monitors
+                mon = mons[1] if len(mons) > 1 else mons[0]
+                shot = sct.grab(mon)
+                img = Image.frombytes("RGB", shot.size, shot.rgb)
+        try:
+            import pytesseract
+            from pytesseract import Output
+
+            data = pytesseract.image_to_data(img, output_type=Output.DICT)
+            texts = []
+            confs = []
+            for i, txt in enumerate(data.get("text") or []):
+                t = str(txt or "").strip()
+                if not t:
+                    continue
+                try:
+                    c = float(data["conf"][i])
+                except Exception:
+                    c = -1.0
+                if c >= 0:
+                    texts.append(t)
+                    confs.append(c)
+            full = " ".join(texts).strip()
+            confidence = (sum(confs) / len(confs) / 100.0) if confs else 0.0
+            return {
+                "ok": bool(full),
+                "text": full,
+                "confidence": min(1.0, max(0.0, confidence)),
+                "frame_age_ms": int((_time.monotonic() - started) * 1000),
+                "window": title,
+            }
+        except ImportError:
+            return {"ok": False, "text": "", "confidence": 0.0, "error": "pytesseract missing"}
+    except Exception as exc:
+        return {"ok": False, "text": "", "confidence": 0.0, "error": str(exc)[:200]}
 
 
 __all__ = [

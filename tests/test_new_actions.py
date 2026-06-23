@@ -391,10 +391,77 @@ def test_file_glob_stays_inside_workspace(workspace):
     assert result.ok
     assert "src" in result.output
 
+    # An ABSOLUTE pattern inside the workspace is allowed (read_file/write_file accept
+    # such paths too — file_glob used to reject every absolute path, so the agent
+    # couldn't glob a folder it had just written to).
+    abs_inside = t.file_glob(str((workspace / "src" / "*.py").resolve()))
+    assert abs_inside.ok
+    assert "app.py" in abs_inside.output
+
     with pytest.raises(Exception):
         t.file_glob("../**/*")
     with pytest.raises(Exception):
         t.file_glob(str((workspace.parent / "*.py").resolve()))
+
+
+def test_validate_action_args_rejects_null_and_missing(workspace):
+    """A required arg that's missing OR explicitly null is rejected before execute,
+    with a clear message — not a confusing downstream crash (#1)."""
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+
+    missing = t._validate_action_args(Action(id="1", type=ActionType.uia_click, args={}))
+    assert missing is not None and missing.ok is False and "query" in missing.output
+
+    null_arg = t._validate_action_args(Action(id="2", type=ActionType.uia_click, args={"query": None}))
+    assert null_arg is not None and null_arg.ok is False
+
+    ok = t._validate_action_args(Action(id="3", type=ActionType.uia_click, args={"query": "OK"}))
+    assert ok is None
+
+
+def test_validate_action_args_allows_empty_string_content(workspace):
+    """Empty content is a legitimately empty file — must not be rejected (#1)."""
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+    res = t._validate_action_args(
+        Action(id="1", type=ActionType.write_file, args={"path": "a.txt", "content": ""})
+    )
+    assert res is None
+
+
+def test_guess_launch_title_maps_uri_schemes(workspace):
+    """ms-settings: and friends open a window whose title isn't the scheme — map them
+    so the launch waits for the real window instead of falsely failing (#6). Windows
+    drive paths must NOT be mistaken for URI schemes."""
+    t = ToolExecutor(workspace, text_editor=TextEditorTool(workspace))
+    assert t._guess_launch_target_title("start ms-settings:") == "Settings"
+    assert t._guess_launch_target_title("start ms-settings:bluetooth") == "Settings"
+    assert t._guess_launch_target_title("start ms-photos:") == "Photos"
+    # Unknown scheme/URL → no title (don't block on a wait that can't match).
+    assert t._guess_launch_target_title("start https://example.com") == ""
+    # A drive-letter path is not a scheme.
+    assert t._guess_launch_target_title("explorer C:\\Users") != "C"
+    # Plain known apps still resolve.
+    assert t._guess_launch_target_title("start notepad") == "Notepad"
+
+
+def test_windows_translate_command():
+    """Bare POSIX commands the model emits map to Windows equivalents; complex
+    commands (pipes/redirects/chaining) are left untouched (#10 / QA: ls on Windows)."""
+    import os
+    tr = ToolExecutor._windows_translate_command
+    if os.name != "nt":
+        import pytest as _pt
+        _pt.skip("Windows-only translation")
+    assert tr("ls") == "dir"
+    assert tr("ls -la") == "dir"
+    assert tr("ls -la C:/Users") == "dir C:/Users"
+    assert tr("cat notes.txt") == "type notes.txt"
+    assert tr("pwd") == "cd"
+    assert tr("which python") == "where python"
+    # Anything with a pipe/redirect/chain is preserved verbatim.
+    assert tr("ls | findstr foo") == "ls | findstr foo"
+    assert tr("dir /b") == "dir /b"
+    assert tr("python build.py") == "python build.py"
 
 
 def test_safety_bash():

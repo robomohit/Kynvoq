@@ -744,3 +744,32 @@ def format_affordance_graph(graph: dict[str, Any], *, limit: int = 8) -> str:
         f"Adaptive app map for {app}: {count} UIA nodes, {named} named controls. "
         + " | ".join(group_bits)
     )
+
+
+_BUILTIN_PLAYBOOKS: dict[str, list[ResolverStep]] = {
+    "calculator": [
+        _resolver("pb-calc-1", "Four", "Calculator keypad", "uia_click", query="Four", app="Calculator"),
+        _resolver("pb-calc-2", "Equals", "Finish calculation", "uia_click", query="Equals", app="Calculator"),
+    ],
+    "notepad": [
+        _resolver("pb-note-1", "Text editor", "Type into editor", "uia_type", query="Text editor", app="Notepad"),
+    ],
+}
+
+
+def playbook_for_app(app: str) -> list[ResolverStep]:
+    """Return auto-selected playbook steps for known simple apps (WS6)."""
+    key = _app_key(app)
+    if "calc" in key:
+        return list(_BUILTIN_PLAYBOOKS["calculator"])
+    if "notepad" in key:
+        return list(_BUILTIN_PLAYBOOKS["notepad"])
+    return []
+
+
+def format_playbook_hint(app: str) -> str:
+    steps = playbook_for_app(app)
+    if not steps:
+        return ""
+    titles = ", ".join(s.title for s in steps[:6])
+    return f"Playbook hint for {app}: try sequence {titles}."

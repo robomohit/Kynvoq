@@ -54,6 +54,51 @@ def test_explicit_desktop_model_still_wins_over_groq(monkeypatch):
     assert not sel["selected_model"].startswith("groq/")
 
 
+def test_groq_kept_off_desktop_when_openrouter_available(monkeypatch):
+    """#10: Groq is fast but weaker at the UIA tool loop, so a desktop mode with both
+    keys (and no DESKTOP_MODEL) uses the tool-accurate OpenRouter desktop model — while
+    chat/auto stays on Groq for latency."""
+    from app.main import _select_model_for_task
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.delenv("DESKTOP_MODEL", raising=False)
+
+    desktop = _select_model_for_task("click the Start button", mode="computer")
+    assert not desktop["selected_model"].startswith("groq/"), desktop
+    assert desktop["required_key"] == "OPENROUTER_API_KEY"
+
+    chat = _select_model_for_task("what's the weather", mode="auto")
+    assert chat["selected_model"].startswith("groq/"), chat
+
+
+def test_desktop_model_honored_for_computer_use_mode(monkeypatch):
+    """computer_use is a desktop mode too — a user's DESKTOP_MODEL must be honored for
+    it, not silently dropped to the generic effort model."""
+    from app.main import _select_model_for_task
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test")
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.setenv("DESKTOP_MODEL", "z-ai/glm-4.5-air:free")
+
+    sel = _select_model_for_task("click the Start button", mode="computer_use")
+    assert sel["selected_model"] == "z-ai/glm-4.5-air:free", sel
+    assert sel["model_source"] == "auto:desktop:env"
+
+
+def test_groq_stays_on_desktop_when_its_the_only_key(monkeypatch):
+    """If Groq is the only provider, a desktop task still uses it — better than no
+    model. We only skip Groq for desktop when OpenRouter exists to fall through to."""
+    from app.main import _select_model_for_task
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "gsk_test")
+    monkeypatch.delenv("DESKTOP_MODEL", raising=False)
+
+    desktop = _select_model_for_task("click the Start button", mode="computer_isolated")
+    assert desktop["selected_model"].startswith("groq/"), desktop
+
+
 # ---------------------------------------------------------------------------
 # Half 2 — cross-provider fallback on a Groq failure (stream_chat_with_tools)
 # ---------------------------------------------------------------------------

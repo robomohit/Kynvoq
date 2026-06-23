@@ -60,6 +60,7 @@ Thumbs.db
 # Runtime state (written by the app at runtime; not source)
 connectors.json
 preferences.json
+memory/knowledge.json
 clipboard_history.json
 form_profiles.json
 scheduled_recipes.json
@@ -90,3 +91,7 @@ static/_*.html
 
 # UI audit scratch (before/after + third-party reference shots — not shipped)
 docs/ui_audit/
+
+# Trash artifacts (app-generated cleanup state, not source)
+.trash/
+capsule_trash_manifest.json

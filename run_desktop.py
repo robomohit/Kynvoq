@@ -5,15 +5,61 @@ import uvicorn
 import time
 import os
 import sys
+
+# Force UTF-8 stdio BEFORE importing the app, so model text or a unicode log line
+# (em / non-breaking hyphens, smart quotes, emoji) can never crash a print on the
+# Windows cp1252 console (UnicodeEncodeError).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+# Frozen .exe: anchor relative paths (.env, workspace/memory) to the INSTALL folder
+# next to Orynn.exe — not PyInstaller's read-only temp bundle. Must run BEFORE
+# importing app.main (which load_dotenv's ".env" at import time).
+if getattr(sys, "frozen", False):
+    from pathlib import Path as _Path
+    _exe_dir = _Path(sys.executable).resolve().parent
+    try:
+        os.chdir(_exe_dir)
+    except Exception:
+        pass
+    os.environ.setdefault("ORYNN_WORKSPACE", str(_exe_dir))
+    # A windowed PyInstaller exe has sys.stdout/stderr == None, so any print() — and
+    # uvicorn's sys.stdout.isatty() — crashes. Route them to a log file by the exe.
+    if sys.stdout is None or sys.stderr is None:
+        try:
+            _logf = open(_exe_dir / "orynn.log", "a", encoding="utf-8", buffering=1)
+        except Exception:
+            import io as _io
+            _logf = _io.StringIO()
+        if sys.stdout is None:
+            sys.stdout = _logf
+        if sys.stderr is None:
+            sys.stderr = _logf
+
 from app.main import app
 
 PORT = int(os.getenv("ORYNN_PORT") or os.getenv("AI_COMPUTER_PORT", "8000"))
 
 
 def run_server(port: int):
-    # Run FastAPI server on a background thread
+    # Run FastAPI server on a background thread.
     # Defaults to 8000; ORYNN_PORT can override it for local testing.
-    uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
+    try:
+        uvicorn.run(app, host="127.0.0.1", port=port, log_level="error")
+    except Exception:
+        # The frozen .exe is windowed (no console), so a backend crash would be
+        # invisible. Persist it next to the exe so failures are diagnosable.
+        import traceback
+        from pathlib import Path as _P
+        try:
+            (_P(os.environ.get("ORYNN_WORKSPACE") or ".") / "orynn_backend_error.log").write_text(
+                traceback.format_exc(), encoding="utf-8")
+        except Exception:
+            pass
+        raise
 
 
 def _server_healthy(port: int, timeout: float = 0.7) -> bool:
@@ -78,13 +124,13 @@ def _start_backend(preferred_port: int) -> int:
 
 
 def _start_textbox_overlay(port: int) -> subprocess.Popen | None:
-    cmd = [
-        sys.executable,
-        "-m",
-        "app.widget.textbox_overlay",
-        "--port",
-        str(port),
-    ]
+    _stop_existing_textbox_overlays(port)
+    if getattr(sys, "frozen", False):
+        # Bundled .exe: there's no `python -m`, so relaunch OURSELVES with --overlay
+        # (run_desktop's __main__ routes that flag straight to the overlay's main()).
+        cmd = [sys.executable, "--overlay", "--port", str(port)]
+    else:
+        cmd = [sys.executable, "-m", "app.widget.textbox_overlay", "--port", str(port)]
     creationflags = 0
     if os.name == "nt":
         creationflags = (
@@ -103,6 +149,52 @@ def _start_textbox_overlay(port: int) -> subprocess.Popen | None:
     except Exception as exc:
         print(f"[Desktop] Textbox overlay failed to start: {exc}", file=sys.stderr)
         return None
+
+
+def _stop_existing_textbox_overlays(port: int) -> int:
+    """Retire stale textbox overlays before starting a fresh one.
+
+    Re-running the desktop launcher used to stack multiple always-on-top overlay
+    processes. They all listened for the same Live/stop hotkeys and all tried to
+    render status, which made the companion feel flaky. Keep one overlay per
+    backend port.
+    """
+    try:
+        import psutil
+    except Exception:
+        return 0
+    # Dev runs as `python -m app.widget.textbox_overlay`; the frozen build as
+    # `Orynn.exe --overlay` — match either so the one-overlay-per-port rule holds.
+    markers = ("app.widget.textbox_overlay", "--overlay")
+    wanted_port = str(int(port))
+    victims = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            if proc.pid == os.getpid():
+                continue
+            cmdline = [str(part) for part in (proc.info.get("cmdline") or [])]
+            joined = " ".join(cmdline)
+            if not any(m in joined for m in markers):
+                continue
+            if "--port" in cmdline:
+                idx = cmdline.index("--port")
+                if idx + 1 < len(cmdline) and cmdline[idx + 1] != wanted_port:
+                    continue
+            elif wanted_port not in joined:
+                continue
+            proc.terminate()
+            victims.append(proc)
+        except Exception:
+            continue
+    if victims:
+        gone, alive = psutil.wait_procs(victims, timeout=2.0)
+        for proc in alive:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        print(f"[Desktop] Restarted textbox overlay ({len(victims)} stale instance(s) stopped).")
+    return len(victims)
 
 
 def parse_args():
@@ -125,7 +217,32 @@ def parse_args():
     return parser.parse_args()
 
 if __name__ == "__main__":
+    # Frozen re-entry: a bundled .exe has no `python -m`, so it relaunches ITSELF with
+    # --overlay to run the companion overlay subprocess. Route that straight to the
+    # overlay's main() and exit, before any launcher logic (backend/setup/dashboard).
+    if "--overlay" in sys.argv:
+        from app.widget.textbox_overlay import main as _overlay_main
+        _ov_port = str(PORT)
+        if "--port" in sys.argv:
+            _pi = sys.argv.index("--port")
+            if _pi + 1 < len(sys.argv):
+                _ov_port = sys.argv[_pi + 1]
+        sys.exit(_overlay_main(["--port", _ov_port]))
+
     args = parse_args()
+
+    # First run: if the Gemini key (Live's lifeblood) is missing, show a one-time,
+    # polished setup window to collect it (+ an optional agent key) before anything
+    # else starts. No-op once a key exists.
+    try:
+        from app.widget.setup_window import ensure_keys_configured
+        if not ensure_keys_configured():
+            print("[Desktop] Setup cancelled — no API key was provided. Exiting.")
+            sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as exc:
+        print(f"[Desktop] Setup window unavailable ({exc}); continuing.", file=sys.stderr)
 
     # 1. Start the backend server in a background thread, unless one is already
     #    running (e.g. the capsule launched us to open a second native window).

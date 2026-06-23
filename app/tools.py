@@ -436,6 +436,93 @@ def _read_public_http_url(
     raise ToolError("Too many redirects while fetching URL.")
 
 
+# ── Deterministic app-launch fast-path ───────────────────────────────────────
+# A curated registry of apps Orynn can open by voice without any LLM: spoken name
+# -> (launch command, window-title substring to verify). Deliberately NARROW —
+# only Windows built-ins with a stable, matchable window title and a reliable
+# `start` command. Browsers / third-party apps are left out on purpose (their
+# launch + title vary per machine), so "open chrome" correctly falls through to
+# the planner instead of failing. This is the "bounded command" layer the North
+# Star favors: fast, predictable, never mis-reported.
+_KNOWN_LAUNCH_APPS: Dict[str, tuple] = {
+    "notepad": ("start notepad", "Notepad"),
+    "calculator": ("start calc", "Calculator"),
+    "calc": ("start calc", "Calculator"),
+    "paint": ("start mspaint", "Paint"),
+    "ms paint": ("start mspaint", "Paint"),
+    "mspaint": ("start mspaint", "Paint"),
+    "wordpad": ("start wordpad", "WordPad"),
+    "settings": ("start ms-settings:", "Settings"),
+    "task manager": ("start taskmgr", "Task Manager"),
+    # WS1 registry expansion — third-party + common Windows apps
+    "spotify": ("start spotify:", "Spotify"),
+    "edge": ("start msedge", "Edge"),
+    "microsoft edge": ("start msedge", "Edge"),
+    "chrome": ("start chrome", "Google Chrome"),
+    "google chrome": ("start chrome", "Google Chrome"),
+    "firefox": ("start firefox", "Mozilla Firefox"),
+    "explorer": ("start explorer", "File Explorer"),
+    "file explorer": ("start explorer", "File Explorer"),
+    "cmd": ("start cmd", "Command Prompt"),
+    "command prompt": ("start cmd", "Command Prompt"),
+    "powershell": ("start powershell", "Windows PowerShell"),
+    "terminal": ("start wt", "Windows Terminal"),
+    "photos": ("start ms-photos:", "Photos"),
+    "snipping tool": ("start snippingtool", "Snipping Tool"),
+    "clock": ("start ms-clock:", "Clock"),
+    "mail": ("start outlookmail:", "Mail"),
+    "store": ("start ms-windows-store:", "Store"),
+    "discord": ("start discord:", "Discord"),
+    "vscode": ("start code", "Visual Studio Code"),
+    "visual studio code": ("start code", "Visual Studio Code"),
+    "cursor": ("start cursor", "Cursor"),
+    "teams": ("start msteams:", "Microsoft Teams"),
+    "onenote": ("start onenote:", "OneNote"),
+}
+
+_LAUNCH_VERB_RE = re.compile(
+    r"^(?:(?:hey\s+|ok\s+|okay\s+)?orynn[,\s]+|please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+)*"
+    r"(open(?:\s+up)?|launch|start|run|bring\s+up|pull\s+up|fire\s+up|go\s+to|switch\s+to|show\s+me)\s+(.+)$"
+)
+# A pure launch chains no other action; any of these means "do more than open" —
+# hand it to the planner instead (e.g. "open notepad AND type hello").
+_LAUNCH_EXTRA_RE = re.compile(r"(\b(?:and|then|after|also|to|with|so|while|in|on)\b|[;,])")
+_LAUNCH_FILLER_RE = re.compile(
+    r"\b(?:the|my|a|an|app|application|program|tool|window|please|up|for\s+me)\b"
+)
+
+
+def detect_app_launch_intent(goal: str) -> Optional[tuple]:
+    """If `goal` is a PURE 'open/launch/switch to <known app>' command, return its
+    (launch_command, window_title); otherwise None. Anything with extra steps,
+    unknown apps, or surrounding wrapper text falls through (None) so the normal
+    planner handles it. Matching is exact against the curated registry — narrow by
+    design."""
+    text = re.sub(r"\s+", " ", str(goal or "")).strip().lower().rstrip(" .!?")
+    if not text:
+        return None
+    m = _LAUNCH_VERB_RE.match(text)
+    if not m:
+        return None
+    rest = m.group(2).strip()
+    if _LAUNCH_EXTRA_RE.search(rest):
+        return None
+    rest = _LAUNCH_FILLER_RE.sub(" ", rest)
+    rest = re.sub(r"\s+", " ", rest).strip()
+    hit = _KNOWN_LAUNCH_APPS.get(rest)
+    if hit:
+        return hit
+    try:
+        from .launch import resolve_launch_target
+
+        entry = resolve_launch_target(rest)
+        if entry and entry.kind in ("curated", "settings", "protocol"):
+            return entry.launch_command, entry.window_title
+    except Exception:
+        pass
+    return None
+
+
 class ToolExecutor:
     def __init__(self, workspace: Path, text_editor=None, plugin_registry=None, *, home_dir: Optional[Path] = None, memory: Optional["MemoryStore"] = None):
         self.workspace = workspace.resolve()
@@ -768,7 +855,24 @@ class ToolExecutor:
             if match:
                 target = (match.group("target") or "").strip().strip('"').strip("'")
                 break
-        if not target or re.match(r"^[a-z]+://", target, flags=re.IGNORECASE):
+        if not target:
+            return ""
+        # Windows URI launchers (ms-settings:, etc.) open an app whose window title is
+        # NOT the scheme — so waiting for a "ms-settings" window always failed even
+        # though Settings opened. Map known schemes to their real window title; for an
+        # unknown scheme/URL we can't guess a title, so don't block on a wait (#6).
+        scheme = re.match(r"^([a-z][a-z0-9.+-]*):(?!\\|/[^/])", target, flags=re.IGNORECASE)
+        uri_titles = {
+            "ms-settings": "Settings",
+            "ms-clock": "Clock",
+            "ms-calculator": "Calculator",
+            "calculator": "Calculator",
+            "ms-photos": "Photos",
+            "ms-availablenetworks": "Network",
+        }
+        if scheme:
+            return uri_titles.get(scheme.group(1).lower(), "")
+        if re.match(r"^[a-z]+://", target, flags=re.IGNORECASE):
             return ""
         base = Path(target.rstrip(":")).stem or target.rstrip(":")
         alias = {
@@ -853,10 +957,15 @@ class ToolExecutor:
         )
 
     def mouse_move(self, x: int, y: int, sw=1280, sh=800):
+        if self.has_isolated_target():
+            return self._mouse_move_isolated(x, y, sw, sh)
         import pyautogui
         rx, ry = self._scale(x, y, sw, sh)
-        # Smooth, human-like movement
-        pyautogui.moveTo(rx, ry, duration=0.6, tween=pyautogui.easeInOutQuad)
+        screen_w, screen_h = pyautogui.size()
+        rx = max(0, min(rx, screen_w - 1))
+        ry = max(0, min(ry, screen_h - 1))
+        # Instant movement
+        pyautogui.moveTo(rx, ry)
         return ToolResult(
             ok=True,
             output=f"Moved mouse to {rx}, {ry}",
@@ -893,9 +1002,10 @@ class ToolExecutor:
         # The marker window is destroyed before the click — no interference.
         _flash_pointer(rx, ry)
         try:
-            pyautogui.moveTo(rx, ry, duration=0.4, tween=pyautogui.easeInOutQuad)
-            time.sleep(0.1)
-            pyautogui.click(button=button, clicks=clicks, interval=0.1)
+            # Instant movement
+            pyautogui.moveTo(rx, ry)
+            time.sleep(0.01)
+            pyautogui.click(button=button, clicks=clicks, interval=0.05)
             self._note_synthetic_input()
         except Exception as e:
             # Screen locked, fail-safe triggered, no display, etc. — report it
@@ -1393,6 +1503,62 @@ class ToolExecutor:
             time.sleep(0.1)
         return ToolResult(ok=False, output=f"Timed out waiting for a visible window matching '{needle}'.")
 
+    def open_known_app(self, launch_command: str, window_title: str, timeout: float = 12.0) -> ToolResult:
+        """Deterministically open (or focus) a known app — no LLM. If a window
+        matching `window_title` is already visible, focus it instead of launching a
+        duplicate; otherwise launch detached and wait for the window to actually
+        appear. The success of this call IS the verification (a real window, not a
+        model claiming 'done'), which is what makes the 'open <app>' command a
+        true 10/10. Used by the run_task fast-path for spoken launch commands."""
+        if win32gui is None:
+            return ToolResult(ok=False, output="Opening apps is only available on Windows.")
+        title = (window_title or "").strip()
+        # 1. Already open? Focus it — covers single-instance apps and "switch to X".
+        try:
+            if title and self._iter_matching_windows(title):
+                focused = self.focus_window(title)
+                if focused.ok:
+                    return focused
+        except Exception:
+            pass
+        # 2. Launch detached (so it outlives this process), then verify by title.
+        command = self._normalize_gui_launch_command(launch_command)
+        try:
+            creationflags = (
+                getattr(subprocess, "DETACHED_PROCESS", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            )
+            popen_kwargs: Dict[str, Any] = {
+                "shell": True,
+                "cwd": self.workspace,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if creationflags:
+                popen_kwargs["creationflags"] = creationflags
+            subprocess.Popen(command, **popen_kwargs)
+        except Exception as exc:
+            return ToolResult(ok=False, output=f"Couldn't launch {title or command}: {exc}")
+        if not title:
+            return ToolResult(ok=True, output=f"Launched: {command}")
+        verify = self.wait_for_window(title, timeout=timeout)
+        if verify.ok:
+            return verify
+        return ToolResult(
+            ok=False,
+            output=f"Ran '{command}' but no '{title}' window appeared in time.",
+        )
+
+    def open_settings(self, page: str = "display") -> ToolResult:
+        """Open a Windows Settings pane via ms-settings: URI (WS1)."""
+        try:
+            from .launch import open_settings_uri
+
+            cmd, title = open_settings_uri(page)
+        except Exception as exc:
+            return ToolResult(ok=False, output=f"Unknown settings page: {exc}")
+        return self.open_known_app(cmd, title, timeout=12.0)
+
     def _auto_wait_after_launch(self, command: str):
         title_hint = self._guess_launch_target_title(command)
         if not title_hint:
@@ -1457,6 +1623,33 @@ class ToolExecutor:
             return ToolResult(ok=True, output=f"{launch_output}\n{wait_result.output}", data=wait_result.data)
         return ToolResult(ok=False, output=f"{launch_output}\n{wait_result.output}")
 
+    @staticmethod
+    def _windows_translate_command(command: str) -> str:
+        """Map a few bare POSIX commands the model reaches for to their Windows
+        equivalents, so 'list the files' (which Live often emits as `ls`) doesn't fail
+        on cmd.exe. Only rewrites a SIMPLE single command — anything with a pipe,
+        redirect, or chaining is left untouched so we never mangle a real command."""
+        if os.name != "nt":
+            return command
+        s = command.strip()
+        if not s or any(ch in s for ch in ("|", "&", ";", ">", "<", "`")) or "$(" in s:
+            return command
+        parts = s.split()
+        head = parts[0].lower()
+        rest = parts[1:]
+        if head == "ls":
+            paths = [p for p in rest if not p.startswith("-")]
+            return ("dir " + " ".join(paths)).strip()
+        if head == "cat" and rest:
+            return "type " + " ".join(rest)
+        if head == "pwd":
+            return "cd"
+        if head == "clear":
+            return "cls"
+        if head == "which" and rest:
+            return "where " + " ".join(rest)
+        return command
+
     def run_command(self, command: str):
         try:
             import re
@@ -1467,12 +1660,18 @@ class ToolExecutor:
                 return ToolResult(ok=True, output=f"Created directory: {target}")
             if self._looks_like_gui_launch(command):
                 return self._launch_gui_command(command, self.workspace)
-            res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120, cwd=self.workspace)
+            command = self._windows_translate_command(command)
+            res = subprocess.run(command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=self.workspace)
+            # A non-zero exit with no stderr (e.g. `dir` of a missing path on cmd) used
+            # to surface as a bare "STDERR:\n" — give the model a concrete reason (#7).
+            if res.returncode != 0 and not (res.stdout or "").strip() and not (res.stderr or "").strip():
+                return ToolResult(ok=False, output=f"Command exited with code {res.returncode} and produced no output.")
             return ToolResult(ok=res.returncode == 0, output=f"STDOUT:\n{res.stdout}\nSTDERR:\n{res.stderr}")
         except subprocess.TimeoutExpired:
             return ToolResult(ok=False, output="Command timed out after 120 seconds.")
         except Exception as e:
-            return ToolResult(ok=False, output=str(e))
+            # Never hand back an empty error — some exceptions stringify to "" (#7).
+            return ToolResult(ok=False, output=str(e).strip() or f"Command failed: {type(e).__name__}")
 
     async def run_command_streaming(
         self,
@@ -1536,6 +1735,8 @@ class ToolExecutor:
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=60,
                 cwd=self._bash_cwd,
             )
@@ -1771,17 +1972,33 @@ class ToolExecutor:
 
     def file_glob(self, pattern: str):
         import glob
-        raw = Path(pattern)
-        if raw.is_absolute() or ".." in raw.parts:
-            raise ToolError("Glob pattern must be relative and stay inside the workspace.")
-        matches = glob.glob(str(self.workspace / pattern), recursive=True)
+        raw = Path((pattern or "")).expanduser()
+        ws = self.workspace.resolve()
+        if raw.is_absolute():
+            # Absolute patterns are allowed as long as they stay inside the workspace.
+            # read_file/write_file already accept such paths, but file_glob used to
+            # reject EVERY absolute path — so the agent could write a file (e.g. on the
+            # Desktop, which is inside the workspace) yet fail to glob the folder it
+            # just wrote to. Validate the non-wildcard base resolves inside the workspace.
+            base = raw
+            while base != base.parent and any(c in base.name for c in "*?["):
+                base = base.parent
+            base = base.resolve()
+            if not (base == ws or ws in base.parents):
+                raise ToolError("Glob pattern must stay inside the workspace.")
+            search = str(raw)
+        else:
+            if ".." in raw.parts:
+                raise ToolError("Glob pattern must be relative and stay inside the workspace.")
+            search = str(self.workspace / pattern)
+        matches = glob.glob(search, recursive=True)
         rel_matches = []
         for match in matches:
             path = Path(match).resolve()
-            try:
-                rel_matches.append(str(path.relative_to(self.workspace)))
-            except ValueError:
-                raise ToolError("Glob pattern escaped workspace.")
+            # Defense in depth: never surface a match that resolved outside the workspace.
+            if not (path == ws or ws in path.parents):
+                continue
+            rel_matches.append(str(path.relative_to(ws)))
         return ToolResult(ok=True, output="\n".join(rel_matches) if rel_matches else "No matches found.")
 
     GREP_SKIP_DIRS = {
@@ -1834,6 +2051,7 @@ class ToolExecutor:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                encoding="utf-8",
                 cwd=str(self.workspace),
                 errors="replace",
             )
@@ -2246,53 +2464,88 @@ class ToolExecutor:
         except Exception as e:
             return ToolResult(ok=False, output=str(e))
 
+    @staticmethod
+    def _ddg_resolve_href(href: str) -> str:
+        """Turn a DuckDuckGo redirect href (…/l/?uddg=<real>) into the real URL."""
+        import urllib.parse
+        full = urllib.parse.urljoin("https://duckduckgo.com/", href.strip())
+        parsed = urllib.parse.urlsplit(full)
+        if parsed.netloc.lower().endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+            uddg = urllib.parse.parse_qs(parsed.query).get("uddg", [""])[0]
+            if uddg:
+                return urllib.parse.unquote(uddg)
+        return full
+
+    @staticmethod
+    def _parse_ddg_lite(page: str, max_results: int):
+        """Parse the stable lite.duckduckgo.com layout: result-link anchors paired with
+        the following result-snippet cells (the html.duckduckgo.com markup changed and
+        now returns no result__a/result__snippet, breaking the old parser)."""
+        import html, re
+        links = re.findall(
+            r"<a[^>]+href=[\"'](?P<href>[^\"']+)[\"'][^>]*class=[\"']result-link[\"'][^>]*>(?P<title>.*?)</a>",
+            page, flags=re.IGNORECASE | re.DOTALL)
+        snippets = re.findall(
+            r"<td[^>]*class=[\"']result-snippet[\"'][^>]*>(?P<snip>.*?)</td>",
+            page, flags=re.IGNORECASE | re.DOTALL)
+        strip = lambda s: html.unescape(re.sub(r"<.*?>", "", s)).strip()
+        out = []
+        for i, (href, title) in enumerate(links[:max_results]):
+            snip = strip(snippets[i]) if i < len(snippets) else ""
+            out.append((strip(title), href.strip(), snip))
+        return out
+
+    @staticmethod
+    def _parse_ddg_html(page: str, max_results: int):
+        """Legacy html.duckduckgo.com parser (result__a/result__snippet) — kept as a
+        fallback in case the lite endpoint is unavailable."""
+        import html, re
+        pattern = re.compile(
+            r'<a[^>]*class="result__a"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
+            r'<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
+            flags=re.IGNORECASE | re.DOTALL)
+        strip = lambda s: html.unescape(re.sub(r"<.*?>", "", s)).strip()
+        out = []
+        for m in pattern.finditer(page):
+            out.append((strip(m.group("title")), m.group("href").strip(), strip(m.group("snippet"))))
+            if len(out) >= max_results:
+                break
+        return out
+
     def web_search(self, query: str, max_results: int = 5):
-        try:
-            import html
-            import re
-            import urllib.parse
-            import urllib.request
-
-            encoded = urllib.parse.quote_plus(query)
-            url = f"https://html.duckduckgo.com/html/?q={encoded}"
-            raw, _final_url = _read_public_http_url(url, max_bytes=1_000_000)
-            page = raw.decode("utf-8", errors="replace")
-
-            results = []
-            ddg_base = "https://duckduckgo.com/"
-            pattern = re.compile(
-                r'<a[^>]*class="result__a"[^>]*href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
-                r'<a[^>]*class="result__snippet"[^>]*>(?P<snippet>.*?)</a>',
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            for match in pattern.finditer(page):
-                href = html.unescape(re.sub(r"<.*?>", "", match.group("href"))).strip()
-                title = html.unescape(re.sub(r"<.*?>", "", match.group("title"))).strip()
-                snippet = html.unescape(re.sub(r"<.*?>", "", match.group("snippet"))).strip()
-                full_href = urllib.parse.urljoin(ddg_base, href)
-                parsed_href = urllib.parse.urlsplit(full_href)
-                if parsed_href.netloc.lower().endswith("duckduckgo.com") and parsed_href.path.startswith("/l/"):
-                    redirect_params = urllib.parse.parse_qs(parsed_href.query)
-                    uddg = redirect_params.get("uddg", [""])[0]
-                    if uddg:
-                        full_href = urllib.parse.unquote(uddg)
-                try:
-                    href = _validate_public_http_url(full_href)
-                except ToolError:
-                    continue
-                if href and title:
-                    results.append(f"{title}\n{href}\n{snippet}")
-                if len(results) >= max_results:
-                    break
-
-            if not results:
-                return ToolResult(ok=False, output=f"No search results found for: {query}")
-            return ToolResult(
-                ok=True,
-                output=wrap_untrusted_web_content("\n\n".join(results), source=url, kind="web_search"),
-            )
-        except Exception as e:
-            return ToolResult(ok=False, output=str(e))
+        import urllib.parse
+        encoded = urllib.parse.quote_plus(query)
+        # lite is the stable endpoint; html.duckduckgo.com now returns no parseable
+        # results. Try lite first, fall back to html, so a markup change on one can't
+        # silently break search.
+        endpoints = [
+            (f"https://lite.duckduckgo.com/lite/?q={encoded}", self._parse_ddg_lite),
+            (f"https://html.duckduckgo.com/html/?q={encoded}", self._parse_ddg_html),
+        ]
+        last_err = ""
+        for url, parser in endpoints:
+            try:
+                raw, _final = _read_public_http_url(url, max_bytes=1_000_000)
+                page = raw.decode("utf-8", errors="replace")
+                results = []
+                for title, href, snippet in parser(page, max_results):
+                    try:
+                        real = _validate_public_http_url(self._ddg_resolve_href(href))
+                    except ToolError:
+                        continue
+                    if real and title:
+                        results.append(f"{title}\n{real}\n{snippet}".rstrip())
+                if results:
+                    return ToolResult(
+                        ok=True,
+                        output=wrap_untrusted_web_content("\n\n".join(results), source=url, kind="web_search"),
+                    )
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e).strip()
+                continue
+        if last_err:
+            return ToolResult(ok=False, output=f"Web search failed: {last_err}")
+        return ToolResult(ok=False, output=f"No search results found for: {query}")
 
     # ── Real API connectors: free, no-auth, single-call (reliable on free models) ──
     # Each is one HTTP GET to a hardcoded public host (user input is URL-encoded
@@ -2468,7 +2721,7 @@ class ToolExecutor:
 
         def _run(cmd, label):
             try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=15, cwd=str(self.workspace))
+                r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15, cwd=str(self.workspace))
                 out = (r.stdout + r.stderr).strip()
                 if r.returncode == 0:
                     results.append(f"[{label}] ✓ clean")
@@ -2525,6 +2778,7 @@ class ToolExecutor:
         try:
             r = subprocess.run(
                 argv, capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
                 timeout=30, cwd=str(self.workspace)
             )
             out = (r.stdout + r.stderr).strip()
@@ -2549,7 +2803,7 @@ class ToolExecutor:
         elif command.strip().lower().startswith("pytest"):
             command = f"python -m {command.strip()}"
         try:
-            r = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=120, cwd=cwd)
+            r = subprocess.run(command, shell=True, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, cwd=cwd)
             out = (r.stdout + r.stderr).strip()
             # Parse pytest summary line
             summary_match = re.search(r"((\d+ passed).*?((\d+ failed).*?)?(\d+ error)?.*?in [\d.]+s)", out)
@@ -2857,6 +3111,7 @@ class ToolExecutor:
                 build_affordance_graph,
                 classify_surface_runtime,
                 format_affordance_graph,
+                format_playbook_hint,
                 format_recovery_plan,
                 format_runtime_plan,
                 meaningful_runtime_control_count,
@@ -3013,6 +3268,9 @@ class ToolExecutor:
             data["recovered_by"] = recovered_by
         output = format_affordance_graph(graph)
         output += "\n" + format_runtime_plan(runtime_plan)
+        pb = format_playbook_hint(observed_app)
+        if pb:
+            output += "\n" + pb
         if recovered_by:
             output += f"\nRecovered empty UIA map via {recovered_by}."
         if graph["named_control_count"] == 0:
@@ -3067,6 +3325,75 @@ class ToolExecutor:
             )
             return ToolResult(ok=True, data=data, output=(
                 f"Clicked '{matched}' via OCR fallback at ({x},{y}). "
+                f"[uia:{x-14},{y-12},28,24]{self._app_rect_token(app, app_rect)}"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _wait_foreground(app: str, timeout: float = 1.2) -> None:
+        """Block until the foreground window's title contains `app`, then a beat to let
+        it repaint — so a full-screen capture (grid-locate) sees the right app. Bounded;
+        falls back to a fixed sleep when win32 isn't available."""
+        try:
+            import win32gui
+        except Exception:
+            time.sleep(0.45)
+            return
+        key = (app or "").lower().strip()
+        deadline = time.time() + max(0.1, timeout)
+        while time.time() < deadline:
+            try:
+                title = win32gui.GetWindowText(win32gui.GetForegroundWindow()).lower()
+            except Exception:
+                title = ""
+            if not key or key in title:
+                break
+            time.sleep(0.08)
+        time.sleep(0.18)  # repaint settle after it comes forward
+
+    def _grid_locate_click(self, query: str, app: str):
+        """Vision grid-locate fallback (Clicky's two-stage Set-of-Mark). When UIA and
+        OCR both miss, ask a vision model which screen cell holds the target, then
+        pixel-click it. Returns a ToolResult tagged 'grid-locate', or None when it
+        can't locate (no key, model unsure, or 'not visible') so the caller reports
+        the original UIA miss instead of clicking the wrong thing."""
+        try:
+            from . import grid_locate
+            import pyautogui
+            if app:
+                try:
+                    self.focus_window(app)
+                    # grid-locate captures the WHOLE screen, so the target app must be
+                    # foreground AND repainted before we snapshot. A fixed tiny sleep
+                    # races the window coming forward (proven on Chrome — 0.08s whiffs),
+                    # so wait until it's actually foreground, then let it repaint.
+                    self._wait_foreground(app, timeout=1.2)
+                except Exception:
+                    pass
+            hit = grid_locate.locate(query)
+            if not hit:
+                return None
+            x, y = int(hit[0]), int(hit[1])
+            self._input_politeness_gate()
+            pyautogui.click(x, y)
+            self._note_synthetic_input()
+            app_rect = self._app_rect_payload(app)
+            data = {"ok": True, "method": "grid_locate", "matched": query, "x": x, "y": y}
+            data["overlay"] = _overlay_payload(
+                "app_focus" if app_rect else "status", "uia_click", "click",
+                f"Clicking “{query}” (vision)", target=query, app_rect=app_rect,
+                rect={"left": x - 14, "top": y - 12, "width": 28, "height": 24},
+                control_layer="vision grid-locate",
+                control_reason="no accessible control and no OCR text — located visually",
+            )
+            self._remember_adaptive_success(
+                app,
+                failure_class="uia_no_match",
+                resolver_id="vision_grid_locate",
+                detail=f"Clicked {query} (vision)",
+            )
+            return ToolResult(ok=True, data=data, output=(
+                f"Clicked '{query}' via vision grid-locate at ({x},{y}). "
                 f"[uia:{x-14},{y-12},28,24]{self._app_rect_token(app, app_rect)}"))
         except Exception:
             return None
@@ -3623,16 +3950,25 @@ class ToolExecutor:
                 pass
         return ToolResult(ok=ok, output=out, data=data)
 
-    def uia_click(self, query: str, app: str = ""):
+    def uia_click(self, query: str, app: str = "", allow_pixel_fallback: bool = True):
         from .widget.desktop_features import invoke_ui_element
         self._clear_uia_find_cache()
         before = self._click_snapshot()
-        res = invoke_ui_element(query, app)
+        res = invoke_ui_element(query, app, allow_pixel_fallback=allow_pixel_fallback)
         if not res.get("ok"):
-            # Auto-fallback: try OCR pixel-click before giving up to the model.
-            ocr_result = self._ocr_click_fallback(query, app)
-            if ocr_result is not None:
-                return ocr_result
+            # Auto-fallback: try OCR pixel-click before giving up to the model — unless
+            # the caller forbade pixel fallback (Live's fast path wants UIA-only so it
+            # can escalate cleanly instead of hijacking the mouse).
+            if allow_pixel_fallback:
+                ocr_result = self._ocr_click_fallback(query, app)
+                if ocr_result is not None:
+                    return ocr_result
+                # Last resort before giving up: vision grid-locate (Set-of-Mark). For
+                # Electron/canvas controls with no UIA tree AND no OCR text — exactly
+                # where the old path went blind. Fails safe to None (no wrong click).
+                grid_result = self._grid_locate_click(query, app)
+                if grid_result is not None:
+                    return grid_result
             app_rect = self._app_rect_payload(app)
             data = dict(res)
             data["overlay"] = _overlay_payload(
@@ -3671,21 +4007,57 @@ class ToolExecutor:
         )
         # Post-action verification: did the click visibly change UI state?
         verified = self._verify_clicked(before)
+        if verified is not True and allow_pixel_fallback:
+            # Active self-healing click retries:
+            # Bring window to foreground, scroll control into view, and retry via pyautogui
+            # (a real mouse click — skipped when the caller forbade pixel fallback).
+            try:
+                from .widget.desktop_features import _find_uia_control, _uia_pattern
+                import pyautogui
+                if app:
+                    self.focus_window(app)
+                    time.sleep(0.08)
+                ctrl, info_ctrl = _find_uia_control(query, app)
+                if ctrl is not None:
+                    try:
+                        sip = _uia_pattern(ctrl, "ScrollItemPattern")
+                        if sip is not None:
+                            sip.ScrollIntoView()
+                            time.sleep(0.05)
+                    except Exception:
+                        pass
+                    rect = ctrl.BoundingRectangle
+                    has_rect = rect.right > rect.left and rect.bottom > rect.top
+                    if has_rect:
+                        x = (rect.left + rect.right) // 2
+                        y = (rect.top + rect.bottom) // 2
+                        pyautogui.click(x, y)
+                        from .widget.desktop_features import note_synthetic_input
+                        note_synthetic_input()
+                        # Re-verify the click outcome
+                        verified = self._verify_clicked(before)
+            except Exception:
+                pass
+
         data["verified"] = verified
         if isinstance(data.get("overlay"), dict):
             data["overlay"]["verified"] = verified
         verdict = " (verified)" if verified is True else ""
         return ToolResult(ok=True, output=f"Activated '{res.get('target')}' via {res.get('method')}{verdict}.{tok}", data=data)
 
-    def uia_type(self, query: str, text: str, app: str = "", clear_first: bool = False, submit: bool = False):
+    def uia_type(self, query: str, text: str, app: str = "", clear_first: bool = False, submit: bool = False, allow_pixel_fallback: bool = True):
         from .widget.desktop_features import type_into_ui_element
         self._clear_uia_find_cache()
         res = type_into_ui_element(query, text, app, clear_first, submit)
         if not res.get("ok"):
-            # Auto-fallback: OCR-find the field, click to focus, then paste.
-            ocr_result = self._ocr_type_fallback(query, text, app, clear_first, submit)
-            if ocr_result is not None:
-                return ocr_result
+            # Auto-fallback: OCR-find the field, click to focus (a real mouse click),
+            # then paste — skipped when the caller forbade pixel fallback (Live's fast
+            # path wants UIA-only so it can escalate cleanly instead of hijacking the
+            # mouse), mirroring uia_click (#8).
+            if allow_pixel_fallback:
+                ocr_result = self._ocr_type_fallback(query, text, app, clear_first, submit)
+                if ocr_result is not None:
+                    return ocr_result
             app_rect = self._app_rect_payload(app)
             data = dict(res)
             data["overlay"] = _overlay_payload(
@@ -3971,8 +4343,13 @@ class ToolExecutor:
     }
 
     def _validate_action_args(self, action: "Action") -> "Optional[ToolResult]":
+        args = action.args if isinstance(action.args, dict) else {}
         required = self._REQUIRED_ARGS.get(action.type.value, [])
-        missing = [k for k in required if k not in action.args]
+        # Treat a present-but-null required arg the same as missing (the model passed
+        # the key with no value). Empty strings are allowed — write_file content="" is
+        # a legitimately empty file; the acting tools (uia_click/uia_type) guard blank
+        # values themselves with a clearer message.
+        missing = [k for k in required if args.get(k) is None]
         if missing:
             example = ", ".join(f'"{k}": ...' for k in required)
             return ToolResult(

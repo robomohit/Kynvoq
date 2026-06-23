@@ -49,7 +49,7 @@ def _load_or_create_api_key() -> str:
 API_KEY = _load_or_create_api_key()
 print(f"[Orynn] Agent API key configured: {bool(API_KEY)}", flush=True)
 SESSION_COOKIE_NAME = "orynn_session"
-SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS", "43200"))
+SESSION_TTL_SECONDS = int(os.environ.get("SESSION_TTL_SECONDS") or "43200")
 _sessions: Dict[str, datetime] = {}
 
 from contextlib import asynccontextmanager
@@ -81,7 +81,19 @@ async def _lifespan(application):
             await asyncio.sleep(300)
             _prune_sessions()
 
-    global _telegram_task, _discord_task, _automation_task, _session_prune_task
+    async def _queue_watchdog_loop():
+        """Keep the task queue self-healing: periodically reap stuck/zombie/runaway
+        tasks and re-drain queued work, so a hung task can never permanently wedge
+        the queue (which would make every future task hang forever as 'queued')."""
+        while True:
+            await asyncio.sleep(_WATCHDOG_INTERVAL)
+            try:
+                _reap_stuck_tasks()
+                _start_next_queued_task()
+            except Exception as exc:
+                _lifespan_log.warning("queue watchdog tick failed: %s", exc)
+
+    global _telegram_task, _discord_task, _automation_task, _session_prune_task, _queue_watchdog_task
     await _init_mcp()
     def _external_submit(*, goal: str, task_id: Optional[str] = None, source: str = "external") -> TaskRecord:
         return _submit_managed_task(goal=goal, task_id=task_id, source=source)
@@ -89,6 +101,7 @@ async def _lifespan(application):
     _telegram_task = asyncio.create_task(start_telegram(service, submit_task=_external_submit))
     _discord_task = asyncio.create_task(start_discord(service, submit_task=_external_submit))
     _session_prune_task = asyncio.create_task(_prune_sessions_loop())
+    _queue_watchdog_task = asyncio.create_task(_queue_watchdog_loop())
 
     from .automation import get_registry as _get_auto_registry, poll_and_fire as _poll_and_fire
 
@@ -105,7 +118,7 @@ async def _lifespan(application):
 
     yield
     # Shutdown: cancel integrations and automation poller, then clean up background browsers
-    for _t in (_telegram_task, _discord_task, _automation_task, _session_prune_task):
+    for _t in (_telegram_task, _discord_task, _automation_task, _session_prune_task, _queue_watchdog_task):
         if _t and not _t.done():
             _t.cancel()
             try:
@@ -261,6 +274,7 @@ _telegram_task: Optional[asyncio.Task] = None
 _discord_task: Optional[asyncio.Task] = None
 _automation_task: Optional[asyncio.Task] = None
 _session_prune_task: Optional[asyncio.Task] = None
+_queue_watchdog_task: Optional[asyncio.Task] = None
 
 def _prune_sessions(now: Optional[datetime] = None) -> None:
     now = now or datetime.now(timezone.utc)
@@ -507,6 +521,7 @@ def _load_persisted_tasks() -> Dict[str, TaskRecord]:
             inferred.status = "failed"
             inferred.reason = inferred.reason or "Server restarted while task was active."
             inferred.finished_at = inferred.finished_at or datetime.now(timezone.utc).isoformat()
+            _save_task_record(inferred)
         tasks[task_id] = inferred
 
     result = {task_id: record for task_id, record in tasks.items() if record is not None}
@@ -545,13 +560,89 @@ def _task_is_server_running(task_id: str) -> bool:
     return bool(task and not task.done())
 
 
+def _task_complete_from_log(task_id: str, status: str) -> bool:
+    """Read the last done event so Live/poll can distinguish complete:true vs false."""
+    if status in {"failed", "error", "cancelled"}:
+        return False
+    try:
+        events = log_emitter.read_log(task_id)
+    except Exception:
+        events = []
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("type") == "done":
+            return event.get("complete") is not False
+    return status in {"done", "complete"}
+
+
+_TASK_START_GRACE = float(os.environ.get("ORYNN_TASK_START_GRACE") or "4.0")
+
+
+def _record_age_seconds(record: TaskRecord) -> Optional[float]:
+    try:
+        created = datetime.fromisoformat(str(record.created_at).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - created).total_seconds()
+    except Exception:
+        return None
+
+
+def _task_done_exception(task_id: str) -> Optional[str]:
+    """The REAL reason a task's coroutine ended, if it died with an exception -- so we
+    surface the actual crash instead of the opaque 'abandoned'. None if it's still
+    running, finished cleanly, or has no record."""
+    task = service._active_tasks.get(task_id)
+    if task is None or not task.done():
+        return None
+    try:
+        exc = task.exception()
+    except asyncio.CancelledError:
+        return "the task was cancelled before it finished"
+    except Exception:
+        return None
+    if exc is not None:
+        return f"{type(exc).__name__}: {str(exc)[:160]}"
+    return None
+
+
 def _serialize_task_record(record: TaskRecord) -> dict:
     payload = record.model_dump()
     terminal = _is_terminal_status(record.status)
     payload["paused"] = False if terminal else bool(record.paused or record.id in service._paused_tasks)
     payload["server_running"] = _task_is_server_running(record.id)
-    if not terminal and (payload["server_running"] or payload["paused"]):
-        payload["status"] = "paused" if payload["paused"] else "running"
+    if terminal:
+        payload["complete"] = _task_complete_from_log(record.id, record.status)
+    
+    is_queued = any(spec["task_id"] == record.id for spec in _queued_task_specs)
+    if not terminal:
+        if payload["server_running"] or payload["paused"] or is_queued:
+            payload["status"] = "paused" if payload["paused"] else ("queued" if is_queued else "running")
+        else:
+            # Startup grace: a just-created task whose coroutine hasn't produced its
+            # first signal yet must NOT be slapped with "abandoned" — that flashed a
+            # bogus failure into the Live bubble milliseconds after start ("Open
+            # Spotify" -> "Failed: abandoned" in ~270ms). Hold it as running briefly.
+            age = _record_age_seconds(record)
+            if age is not None and age < _TASK_START_GRACE:
+                payload["status"] = "running"
+                payload["server_running"] = True
+                return payload
+            # Surface the REAL crash if the coroutine died with an exception, instead
+            # of the opaque "abandoned" — so the user (and Live) learn why it failed.
+            record.status = "failed"
+            record.reason = (
+                _task_done_exception(record.id)
+                or record.reason
+                or "the task ended before it could run"
+            )
+            record.finished_at = record.finished_at or datetime.now(timezone.utc).isoformat()
+            record.paused = False
+            _save_task_record(record)
+
+            payload = record.model_dump()
+            payload["paused"] = False
+            payload["server_running"] = False
+            payload["status"] = "failed"
     return payload
 
 
@@ -559,6 +650,10 @@ _tasks = _load_persisted_tasks()
 
 _MAX_IN_MEMORY_TASKS = 200  # keep at most this many completed tasks in _tasks dict
 _MAX_ACTIVE_TASKS = int(os.environ.get("ORYNN_MAX_ACTIVE_TASKS") or os.environ.get("AI_COMPUTER_MAX_ACTIVE_TASKS", "5"))
+# Queue watchdog: how often to reap stuck tasks + re-drain the queue, and the hard
+# ceiling past which a single task is force-failed so it can't wedge a slot forever.
+_WATCHDOG_INTERVAL = float(os.environ.get("ORYNN_WATCHDOG_INTERVAL") or "5")
+_TASK_MAX_RUNTIME = float(os.environ.get("ORYNN_TASK_MAX_RUNTIME") or "900")
 _queued_task_specs: List[Dict[str, Any]] = []
 
 
@@ -611,6 +706,12 @@ def _start_task_from_spec(spec: Dict[str, Any]) -> TaskRecord:
         thinking_budget=spec.get("thinking_budget") or "off",
         history=spec.get("history") or [],
     )
+    ug = spec.get("user_goal") or spec["goal"]
+    pg = spec.get("prompt_goal") or spec["goal"]
+    record.user_goal = ug
+    record.prompt_goal = pg
+    record.goal = ug
+    record.context.goal = pg
     _tasks[record.id] = record
     _save_task_record(record)
     log_emitter.emit(record.id, "task_started", {
@@ -623,9 +724,60 @@ def _start_task_from_spec(spec: Dict[str, Any]) -> TaskRecord:
     return record
 
 
+def _count_active_tasks() -> int:
+    """Concurrency slots GENUINELY in use. A task counts only if its coroutine is
+    still running AND its record isn't already terminal — so a task that finalized
+    but whose coroutine hasn't unwound (or got wedged in cleanup) can never hold a
+    slot hostage. This is what stops a few stuck tasks from deadlocking the queue so
+    every future task hangs forever as 'queued'."""
+    n = 0
+    for tid, task in service._active_tasks.items():
+        if task.done():
+            continue
+        rec = _tasks.get(tid)
+        if rec is not None and _is_terminal_status(rec.status):
+            continue
+        n += 1
+    return n
+
+
+def _reap_stuck_tasks() -> None:
+    """Self-healing housekeeping so the task queue can NEVER permanently deadlock:
+    free slots held by finished, zombie (finalized-but-still-alive), or runaway
+    (past the hard runtime ceiling) tasks. Safe to call repeatedly."""
+    now = datetime.now(timezone.utc)
+    for tid, task in list(service._active_tasks.items()):
+        try:
+            if task.done():
+                service._active_tasks.pop(tid, None)
+                continue
+            rec = _tasks.get(tid)
+            # Finalized but the coroutine is still alive -> zombie: cancel + drop.
+            if rec is not None and _is_terminal_status(rec.status):
+                task.cancel()
+                service._active_tasks.pop(tid, None)
+                continue
+            # Running past the hard ceiling -> a genuine hang: force-fail it so it
+            # can never wedge a slot forever.
+            if rec is not None and rec.created_at:
+                try:
+                    age = (now - datetime.fromisoformat(rec.created_at)).total_seconds()
+                except Exception:
+                    age = 0.0
+                if age > _TASK_MAX_RUNTIME:
+                    task.cancel()
+                    rec.status = "failed"
+                    rec.reason = rec.reason or f"Reaped: exceeded max runtime ({_TASK_MAX_RUNTIME:.0f}s)."
+                    rec.finished_at = now.isoformat()
+                    _save_task_record(rec)
+                    service._active_tasks.pop(tid, None)
+        except Exception as exc:
+            _lifespan_log.warning("reap of task %s failed: %s", tid, exc)
+
+
 def _start_next_queued_task() -> None:
-    active_count = lambda: sum(1 for task in service._active_tasks.values() if not task.done())
-    while _queued_task_specs and active_count() < _MAX_ACTIVE_TASKS:
+    _reap_stuck_tasks()  # free any leaked/zombie slots before deciding capacity
+    while _queued_task_specs and _count_active_tasks() < _MAX_ACTIVE_TASKS:
         spec = _queued_task_specs.pop(0)
         rec = _tasks.get(spec["task_id"])
         if rec and rec.status != "queued":
@@ -691,7 +843,7 @@ from pydantic import BaseModel, Field
 
 class TaskIn(BaseModel):
     task_id: str = Field(..., min_length=1, max_length=128, pattern=TASK_ID_PATTERN)
-    goal: str = Field(..., min_length=1, max_length=2000)
+    goal: str = Field(..., min_length=1, max_length=8000)  # voice/computer tasks prepend the ~1.7KB desktop-hardening system prompt to the goal; stays under the 10KB request guard
     model: Optional[str] = None  # None = auto-pick from available keys
     mode: Literal["auto", "coding", "computer", "computer_use", "computer_isolated", "explain"] = "auto"
     screen_width: int = 1280
@@ -702,16 +854,18 @@ class TaskIn(BaseModel):
     plan_first: bool = False
     notify_on_completion: bool = False
     auto_commit: bool = False
-    autonomy_level: Literal["careful", "balanced", "fast"] = "balanced"
+    autonomy_level: Literal["careful", "balanced", "fast", "autonomous"] = "balanced"
     thinking_budget: Literal["off", "standard", "extended"] = "off"
     readiness_override: bool = False
+    user_goal: Optional[str] = None
+    prompt_goal: Optional[str] = None
     # Prior conversation turns ([{role: "user"|"assistant", content}]) so a
     # follow-up message continues the chat instead of starting cold.
     history: List[Dict[str, str]] = Field(default_factory=list)
 
 
 class TaskPreflightIn(BaseModel):
-    goal: str = Field(..., min_length=1, max_length=2000)
+    goal: str = Field(..., min_length=1, max_length=8000)  # voice/computer tasks prepend the ~1.7KB desktop-hardening system prompt to the goal; stays under the 10KB request guard
     model: Optional[str] = None
     mode: Literal["auto", "coding", "computer", "computer_use", "computer_isolated", "explain"] = "auto"
     isolated_app: Optional[str] = None
@@ -1083,14 +1237,18 @@ def _select_model_for_task(goal: str, mode: str = "auto", requested_model: Optio
         }
 
     if os.environ.get("GROQ_API_KEY"):
-        # Groq is free AND sub-second, so it's the preferred free provider when its
-        # key is set — this is the app's #1 UX win (latency). A Groq 429/failure
+        # Groq is free AND sub-second, so it's the preferred free provider for
+        # chat/coding/auto — the app's #1 UX win (latency). A Groq 429/failure
         # transparently falls back to the OpenRouter ":free" chain inside
         # LLMProvider.stream_chat_with_tools, so speed doesn't cost reliability.
-        # A deliberate DESKTOP_MODEL opt-in still wins for an explicit desktop task
-        # (reliability is the whole point of that escape hatch).
-        _dm = os.environ.get("DESKTOP_MODEL", "").strip()
-        if not (_dm and requested_mode in ("computer", "computer_isolated")):
+        # BUT keep Groq OFF desktop work (#10): llama-3.3-70b is fast yet weaker at the
+        # multi-step UIA tool loop, so a desktop mode falls through to the tool-accurate
+        # OpenRouter desktop model instead — as long as OpenRouter is actually available
+        # to fall through to (else Groq is still better than no model). A user-set
+        # DESKTOP_MODEL still wins (handled in the OpenRouter branch below).
+        _desktop_mode = requested_mode in ("computer", "computer_isolated", "computer_use")
+        _skip_groq_for_desktop = _desktop_mode and bool(os.environ.get("OPENROUTER_API_KEY"))
+        if not _skip_groq_for_desktop:
             return {"selected_model": "groq/llama-3.3-70b-versatile", "model_source": "auto:groq", "model_auto": True, "required_key": "GROQ_API_KEY", "missing_key": False}
     if os.environ.get("OPENROUTER_API_KEY"):
         from .providers import effort_model, normalize_effort
@@ -1104,8 +1262,10 @@ def _select_model_for_task(goal: str, mode: str = "auto", requested_model: Optio
             # Only one free coder model — effort doesn't change it.
             selected_model = "openrouter/qwen/qwen3-coder:free"
             source = "auto:openrouter:coding"
-        elif detected_mode in ("computer", "computer_isolated"):
+        elif detected_mode in ("computer", "computer_isolated", "computer_use"):
             # A user-set DESKTOP_MODEL always wins; otherwise effort picks the tier.
+            # (computer_use is a desktop mode too — without it here a user's
+            # DESKTOP_MODEL was silently ignored for that mode.)
             dm = os.environ.get("DESKTOP_MODEL", "").strip()
             selected_model = dm or effort_model(effort, detected_mode)
             source = "auto:desktop:env" if dm else f"auto:desktop:effort:{effort}"
@@ -1273,7 +1433,7 @@ def _submit_managed_task(
     plan_first: bool = False,
     notify_on_completion: bool = False,
     auto_commit: bool = False,
-    autonomy_level: Literal["careful", "balanced", "fast"] = "balanced",
+    autonomy_level: Literal["careful", "balanced", "fast", "autonomous"] = "balanced",
     thinking_budget: Literal["off", "standard", "extended"] = "off",
     readiness_override: bool = False,
 ) -> TaskRecord:
@@ -1336,7 +1496,7 @@ def _submit_managed_task(
         "thinking_budget": thinking_budget,
         "source": source,
     }
-    active_count = sum(1 for task in service._active_tasks.values() if not task.done())
+    active_count = _count_active_tasks()
     if active_count >= _MAX_ACTIVE_TASKS:
         context = AgentContext(
             goal=goal,
@@ -1509,6 +1669,46 @@ async def set_preferences(body: _PreferencesBody):
     else:
         os.environ.pop("DESKTOP_MODEL", None)
     return {"ok": True, "preferences": updated}
+
+
+@app.get("/api/memory/facts", dependencies=[Depends(verify_token)])
+async def get_memory_facts(q: str = "", limit: int = 50):
+    """Orynn's knowledge memory — durable facts it knows about the user's setup and
+    vocabulary. `q` filters by relevance; otherwise the most recent are returned."""
+    from . import knowledge
+    facts = knowledge.relevant(q, limit) if q else knowledge.all_facts()[-limit:][::-1]
+    return {"facts": facts, "prompt_block": knowledge.as_prompt_block(q)}
+
+
+class _FactBody(BaseModel):
+    text: str
+    app: str = ""
+    owner: str = "user"          # "user" (taught) | "assistant" (Orynn learned it)
+    category: str = "fact"       # rule | preference | location | vocab | fact | app
+
+
+@app.post("/api/memory/facts", dependencies=[Depends(verify_token)])
+async def add_memory_fact(body: _FactBody):
+    """Teach Orynn a fact ('cowork is the button top-right in the dashboard') or record
+    one it auto-learned. Organized by owner (user vs assistant) + category. De-duped."""
+    from . import knowledge
+    fact = await asyncio.to_thread(
+        knowledge.add_fact, body.text, owner=body.owner, category=body.category, app=body.app)
+    if fact is None:
+        raise HTTPException(status_code=400, detail="Empty fact text.")
+    return {"ok": True, "fact": fact}
+
+
+class _ForgetBody(BaseModel):
+    query: str
+
+
+@app.post("/api/memory/forget", dependencies=[Depends(verify_token)])
+async def forget_memory_fact(body: _ForgetBody):
+    """Forget facts whose text contains the query (case-insensitive)."""
+    from . import knowledge
+    removed = await asyncio.to_thread(knowledge.forget, body.query)
+    return {"ok": True, "removed": removed}
 
 
 @app.get("/api/skills", dependencies=[Depends(verify_token)])
@@ -2061,7 +2261,7 @@ async def create_task(body: TaskIn):
         raise HTTPException(status_code=409, detail=f"Task '{body.task_id}' already exists and is still active")
     if existing and existing.status in {"done", "failed", "cancelled", "complete"}:
         raise HTTPException(status_code=409, detail=f"Task '{body.task_id}' already exists")
-    active = len(service._active_tasks)
+    active = _count_active_tasks()
 
     model_selection = _select_model_for_task(body.goal, body.mode or "auto", body.model)
     selected_model = model_selection.get("selected_model") or ""
@@ -2115,9 +2315,13 @@ async def create_task(body: TaskIn):
     )
 
     try:
+        user_goal = (body.user_goal or body.goal).strip()
+        prompt_goal = (body.prompt_goal or body.goal).strip()
         spec = {
             "task_id": body.task_id,
-            "goal": body.goal,
+            "goal": prompt_goal,
+            "user_goal": user_goal,
+            "prompt_goal": prompt_goal,
             "screen_width": body.screen_width,
             "screen_height": body.screen_height,
             "model": selected_model,
@@ -2147,7 +2351,9 @@ async def create_task(body: TaskIn):
                 id=body.task_id,
                 status="queued",
                 context=context,
-                goal=body.goal,
+                goal=user_goal,
+                user_goal=user_goal,
+                prompt_goal=prompt_goal,
                 model=selected_model,
                 mode=execution_mode,
                 plan_first=body.plan_first,
@@ -2253,7 +2459,13 @@ async def kill_task(task_id: str):
     # checkpoint) AND cancels the backing asyncio task. cancel_task alone never
     # set the flag, so killed tasks kept running until their next await.
     killed = service.kill_task(task_id)
-    if not killed:
+    # Also drop it from the pending queue. A queued task has no backing asyncio task,
+    # so service.kill_task() returns False for it — without this, "stop" would leave
+    # queued work that the queue watchdog springs back to life moments later (#9).
+    was_queued = any(s.get("task_id") == task_id for s in _queued_task_specs)
+    if was_queued:
+        _queued_task_specs[:] = [s for s in _queued_task_specs if s.get("task_id") != task_id]
+    if not killed and not was_queued:
         raise HTTPException(status_code=404, detail="Task not found or already complete")
     if task_id in _tasks:
         _tasks[task_id].status = "cancelled"

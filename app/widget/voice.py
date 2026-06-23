@@ -10,8 +10,15 @@ and offline-capable, in keeping with the free-models-only product.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
+
+# Speech-to-text backend. Groq Whisper (cloud, very fast + accurate) is used when
+# GROQ_API_KEY is set and a mic is available; otherwise we fall back to the
+# built-in Windows recognizers below so the capsule still works offline.
+GROQ_STT_MODEL = os.environ.get("GROQ_STT_MODEL") or "whisper-large-v3-turbo"
+_STT_SAMPLE_RATE = 16000  # Whisper-friendly mono sample rate
 
 # A single dedicated TTS thread + queue so speech serialises and a new line can
 # interrupt the previous one (SVSFPurgeBeforeSpeak) on the SAME voice instance.
@@ -19,6 +26,7 @@ _tts_lock = threading.Lock()
 _tts_queue: list[tuple[str, int, bool]] = []
 _tts_thread: threading.Thread | None = None
 _tts_stop = False
+_groq_tts_ok: bool | None = None  # None=untried, False=unavailable (don't retry)
 
 
 def tts_available() -> bool:
@@ -30,16 +38,174 @@ def tts_available() -> bool:
         return False
 
 
+def _select_best_voice(voice) -> None:
+    """Pick the least-robotic installed SAPI voice. Default Windows picks 'David'
+    (US male) which sounds ancient; prefer a natural/female voice. Override with
+    ORYNN_TTS_VOICE (substring match, e.g. 'zira', 'hazel')."""
+    pref = (os.environ.get("ORYNN_TTS_VOICE") or "").strip().lower()
+
+    def score(desc: str) -> int:
+        d = desc.lower()
+        if pref and pref in d:
+            return 100
+        if "natural" in d or "aria" in d or "jenny" in d or "guy" in d:
+            return 60
+        if "zira" in d:
+            return 30   # US female — clearer than David
+        if "hazel" in d:
+            return 25   # GB female
+        if "david" in d:
+            return -10  # the "1600s robot"
+        return 0
+
+    try:
+        toks = voice.GetVoices()
+        best, best_score = None, -10_000
+        for i in range(toks.Count):
+            tok = toks.Item(i)
+            s = score(tok.GetDescription())
+            if s > best_score:
+                best, best_score = tok, s
+        if best is not None and best_score > 0:
+            voice.Voice = best
+    except Exception as exc:
+        print(f"[voice] voice selection failed: {exc}", flush=True)
+
+
+def _tts_backend() -> str:
+    """Preferred TTS engine. ORYNN_TTS=groq|edge|sapi forces it; default 'edge'.
+    'groq'  = Groq Orpheus neural voice (fast, free, reuses GROQ_API_KEY; needs a
+              one-time terms-accept on the Groq console). Falls back to edge/sapi.
+    'edge'  = Microsoft online neural voices (natural, free, no key).
+    'sapi'  = legacy offline voices."""
+    pref = (os.environ.get("ORYNN_TTS") or "edge").strip().lower()
+    if pref == "groq":
+        return "groq" if _groq_key() else "edge"
+    if pref == "sapi":
+        return "sapi"
+    return "edge"
+
+
+def _edge_voice() -> str:
+    """Edge neural voice name. Defaults to Ava Multilingual — Microsoft's flagship
+    conversational voice, far more human than the older 'Aria'. Override with
+    ORYNN_TTS_VOICE (e.g. en-US-AndrewMultilingualNeural, en-GB-SoniaNeural)."""
+    v = (os.environ.get("ORYNN_TTS_VOICE") or "").strip()
+    return v if "Neural" in v else "en-US-AvaMultilingualNeural"
+
+
+def _mci_play_file(path: str, mtype: str) -> bool:
+    """Play an audio file with native Windows MCI, blocking until done or until a
+    new line / stop is queued. mtype is 'mpegvideo' (mp3) or 'waveaudio' (wav)."""
+    import ctypes
+
+    mci = ctypes.windll.winmm.mciSendStringW
+    alias = "orynntts"
+
+    def _cmd(s: str) -> int:
+        return mci(s, None, 0, None)
+
+    try:
+        if _cmd(f'open "{path}" type {mtype} alias {alias}') != 0:
+            return False
+        _cmd(f"play {alias}")
+        buf = ctypes.create_unicode_buffer(64)
+        while True:
+            mci(f"status {alias} mode", buf, 64, None)
+            if buf.value != "playing":
+                break
+            with _tts_lock:
+                if _tts_stop or _tts_queue:  # interrupted by stop / next line
+                    break
+            time.sleep(0.05)
+        _cmd(f"stop {alias}")
+        _cmd(f"close {alias}")
+        return True
+    except Exception as exc:
+        print(f"[voice] MCI playback failed: {exc}", flush=True)
+        return False
+    finally:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _edge_speak_blocking(text: str) -> bool:
+    """Synthesize via Microsoft neural TTS and play the MP3. False on failure."""
+    import asyncio
+    import tempfile
+
+    path = tempfile.mktemp(suffix=".mp3")
+    try:
+        import edge_tts
+
+        async def _run() -> None:
+            await edge_tts.Communicate(text, _edge_voice()).save(path)
+
+        asyncio.run(_run())
+        if not os.path.exists(path) or os.path.getsize(path) < 256:
+            return False
+    except Exception as exc:
+        print(f"[voice] edge synth failed: {exc}", flush=True)
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return False
+    return _mci_play_file(path, "mpegvideo")
+
+
+def _groq_speak_blocking(text: str) -> bool:
+    """Synthesize via Groq Orpheus neural TTS (fast) and play the WAV. Returns
+    False if unavailable (no key / terms not accepted / error) so we fall back."""
+    key = _groq_key()
+    if not key:
+        return False
+    # Groq Orpheus voices: autumn, diana, hannah (female) / austin, daniel, troy (male).
+    voice_name = (os.environ.get("ORYNN_GROQ_VOICE") or "autumn").strip()
+    import tempfile
+
+    try:
+        import requests
+
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/audio/speech",
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={
+                "model": os.environ.get("GROQ_TTS_MODEL") or "canopylabs/orpheus-v1-english",
+                "voice": voice_name,
+                "input": text[:1200],
+                "response_format": "wav",
+            },
+            timeout=30,
+        )
+        if resp.status_code != 200 or resp.content[:4] != b"RIFF":
+            print(f"[voice] Groq TTS unavailable: {resp.status_code} {resp.text[:160]}", flush=True)
+            return False
+        path = tempfile.mktemp(suffix=".wav")
+        with open(path, "wb") as fh:
+            fh.write(resp.content)
+    except Exception as exc:
+        print(f"[voice] Groq TTS failed: {exc}", flush=True)
+        return False
+    return _mci_play_file(path, "waveaudio")
+
+
 def _tts_worker() -> None:
     import pythoncom
     pythoncom.CoInitialize()
-    try:
-        import comtypes.client as cc
-        voice = cc.CreateObject("SAPI.SpVoice")
-    except Exception as exc:
-        print(f"[voice] TTS init failed: {exc}", flush=True)
-        return
-    global _tts_thread
+    pref = _tts_backend()
+    sapi = [None]
+
+    def _ensure_sapi():
+        if sapi[0] is None:
+            import comtypes.client as cc
+            sapi[0] = cc.CreateObject("SAPI.SpVoice")
+            _select_best_voice(sapi[0])
+        return sapi[0]
+
+    global _tts_thread, _groq_tts_ok
     while True:
         with _tts_lock:
             if not _tts_queue:
@@ -47,32 +213,48 @@ def _tts_worker() -> None:
                 return
             text, rate, interrupt = _tts_queue.pop(0)
         try:
-            voice.Rate = rate
-            flags = 1  # SVSFlagsAsync
-            if interrupt:
-                flags |= 2  # SVSFPurgeBeforeSpeak — cut off the previous line
-            voice.Speak(text, flags)
-            # wait for it to finish (so the queue serialises) but stay responsive
-            while True:
-                with _tts_lock:
-                    if _tts_stop or _tts_queue:
-                        # new line queued or stop requested — purge & move on
-                        try:
-                            voice.Speak("", 2)
-                        except Exception:
-                            pass
-                        break
-                try:
-                    if voice.WaitUntilDone(120):
-                        break
-                except Exception:
-                    break
+            spoken = False
+            # 1. Groq Orpheus (only if chosen and not already known-unavailable).
+            if pref == "groq" and _groq_tts_ok is not False:
+                if _groq_speak_blocking(text):
+                    _groq_tts_ok = True
+                    spoken = True
+                else:
+                    _groq_tts_ok = False  # terms not accepted yet → use fallback
+            # 2. Edge neural (primary, or fallback from Groq).
+            if not spoken and pref in ("groq", "edge"):
+                spoken = _edge_speak_blocking(text)
+            # 3. SAPI offline fallback.
+            if not spoken:
+                _sapi_speak(_ensure_sapi(), text, rate, interrupt)
         except Exception as exc:
             print(f"[voice] TTS speak failed: {exc}", flush=True)
 
 
-def speak(text: str, rate: int = 1, interrupt: bool = True) -> bool:
-    """Queue text to be spoken aloud. Returns False if there's nothing to say."""
+def _sapi_speak(voice, text: str, rate: int, interrupt: bool) -> None:
+    voice.Rate = rate
+    flags = 1  # SVSFlagsAsync
+    if interrupt:
+        flags |= 2  # SVSFPurgeBeforeSpeak — cut off the previous line
+    voice.Speak(text, flags)
+    while True:  # serialise the queue but stay responsive to stop/next
+        with _tts_lock:
+            if _tts_stop or _tts_queue:
+                try:
+                    voice.Speak("", 2)
+                except Exception:
+                    pass
+                break
+        try:
+            if voice.WaitUntilDone(120):
+                break
+        except Exception:
+            break
+
+
+def speak(text: str, rate: int = 0, interrupt: bool = True) -> bool:
+    """Queue text to be spoken aloud. Returns False if there's nothing to say.
+    Rate 0 = natural pace (the old default of 1 sounded rushed/robotic)."""
     text = (text or "").strip()
     if not text:
         return False
@@ -97,7 +279,32 @@ def stop_speaking() -> None:
 
 
 # ── Speech-to-text ───────────────────────────────────────────────────────────
+def _groq_key() -> str:
+    return (os.environ.get("GROQ_API_KEY") or "").strip()
+
+
+def recorder_available() -> bool:
+    """True when the manual push-to-talk recorder can capture mic audio."""
+    try:
+        import numpy  # noqa: F401
+        import sounddevice  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _groq_stt_available() -> bool:
+    return bool(_groq_key() and recorder_available())
+
+
+def push_to_talk_available() -> bool:
+    """True when hold-to-talk recording and Groq transcription can both run."""
+    return _groq_stt_available()
+
+
 def stt_available() -> bool:
+    if _groq_stt_available():
+        return True
     try:
         import winsdk.windows.media.speechrecognition  # noqa: F401
         return True
@@ -108,6 +315,249 @@ def stt_available() -> bool:
             return True
         except Exception:
             return False
+
+
+def _record_utterance(timeout: float) -> bytes | None:
+    """Capture one spoken utterance from the default mic as 16-bit mono WAV bytes.
+
+    Stops ~0.8s after speech ends, or gives up if nothing is said. Returns WAV
+    bytes, b'' if no speech was detected, or None if mic capture is unavailable.
+    """
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except Exception as exc:
+        print(f"[voice] mic capture unavailable: {exc}", flush=True)
+        return None
+
+    sr = _STT_SAMPLE_RATE
+    block = int(sr * 0.1)              # 100ms blocks
+    silence_thresh = 450.0            # int16 RMS below this counts as silence
+    max_blocks = max(1, int(timeout / 0.1))
+    trailing_silence_blocks = 8       # ~0.8s of quiet ends the utterance
+    lead_silence_limit = 30           # give up after ~3s of no speech at all
+
+    frames: list[bytes] = []
+    started = False
+    silent_run = 0
+    try:
+        with sd.InputStream(samplerate=sr, channels=1, dtype="int16") as stream:
+            for i in range(max_blocks):
+                data, _ = stream.read(block)
+                arr = np.asarray(data, dtype=np.int16).reshape(-1)
+                frames.append(arr.tobytes())
+                rms = float(np.sqrt(np.mean(arr.astype(np.float32) ** 2))) if arr.size else 0.0
+                if rms > silence_thresh:
+                    started = True
+                    silent_run = 0
+                else:
+                    silent_run += 1
+                    if started and silent_run >= trailing_silence_blocks:
+                        break
+                    if not started and i >= lead_silence_limit:
+                        break
+    except Exception as exc:
+        print(f"[voice] recording failed: {exc}", flush=True)
+        return None
+
+    if not started:
+        return b""
+
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(b"".join(frames))
+    return buf.getvalue()
+
+
+def _pcm_to_wav(pcm: bytes, sample_rate: int = _STT_SAMPLE_RATE) -> bytes:
+    import io
+    import wave
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def transcribe_wav(wav: bytes) -> str | None:
+    """Send WAV bytes to Groq Whisper and return the transcript. Returns '' for
+    empty input and None if Groq STT is unavailable (no key) or the call fails."""
+    key = _groq_key()
+    if not key:
+        return None
+    if not wav:
+        return ""
+    try:
+        import requests
+
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {key}"},
+            files={"file": ("speech.wav", wav, "audio/wav")},
+            data={"model": GROQ_STT_MODEL, "response_format": "json"},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f"[voice] Groq STT HTTP {resp.status_code}: {resp.text[:200]}", flush=True)
+            return None
+        return (resp.json().get("text") or "").strip()
+    except Exception as exc:
+        print(f"[voice] Groq STT failed: {exc}", flush=True)
+        return None
+
+
+class Recorder:
+    """Manual start/stop mic recorder for push-to-talk (hold a key to record).
+
+    Call start() when the key goes down and stop() when it's released; stop()
+    returns the captured audio as WAV bytes (b'' if nothing/unavailable).
+    """
+
+    def __init__(self, sample_rate: int = _STT_SAMPLE_RATE):
+        self._sr = sample_rate
+        self._frames: list[bytes] = []
+        self._stream = None
+        self._level = 0.0  # smoothed mic level 0..1 for the live waveform
+
+    def level(self) -> float:
+        """Current smoothed mic loudness (0..1) — drives the listening waveform."""
+        return self._level
+
+    def start(self) -> bool:
+        try:
+            import numpy as np
+            import sounddevice as sd
+        except Exception as exc:
+            print(f"[voice] mic capture unavailable: {exc}", flush=True)
+            return False
+        self._frames = []
+
+        def _cb(indata, _frames, _time, _status):
+            raw = bytes(indata)
+            self._frames.append(raw)
+            # Track a smoothed loudness level for the reactive waveform.
+            try:
+                arr = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+                if arr.size:
+                    rms = float(np.sqrt(np.mean(arr * arr)))
+                    lvl = min(1.0, rms / 6000.0)  # ~speech RMS → full scale
+                    # Fast attack, slower release so it feels lively but smooth.
+                    if lvl > self._level:
+                        self._level = lvl
+                    else:
+                        self._level = self._level * 0.8 + lvl * 0.2
+            except Exception:
+                pass
+
+        try:
+            self._stream = sd.RawInputStream(
+                samplerate=self._sr, channels=1, dtype="int16", callback=_cb
+            )
+            self._stream.start()
+            return True
+        except Exception as exc:
+            print(f"[voice] recording failed to start: {exc}", flush=True)
+            self._stream = None
+            return False
+
+    def stop(self) -> bytes:
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+        if not self._frames:
+            return b""
+        return _pcm_to_wav(b"".join(self._frames), self._sr)
+
+
+# Soft, musical cue tones (Hz, ms). Played as smooth sine chimes — NOT the harsh
+# square-wave winsound.Beep, which sounded like an old PC speaker. ORYNN_CUES=0
+# disables them entirely.
+_CUE_NOTES = {
+    "start": [(587, 110)],                       # gentle single "ready" note
+    "stop": [],                                  # silent — the waveform already shows it
+    "cancel": [(440, 130), (330, 150)],          # soft falling
+    "done": [(659, 110), (988, 160)],            # pleasant rising two-note
+    "error": [(392, 200)],                       # soft low
+    "fail": [(392, 160), (294, 200)],            # soft falling
+}
+_CUE_CACHE: dict[str, bytes] = {}
+
+
+def _chime_wav(notes, volume: float = 0.16, sr: int = 22050) -> bytes:
+    """Render notes to a smooth WAV with short fade in/out (no clicks)."""
+    import numpy as np
+
+    chunks = []
+    for freq, ms in notes:
+        n = max(1, int(sr * ms / 1000))
+        t = np.arange(n) / sr
+        sig = np.sin(2 * np.pi * freq * t)
+        env = np.ones(n)
+        a, d = int(sr * 0.010), int(sr * 0.045)
+        if a > 0:
+            env[:a] = np.linspace(0.0, 1.0, a)
+        if d > 0:
+            env[-d:] = np.linspace(1.0, 0.0, d)
+        chunks.append(sig * env * volume)
+    sig = np.concatenate(chunks) if chunks else np.zeros(1, dtype=float)
+    pcm = (np.clip(sig, -1, 1) * 32767).astype("<i2").tobytes()
+    return _pcm_to_wav(pcm, sr)
+
+
+def cue(kind: str) -> None:
+    """Play a soft, non-blocking audio chime for voice feedback. Unknown kinds and
+    ORYNN_CUES=0 are no-ops."""
+    if (os.environ.get("ORYNN_CUES") or "1").strip().lower() in ("0", "false", "no"):
+        return
+    notes = _CUE_NOTES.get(kind)
+    if not notes:
+        return
+
+    def _play() -> None:
+        try:
+            import winsound
+
+            data = _CUE_CACHE.get(kind)
+            if data is None:
+                data = _chime_wav(notes)
+                _CUE_CACHE[kind] = data
+            winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+        except Exception:
+            pass
+
+    threading.Thread(target=_play, daemon=True).start()
+
+
+def wav_seconds(wav: bytes) -> float:
+    """Approximate duration of a 16-bit mono WAV produced by this module."""
+    if not wav or len(wav) <= 44:
+        return 0.0
+    return (len(wav) - 44) / 2 / float(_STT_SAMPLE_RATE)
+
+
+def _listen_groq(timeout: float) -> str | None:
+    """Transcribe one utterance via Groq Whisper. Returns the transcript, '' on
+    no-speech, or None if Groq STT is unavailable (no key/mic) or the call fails
+    (so the caller can fall back to the Windows recognizers)."""
+    if not _groq_key():
+        return None
+    wav = _record_utterance(timeout)
+    if wav is None:
+        return None
+    return transcribe_wav(wav)
 
 
 def _listen_winrt(timeout: float) -> str | None:
@@ -173,9 +623,64 @@ def _listen_sapi(timeout: float) -> str:
 
 def listen(timeout: float = 8.0) -> str:
     """Capture one spoken utterance and return the transcript ('' if none).
-    Blocking — call from a worker thread. Tries the modern recognizer first,
-    falls back to SAPI."""
+    Blocking — call from a worker thread. Tries Groq Whisper first (when
+    GROQ_API_KEY + mic are available), then the modern Windows recognizer,
+    then classic SAPI."""
+    out = _listen_groq(timeout)
+    if out is not None:
+        return out
     out = _listen_winrt(timeout)
     if out is not None:
         return (out or "").strip()
     return _listen_sapi(timeout)
+
+
+# Common ways a general recognizer mangles the made-up name "Orynn" (it isn't a
+# dictionary word, so Whisper/WinRT guess at it). Used for wake-word matching.
+_WAKE_VARIANTS = {
+    "orynn", "oryn", "orinn", "orin", "oren", "oran", "orrin",
+    "auryn", "aurin", "oryan",
+}
+
+
+def matches_wake_word(transcript: str, wake: str = "") -> bool:
+    """True if the transcript contains the wake word (default 'Orynn'), tolerant of
+    how a general recognizer mishears a made-up name. Set ORYNN_WAKE_WORD to a word
+    your recognizer hears reliably if 'Orynn' is flaky."""
+    import re
+    import difflib
+
+    wake = (wake or os.environ.get("ORYNN_WAKE_WORD") or "orynn").lower().strip()
+    text = (transcript or "").lower()
+    if not text or not wake:
+        return False
+    if wake in text:
+        return True
+    variants = _WAKE_VARIANTS if wake == "orynn" else {wake}
+    for w in re.findall(r"[a-z']+", text):
+        if w in variants:
+            return True
+        if difflib.SequenceMatcher(None, w, wake).ratio() >= 0.82:
+            return True
+    return False
+
+
+def listen_for_wake(timeout: float = 5.0) -> str:
+    """One utterance for wake-word listening. Prefers OFFLINE recognizers (WinRT,
+    then SAPI) so ambient listening costs no Groq quota and stays local; only falls
+    back to Groq if no offline engine works. Returns a lowercase transcript ('' if
+    nothing was said or no engine is available)."""
+    try:
+        out = _listen_winrt(timeout)
+        if out is not None:
+            return (out or "").strip().lower()
+    except Exception:
+        pass
+    try:
+        out = _listen_sapi(timeout)
+        if out:
+            return out.strip().lower()
+    except Exception:
+        pass
+    out = _listen_groq(timeout)
+    return (out or "").strip().lower() if out is not None else ""

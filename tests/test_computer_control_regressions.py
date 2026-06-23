@@ -19,6 +19,20 @@ from app.models import Action, ActionType, HierarchicalPlan, SubTask, ToolResult
 from app.providers import PlannerProvider, detect_task_mode, infer_isolated_app_name
 
 
+def test_invoke_ui_element_has_clean_chromium_tiers():
+    """UIA fine-tune for Cursor/Chrome/Electron: focus editable inputs (set_focus) and
+    invoke the actionable ANCESTOR of a Chromium text/icon label (ancestor_invoke) --
+    both BEFORE the mouse-stealing coordinate click, so these activate cleanly with no
+    cursor hijack and work in the no-pixel fast path."""
+    import inspect
+    from app.widget import desktop_features
+
+    src = inspect.getsource(desktop_features.invoke_ui_element)
+    assert "set_focus" in src and "ancestor_invoke" in src
+    assert src.index("ancestor_invoke") < src.index("click_fallback")
+    assert src.index("set_focus") < src.index("click_fallback")
+
+
 class DummyLogEmitter:
     async def emit(self, *args, **kwargs):
         return None
@@ -1502,7 +1516,9 @@ async def test_unified_surface_desktop_task_can_reach_browser_web_and_files(monk
     monkeypatch.setattr("app.agent.is_vision_model", lambda model: False)
     captured = _capture_tool_names(monkeypatch, service)
 
-    await service.run_task("task-unified-desktop", "Open Notepad", mode="computer", model="tier:uia")
+    # NB: bare "open <app>" takes the deterministic launch fast-path (no LLM); use a
+    # multi-step desktop goal so the reactive loop runs and we can read its tool surface.
+    await service.run_task("task-unified-desktop", "Type a note into Notepad", mode="computer", model="tier:uia")
 
     names = captured["names"]
     # Desktop control stays available …
@@ -1579,6 +1595,51 @@ async def test_finish_gate_bounces_unearned_desktop_finish(monkeypatch, workspac
                    if "[finish rejected]" in str(m.get("content", ""))]
     assert bounce_msgs, "second turn should carry the finish-rejected observation"
     assert finalizations and finalizations[-1][1] == "done"
+
+
+@pytest.mark.asyncio
+async def test_text_only_reply_does_not_false_complete_desktop_task(monkeypatch, workspace):
+    """A desktop task that produced ZERO interaction must not finalize complete just
+    because the model replied with text ('Done.'). It's bounced once to actually do
+    the work; only then (or on a real 'can't do it') is it allowed through."""
+    service = AgentService(workspace, log_emitter=DummyLogEmitter())
+
+    monkeypatch.setattr("app.agent.classify_task_complexity", lambda goal: "atomic")
+    monkeypatch.setattr("app.agent.is_vision_model", lambda model: False)
+    monkeypatch.setattr(service.memory, "search", lambda goal, limit=5: [])
+    monkeypatch.setattr(service.memory, "recall_sessions", lambda goal, limit=5: [])
+
+    class FakeProvider:
+        total_tokens = 0
+        model = "tier:uia"
+
+        def __init__(self):
+            self.calls = 0
+            self.last_messages = []
+
+        async def stream_chat_with_tools(self, system, messages, tools, screenshot_b64=None):
+            self.calls += 1
+            self.last_messages = list(messages)
+            # Text-only "done" with no action — the false-completion shape.
+            yield {"type": "text_only", "content": "Done."}
+
+    provider = FakeProvider()
+    monkeypatch.setattr("app.agent.PlannerProvider", lambda model=None: provider)
+
+    finalizations = []
+
+    async def noop_emit(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(service, "_emit", noop_emit)
+    monkeypatch.setattr(service, "_emit_reasoning", noop_emit)
+    monkeypatch.setattr(service, "_finalize", lambda *args, **kwargs: finalizations.append(args))
+
+    await service.run_task("task-textonly-gate", "Type hello into Notepad", mode="computer", model="tier:uia")
+
+    assert provider.calls == 2  # bounced once before being allowed to finalize
+    bounce_msgs = [m for m in provider.last_messages if "[not done]" in str(m.get("content", ""))]
+    assert bounce_msgs, "the text-only reply should be bounced with a 'not done' nudge"
 
 
 def test_uia_miss_error_lists_real_controls():

@@ -1,0 +1,88 @@
+diff --git a/app/widget/textbox_overlay.py b/app/widget/textbox_overlay.py
+index a1b2c3d..e4f5g6h 100644
+--- a/app/widget/textbox_overlay.py
++++ b/app/widget/textbox_overlay.py
+@@ -414,6 +414,7 @@ class OverlayController(QObject):
+         # Goal of the desktop task currently running (if any), so Live can name it
+         # when it refuses to start a second, colliding action on top of it.
+         self._active_task_goal: str = ""
++        self._consecutive_failures = 0
+         # Tasks Live launched (task_id -> short goal), so when one finishes we can
+         # feed the outcome back to the conversation instead of losing it.
+         self._live_task_ids: dict[str, str] = {}
+@@ -1544,18 +1545,56 @@ class OverlayController(QObject):
+ 
+         threading.Thread(target=run, daemon=True).start()
+ 
++    def _sync_state_with_active_tasks(self) -> None:
++        try:
++            data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
++            tasks = data.get("tasks", []) if isinstance(data, dict) else []
++            if tasks:
++                self._active_task_running = True
++                first_task = tasks[0]
++                goal = first_task.get("goal") or ""
++                self._active_task_goal = _short(_strip_hardening(goal), 80)
++                if not self._live_is_running():
++                    self.cursorStateRequested.emit("thinking")
++            else:
++                self._active_task_running = False
++                self._active_task_goal = ""
++                if not self._live_is_running():
++                    self.cursorStateRequested.emit("idle")
++        except Exception as exc:
++            print(f"[clicky] Failed to sync state with active tasks: {exc}", flush=True)
++            raise exc
++
+     def _poll_loop(self) -> None:
+         idle_label_shown = False
++        self._consecutive_failures = 0
++
++        # Initial startup sync
++        try:
++            self._sync_state_with_active_tasks()
++        except Exception:
++            self._consecutive_failures = 1
++
+         while not self._stop.is_set():
+             try:
+                 data = self.client.request(
+                     "GET",
+                     f"/api/overlay/events?since={self._cursor}&limit=80",
+                     timeout=4.0,
+                 )
++
++                # Check if we recovered from 3+ consecutive failures
++                if self._consecutive_failures >= 3:
++                    try:
++                        self._sync_state_with_active_tasks()
++                    except Exception:
++                        raise
++
++                self._consecutive_failures = 0
++
+                 events = data.get("events", []) if isinstance(data, dict) else []
+                 if isinstance(data, dict):
+-                    self._cursor = max(self._cursor, int(data.get("cursor") or 0))
++                    server_cursor = int(data.get("cursor") or 0)
++                    if server_cursor < self._cursor:
++                        # Server restarted or global events reset
++                        self._cursor = server_cursor
++                    else:
++                        self._cursor = max(self._cursor, server_cursor)
+                 for ev in events:
+                     if not isinstance(ev, dict):
+                         continue
+@@ -1589,6 +1629,12 @@ class OverlayController(QObject):
+                 # last activity (handled in the overlay's morph), so no explicit
+                 # "revert to ready" is needed here.
+             except Exception:
++                self._consecutive_failures += 1
++                if self._consecutive_failures >= 3:
++                    self._active_task_running = False
++                    self._active_task_goal = ""
++                    if not self._live_is_running():
++                        self.cursorStateRequested.emit("idle")
+                 if not idle_label_shown:
+                     self._set_label("Waiting for Orynn", source="system_wait")
+                     idle_label_shown = True

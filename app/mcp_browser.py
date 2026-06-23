@@ -24,6 +24,8 @@ class MCPBrowserBridge:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             bufsize=1
         )
         self._listener_task = asyncio.create_task(self._listen())

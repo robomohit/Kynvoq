@@ -18,10 +18,10 @@ def test_uia_click_falls_back_to_ocr_on_uia_miss(monkeypatch, tmp_path):
 
     # UIA finds nothing...
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": False, "error": "no UIA control matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no UIA control matched"})
     # ...but OCR locates the on-screen text.
     monkeypatch.setattr(df, "ocr_find_in_app",
-                        lambda q, a: {"ok": True, "x": 329, "y": 216,
+                        lambda q, a, **kw: {"ok": True, "x": 329, "y": 216,
                                       "matched": "Edit", "score": 100})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 800, "height": 600})
@@ -42,9 +42,9 @@ def test_uia_click_reports_miss_when_uia_and_ocr_both_fail(monkeypatch, tmp_path
     import app.widget.desktop_features as df
 
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": False, "error": "no UIA control matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no UIA control matched"})
     monkeypatch.setattr(df, "ocr_find_in_app",
-                        lambda q, a: {"ok": False, "error": "no OCR text matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no OCR text matched"})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 0, "height": 0})
 
@@ -62,7 +62,7 @@ def test_uia_find_falls_back_to_ocr_on_uia_miss(monkeypatch, tmp_path):
                         lambda q, a, n: {"ok": False, "error": "no UIA control matched"})
     # ...but the text is visible on screen.
     monkeypatch.setattr(df, "ocr_find_in_app",
-                        lambda q, a: {"ok": True, "x": 227, "y": 421,
+                        lambda q, a, **kw: {"ok": True, "x": 227, "y": 421,
                                       "matched": "Find", "score": 100})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 800, "height": 600})
@@ -81,7 +81,7 @@ def test_uia_find_reports_miss_when_uia_and_ocr_both_fail(monkeypatch, tmp_path)
     monkeypatch.setattr(df, "find_ui_elements",
                         lambda q, a, n: {"ok": False, "error": "no UIA control matched"})
     monkeypatch.setattr(df, "ocr_find_in_app",
-                        lambda q, a: {"ok": False, "error": "no OCR text matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no OCR text matched"})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 0, "height": 0})
 
@@ -223,7 +223,7 @@ def test_uia_click_verifies_state_change(monkeypatch, tmp_path):
     import app.widget.desktop_features as df
 
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": True, "method": "invoke_pattern",
+                        lambda q, a, **kw: {"ok": True, "method": "invoke_pattern",
                                       "target": "Edit", "rect": {}})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 800, "height": 600})
@@ -244,7 +244,7 @@ def test_uia_click_unverifiable_is_not_a_failure(monkeypatch, tmp_path):
     import app.widget.desktop_features as df
 
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": True, "method": "invoke_pattern",
+                        lambda q, a, **kw: {"ok": True, "method": "invoke_pattern",
                                       "target": "Bold", "rect": {}})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 800, "height": 600})
@@ -267,9 +267,9 @@ def test_electron_unlock_hint_on_hard_miss(monkeypatch, tmp_path):
     # UIA and OCR both miss, AND the target is an Electron app -> the agent is
     # told it can unlock the DOM instead of just escalating to vision.
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": False, "error": "no UIA control matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no UIA control matched"})
     monkeypatch.setattr(df, "ocr_find_in_app",
-                        lambda q, a: {"ok": False, "error": "no OCR text matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no OCR text matched"})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 0, "height": 0})
     monkeypatch.setattr(df, "electron_hint_for_app",
@@ -286,9 +286,9 @@ def test_no_electron_hint_for_native_app(monkeypatch, tmp_path):
     import app.widget.desktop_features as df
 
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": False, "error": "no UIA control matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no UIA control matched"})
     monkeypatch.setattr(df, "ocr_find_in_app",
-                        lambda q, a: {"ok": False, "error": "no OCR text matched"})
+                        lambda q, a, **kw: {"ok": False, "error": "no OCR text matched"})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 0, "height": 0})
     monkeypatch.setattr(df, "electron_hint_for_app", lambda app: None)
@@ -303,7 +303,7 @@ def test_uia_click_sequence_one_call(monkeypatch, tmp_path):
 
     seen = []
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: seen.append(q) or {"ok": True, "target": q})
+                        lambda q, a, **kw: seen.append(q) or {"ok": True, "target": q})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 400, "height": 300})
 
@@ -323,7 +323,7 @@ def test_uia_click_sequence_reads_result_in_same_call(monkeypatch, tmp_path):
                         lambda self, targets, app, read_result="": None)
     monkeypatch.setattr(ToolExecutor, "_calculator_sequence_fallback",
                         lambda self, targets, app, read_result="": None)
-    monkeypatch.setattr(df, "invoke_ui_element", lambda q, a: {"ok": True, "target": q})
+    monkeypatch.setattr(df, "invoke_ui_element", lambda q, a, **kw: {"ok": True, "target": q})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 400, "height": 300})
     # the result control read back after the sequence
@@ -349,8 +349,8 @@ def test_uia_click_sequence_stops_on_miss(monkeypatch, tmp_path):
                         lambda self, targets, app, read_result="": None)
     # 'Nine' isn't found in UIA and OCR also misses -> stop, report which failed.
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": q != "Nine", "target": q})
-    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a: {"ok": False})
+                        lambda q, a, **kw: {"ok": q != "Nine", "target": q})
+    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a, **kw: {"ok": False})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 0, "height": 0})
 
@@ -366,8 +366,8 @@ def test_uia_click_sequence_calculator_uses_keyboard_fallback(monkeypatch, tmp_p
     monkeypatch.setattr(ToolExecutor, "_calculator_keyboard_fast_path",
                         lambda self, targets, app, read_result="": None)
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": False, "error": "no UIA control matched"})
-    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a: {"ok": False})
+                        lambda q, a, **kw: {"ok": False, "error": "no UIA control matched"})
+    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a, **kw: {"ok": False})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 400, "height": 300})
 
@@ -436,7 +436,7 @@ def test_uia_click_sequence_calculator_fast_keyboard_when_idle(monkeypatch, tmp_
     monkeypatch.setattr(df, "input_polite_enabled", lambda: True)
     monkeypatch.setattr(df, "_user_actively_typing", lambda min_idle: False)
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: (_ for _ in ()).throw(AssertionError("UIA loop should not run")))
+                        lambda q, a, **kw: (_ for _ in ()).throw(AssertionError("UIA loop should not run")))
     monkeypatch.setattr(df, "find_ui_elements",
                         lambda q, a, n: {"ok": True, "items": [{"name": "Display is 5"}]})
     monkeypatch.setattr(ToolExecutor, "_app_rect_payload", staticmethod(lambda app: None))
@@ -469,7 +469,7 @@ def test_uia_click_sequence_calculator_fast_keyboard_skips_when_user_active(monk
     monkeypatch.setattr(df, "_user_actively_typing", lambda min_idle: True)
     seen = []
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: seen.append(q) or {"ok": True, "target": q})
+                        lambda q, a, **kw: seen.append(q) or {"ok": True, "target": q})
     monkeypatch.setattr(df, "find_ui_elements",
                         lambda q, a, n: {"ok": True, "items": [{"name": "Display is 5"}]})
     monkeypatch.setattr(ToolExecutor, "_calculator_sequence_fallback",
@@ -492,7 +492,7 @@ def test_uia_click_sequence_calculator_fallback_on_wrong_display(monkeypatch, tm
     monkeypatch.setattr(ToolExecutor, "_calculator_keyboard_fast_path",
                         lambda self, targets, app, read_result="": None)
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": True, "target": q})
+                        lambda q, a, **kw: {"ok": True, "target": q})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 400, "height": 300})
     monkeypatch.setattr(df, "find_ui_elements",
@@ -546,8 +546,8 @@ def test_uia_click_sequence_adds_electron_hint_on_hard_miss(monkeypatch, tmp_pat
     import app.widget.desktop_features as df
 
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": False, "error": "no UIA control matched"})
-    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a: {"ok": False})
+                        lambda q, a, **kw: {"ok": False, "error": "no UIA control matched"})
+    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a, **kw: {"ok": False})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 0, "height": 0})
     monkeypatch.setattr(df, "electron_hint_for_app",
@@ -595,7 +595,7 @@ def test_uia_type_reports_verification(monkeypatch, tmp_path):
         def GetValuePattern(self):
             return _VP()
 
-    monkeypatch.setattr(df, "_find_uia_control", lambda q, a: (_Ctrl(), {}))
+    monkeypatch.setattr(df, "_find_uia_control", lambda q, a, **kw: (_Ctrl(), {}))
 
     res = _ex(tmp_path).uia_type("Text editor", "hello world", "Notepad")
     assert res.ok is True
@@ -613,8 +613,8 @@ def test_calculator_keyboard_fallback_aborts_when_not_foreground(monkeypatch, tm
     monkeypatch.setattr(ToolExecutor, "_calculator_keyboard_fast_path",
                         lambda self, targets, app, read_result="": None)
     monkeypatch.setattr(df, "invoke_ui_element",
-                        lambda q, a: {"ok": False, "error": "no UIA control matched"})
-    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a: {"ok": False})
+                        lambda q, a, **kw: {"ok": False, "error": "no UIA control matched"})
+    monkeypatch.setattr(df, "ocr_find_in_app", lambda q, a, **kw: {"ok": False})
     monkeypatch.setattr(df, "app_window_rect",
                         lambda a: {"left": 0, "top": 0, "width": 400, "height": 300})
 

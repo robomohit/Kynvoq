@@ -1,4 +1,4 @@
-﻿"""Desktop-native features that round out the Orynn widget into a
+"""Desktop-native features that round out the Orynn widget into a
 shippable product.
 
 Implements (from research-deferred list):
@@ -1295,84 +1295,96 @@ def _find_uia_control(query: str, app_hint: str = ""):
         return None, {"ok": False,
                       "error": "uiautomation not installed (pip install uiautomation)"}
     _ensure_uia_config(uia)
-    try:
-        roots = _uia_root_candidates(app_hint)
-        if not roots:
-            roots = []
 
-        q = (query or "").strip()
-        best = [0, None, None]  # score, ctrl, info (mutable for early-exit)
+    start_time = time.time()
+    while True:
+        try:
+            roots = _uia_root_candidates(app_hint)
+            if not roots:
+                roots = []
 
-        def walk(ctrl, depth=0):
-            # Stop the entire walk the instant we have a perfect match â€”
-            # nothing can beat an exact-name hit (score 100).
-            if depth > _UIA_MAX_DEPTH or best[0] >= 100:
-                return
-            try:
-                name = ctrl.Name or ""
-                aid = ctrl.AutomationId or ""
-                role = ctrl.ControlTypeName or ""
-                # Skip the root container (depth 0) â€” see note in find_ui_elements.
-                score = _score_match(query, name, aid, role) if depth > 0 else 0
-                if score > 0:
-                    rect = ctrl.BoundingRectangle
-                    has_rect = rect.right > rect.left and rect.bottom > rect.top
-                    try:
-                        offscreen = bool(ctrl.IsOffscreen)
-                    except Exception:
-                        offscreen = False
-                    # Keep offscreen/0-size controls (Electron lists report them
-                    # even when invokable) but rank below on-screen matches.
-                    eff = score - (8 if (offscreen or not has_rect) else 0)
-                    if eff > best[0]:
-                        info = {
-                            "name": name, "automation_id": aid,
-                            "control_type": role,
-                            "x": (rect.left + rect.right) // 2 if has_rect else 0,
-                            "y": (rect.top + rect.bottom) // 2 if has_rect else 0,
-                            "score": score,
-                            "offscreen": offscreen or not has_rect,
-                        }
-                        best[0], best[1], best[2] = eff, ctrl, info
-                for child in ctrl.GetChildren():
-                    if best[0] >= 100:
-                        break
-                    walk(child, depth + 1)
-            except Exception:
-                pass
+            q = (query or "").strip()
+            best = [0, None, None]  # score, ctrl, info (mutable for early-exit)
 
-        for root in roots[:3]:
-            if root is None:
-                continue
-            # Fast path: native exact-name FindFirst (runs in UIA's C++ core,
-            # ~2x faster than the Python walk below). maxSearchSeconds=0 = a
-            # single immediate search, so a miss returns fast and falls through
-            # to the scored walk. Try each ranked root because WinUI apps can
-            # expose a stale/tab-frame root before the live document root.
-            if q and not _is_chrome_control(q):
+            def walk(ctrl, depth=0):
+                # Stop the entire walk the instant we have a perfect match â€”
+                # nothing can beat an exact-name hit (score 100).
+                if depth > _UIA_MAX_DEPTH or best[0] >= 100:
+                    return
                 try:
-                    fast = root.Control(searchDepth=0xFFFFFFFF, Name=q)
-                    if fast.Exists(maxSearchSeconds=0, searchIntervalSeconds=0):
-                        r = fast.BoundingRectangle
-                        has_rect = r.right > r.left and r.bottom > r.top
-                        return fast, {
-                            "name": fast.Name or "",
-                            "automation_id": fast.AutomationId or "",
-                            "control_type": fast.ControlTypeName or "",
-                            "x": (r.left + r.right) // 2 if has_rect else 0,
-                            "y": (r.top + r.bottom) // 2 if has_rect else 0,
-                            "score": 100,
-                            "offscreen": not has_rect,
-                        }
+                    name = ctrl.Name or ""
+                    aid = ctrl.AutomationId or ""
+                    role = ctrl.ControlTypeName or ""
+                    # Skip the root container (depth 0) â€” see note in find_ui_elements.
+                    score = _score_match(query, name, aid, role) if depth > 0 else 0
+                    if score > 0:
+                        rect = ctrl.BoundingRectangle
+                        has_rect = rect.right > rect.left and rect.bottom > rect.top
+                        try:
+                            offscreen = bool(ctrl.IsOffscreen)
+                        except Exception:
+                            offscreen = False
+                        # Keep offscreen/0-size controls (Electron lists report them
+                        # even when invokable) but rank below on-screen matches.
+                        eff = score - (8 if (offscreen or not has_rect) else 0)
+                        if eff > best[0]:
+                            info = {
+                                "name": name, "automation_id": aid,
+                                "control_type": role,
+                                "x": (rect.left + rect.right) // 2 if has_rect else 0,
+                                "y": (rect.top + rect.bottom) // 2 if has_rect else 0,
+                                "score": score,
+                                "offscreen": offscreen or not has_rect,
+                            }
+                            best[0], best[1], best[2] = eff, ctrl, info
+                    for child in ctrl.GetChildren():
+                        if best[0] >= 100:
+                            break
+                        walk(child, depth + 1)
                 except Exception:
                     pass
-            walk(root)
-            if best[0] >= 100:
-                break
 
-        if best[1] is None:
-            return None, {"ok": False, "error": f"no UIA control matched '{query}'"}
-        return best[1], best[2]
+            for root in roots[:3]:
+                if root is None:
+                    continue
+                # Fast path: native exact-name FindFirst (runs in UIA's C++ core,
+                # ~2x faster than the Python walk below). maxSearchSeconds=0 = a
+                # single immediate search, so a miss returns fast and falls through
+                # to the scored walk. Try each ranked root because WinUI apps can
+                # expose a stale/tab-frame root before the live document root.
+                if q and not _is_chrome_control(q):
+                    try:
+                        fast = root.Control(searchDepth=0xFFFFFFFF, Name=q)
+                        if fast.Exists(maxSearchSeconds=0, searchIntervalSeconds=0):
+                            r = fast.BoundingRectangle
+                            has_rect = r.right > r.left and r.bottom > r.top
+                            return fast, {
+                                "name": fast.Name or "",
+                                "automation_id": fast.AutomationId or "",
+                                "control_type": fast.ControlTypeName or "",
+                                "x": (r.left + r.right) // 2 if has_rect else 0,
+                                "y": (r.top + r.bottom) // 2 if has_rect else 0,
+                                "score": 100,
+                                "offscreen": not has_rect,
+                            }
+                    except Exception:
+                        pass
+                walk(root)
+                if best[0] >= 100:
+                    break
+
+            if best[1] is not None:
+                return best[1], best[2]
+        except Exception:
+            pass
+
+        if time.time() - start_time >= 2.0:
+            break
+        time.sleep(0.2)
+
+    try:
+        roots = _uia_root_candidates(app_hint)
+        return None, {"ok": False, "error": f"no UIA control matched '{query}'"}
     except Exception as exc:
         return None, {"ok": False, "error": str(exc)}
 
@@ -1662,10 +1674,47 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
     #    Discord bug) â€” those fall through to the focus+paste tier below.
     #    submit needs a real Enter keystroke, so it can't ride this tier.
     control_type = str(info.get("control_type") or "")
+    # Check if target is Electron or a common browser
+    target_is_electron_or_browser = False
+    try:
+        top_node = ctrl
+        while top_node and top_node.GetParentControl() and top_node.GetParentControl() != uia.GetRootControl():
+            top_node = top_node.GetParentControl()
+        hwnd = top_node.NativeWindowHandle if top_node else 0
+        if hwnd:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            pid = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            h = kernel32.OpenProcess(0x1000, False, pid.value)
+            if h:
+                ebuf = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(1024)
+                if kernel32.QueryFullProcessImageNameW(h, 0, ebuf, ctypes.byref(size)):
+                    exe_path = ebuf.value
+                    exe_base = os.path.basename(exe_path).lower()
+                    target_is_electron_or_browser = (
+                        is_electron_app(exe_path) or
+                        any(b in exe_base for b in ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "arc.exe", "iexplore.exe"))
+                    )
+                kernel32.CloseHandle(h)
+    except Exception:
+        pass
+
+    if app_hint and not target_is_electron_or_browser:
+        try:
+            resolved_exe = resolve_app_exe(app_hint)
+            if resolved_exe:
+                exe_base = os.path.basename(resolved_exe).lower()
+                if is_electron_app(resolved_exe) or any(b in exe_base for b in ("chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "arc.exe", "iexplore.exe")):
+                    target_is_electron_or_browser = True
+        except Exception:
+            pass
+
     # Document-style editors (modern Notepad, rich text surfaces, some custom
     # controls) can reflect SetValue through accessibility without updating the
     # app's real document model. Use paste for those so save/submit paths see it.
-    if not submit and control_type != "DocumentControl":
+    if not submit and control_type != "DocumentControl" and not target_is_electron_or_browser:
         bg = _try_background_setvalue(ctrl, text, clear_first)
         if bg:
             return {"ok": True, "method": "setvalue-background",
@@ -1717,19 +1766,39 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
         method = "paste"
         pasted_ok = False
         try:
-            try:
-                saved = uia.GetClipboardText()
-            except Exception:
-                saved = ""
-            uia.SetClipboardText(text)
-            for _ in range(20):
+            saved = ""
+            for _ in range(5):
                 try:
-                    if uia.GetClipboardText() == text:
-                        pasted_ok = True
-                        break
+                    saved = uia.GetClipboardText()
+                    break
                 except Exception:
-                    pass
-                time.sleep(0.01)
+                    time.sleep(0.05)
+            
+            set_ok = False
+            for _ in range(5):
+                try:
+                    uia.SetClipboardText(text)
+                    set_ok = True
+                    break
+                except Exception:
+                    time.sleep(0.05)
+            
+            if set_ok:
+                for _ in range(20):
+                    try:
+                        curr = ""
+                        for _ in range(3):
+                            try:
+                                curr = uia.GetClipboardText()
+                                break
+                            except Exception:
+                                time.sleep(0.01)
+                        if curr == text:
+                            pasted_ok = True
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.01)
             if pasted_ok:
                 if use_foreground_keys:
                     import pyautogui
@@ -1739,10 +1808,12 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
                 note_synthetic_input()
                 time.sleep(0.1)   # let the paste fully consume the clipboard
                 if saved:         # restore prior clipboard, after paste is done
-                    try:
-                        uia.SetClipboardText(saved)
-                    except Exception:
-                        pass
+                    for _ in range(5):
+                        try:
+                            uia.SetClipboardText(saved)
+                            break
+                        except Exception:
+                            time.sleep(0.05)
         except Exception:
             pasted_ok = False
         if not pasted_ok:
@@ -1750,7 +1821,7 @@ def type_into_ui_element(query: str, text: str, app_hint: str = "",
             # SendKeys treating { } ( ) + ^ % as special tokens).
             method = "keystroke"
             import pyautogui
-            pyautogui.typewrite(text, interval=0.01)
+            pyautogui.typewrite(text, interval=0.04)
             note_synthetic_input()
         # 3. Optional submit (send / search) in the same focused control.
         if submit:
@@ -1795,12 +1866,17 @@ def _try_background_setvalue(ctrl, text: str, clear_first: bool) -> bool:
         return False
 
 
-def invoke_ui_element(query: str, app_hint: str = "") -> dict:
+def invoke_ui_element(query: str, app_hint: str = "", allow_pixel_fallback: bool = True) -> dict:
     """Activate a control by name without a pixel click. Order of attempts:
     scroll it into view (Electron virtualized lists), then InvokePattern (a
     real button/menu activation), then SelectionItemPattern (servers/channels/
     list items), and finally a coordinate click if the control has a real rect.
     Works on offscreen/0-size Electron controls that a pixel click can't hit.
+
+    allow_pixel_fallback=False stops before the coordinate-click tier (which steals
+    the real mouse) and returns ok=False instead — used by Live's fast path so a
+    single click either lands cleanly via UIA or escalates to the full agent, never
+    surprising the user by hijacking the mouse.
     """
     ctrl, info = _find_uia_control(query, app_hint)
     if ctrl is None:
@@ -1848,8 +1924,63 @@ def invoke_ui_element(query: str, app_hint: str = "") -> dict:
                     "rect": rect}
     except Exception:
         pass
+    # 2b. Editable inputs (Edit/Combo/Document): the "click" intent is to FOCUS them
+    #     (address bars, search boxes). SetFocus does that with NO mouse move -- and it
+    #     works in the no-pixel fast path, so "click the search bar" stops escalating.
+    if str(info.get("control_type")) in ("EditControl", "ComboBoxControl", "DocumentControl"):
+        try:
+            ctrl.SetFocus()
+            return {"ok": True, "method": "set_focus",
+                    "target": target, "control_type": info["control_type"], "rect": rect}
+        except Exception:
+            pass
+    # 2c. Actionable ancestor -- the Chromium/Electron win. Cursor/Discord/VS Code and
+    #     web content wrap a real clickable Button/Link around a text or icon label, so
+    #     the matched control has no pattern but its PARENT does. Walk up a few levels
+    #     for a CLICKABLE ancestor with InvokePattern/Toggle and activate THAT -- clean,
+    #     no mouse (this is what makes Cursor's "New Agent" activate without a pixel
+    #     click). Restricted to clickable control types so we never fire a container.
+    _CLICKABLE = ("ButtonControl", "HyperlinkControl", "MenuItemControl",
+                  "SplitButtonControl", "ListItemControl", "TabItemControl",
+                  "CheckBoxControl", "RadioButtonControl")
+    try:
+        node = ctrl
+        for _ in range(3):
+            node = node.GetParentControl()
+            if node is None:
+                break
+            if str(getattr(node, "ControlTypeName", "")) not in _CLICKABLE:
+                continue
+            ip2 = _uia_pattern(node, "InvokePattern")
+            if ip2 is not None:
+                ip2.Invoke()
+                return {"ok": True, "method": "ancestor_invoke",
+                        "target": target, "control_type": info["control_type"], "rect": rect}
+            tp2 = _uia_pattern(node, "TogglePattern")
+            if tp2 is not None:
+                tp2.Toggle()
+                return {"ok": True, "method": "ancestor_toggle",
+                        "target": target, "control_type": info["control_type"], "rect": rect}
+    except Exception:
+        pass
+    # 2d. LegacyIAccessible.DoDefaultAction -- native (non-Chromium) controls that lack
+    #     Invoke but carry a working default action. (On Chromium this raises COMError,
+    #     handled below, so it's a no-op there and we fall through to the pixel click.)
+    try:
+        lp = _uia_pattern(ctrl, "LegacyIAccessiblePattern")
+        if lp is not None and hasattr(lp, "DoDefaultAction"):
+            lp.DoDefaultAction()
+            return {"ok": True, "method": "legacy_default_action",
+                    "target": target, "control_type": info["control_type"],
+                    "rect": rect}
+    except Exception:
+        pass
     # 3. Coordinate click â€” only if the control now has a real on-screen rect.
     #    This is the one tier that steals the real mouse, so be polite about it.
+    if not allow_pixel_fallback:
+        return {"ok": False, "method": "needs_pixel_fallback",
+                "error": f"'{target}' has no clean UIA invoke/toggle/select pattern; "
+                         "a mouse click would be needed", "found_at": info, "rect": rect}
     try:
         import pyautogui
         if rect["width"] > 0 and rect["height"] > 0:

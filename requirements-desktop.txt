@@ -5,3 +5,15 @@ pywebview>=4.4
 # PySide6 - the floating glass capsule UI (app/widget/qt_shell.py) and the
 # virtual-cursor / app-edge-glow overlay. Pulls in Qt incl. QtSvg for icons.
 PySide6>=6.6.0
+# google-genai - Gemini Live audio-to-audio companion sessions.
+google-genai>=2.8.0
+# sounddevice + numpy - mic capture for Gemini Live and Groq Whisper
+# speech-to-text (app/widget/voice.py).
+numpy>=2.0.0
+sounddevice>=0.4.6
+# keyboard - global hotkeys for push-to-talk, Gemini Live, and emergency stop.
+keyboard>=0.13.5
+# edge-tts - free Microsoft online NEURAL voices for natural text-to-speech
+# (app/widget/voice.py). No API key; MP3 played via native Windows MCI. Falls
+# back to offline SAPI voices if unavailable. Set ORYNN_TTS=sapi to force legacy.
+edge-tts>=6.1.0

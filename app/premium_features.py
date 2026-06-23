@@ -210,6 +210,8 @@ def run_task_hooks(workspace: Path, event: str, payload: Dict[str, Any], *, time
                 shell=True,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=float(hook.get("timeout", timeout)),
                 env=env,
             )
@@ -226,6 +228,8 @@ def _git(workspace: Path, args: List[str]) -> subprocess.CompletedProcess[str]:
         cwd=str(workspace),
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=60,
     )
 

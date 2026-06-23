@@ -42,7 +42,7 @@ from .premium_features import (
 from .providers import PlannerProvider, _capture_screenshot_b64, _captured_dimensions, _get_active_window_rect, _get_hwnd_for_title, detect_task_mode, classify_task_complexity, infer_isolated_app_name, is_vision_model
 from .safety import SafetyManager
 from .text_editor import TextEditorTool
-from .tools import ToolExecutor, _flash_pointer
+from .tools import ToolExecutor, _flash_pointer, detect_app_launch_intent
 from .plugins import PluginRegistry
 from .skills import skill_manager
 
@@ -51,15 +51,30 @@ _log = logging.getLogger("agent")
 TOKEN_BUDGET_DEFAULT = 100_000  # max combined input+output tokens per task
 MODEL_STREAM_IDLE_TIMEOUT_SECONDS = 120.0
 XML_FALLBACK_MAX_STEPS = 3
-APPROVAL_WAIT_TIMEOUT_SECONDS = float(os.environ.get("APPROVAL_WAIT_TIMEOUT_SECONDS", "300"))
-PERMISSION_WAIT_TIMEOUT_SECONDS = float(os.environ.get("PERMISSION_WAIT_TIMEOUT_SECONDS", "300"))
-AGENT_MAX_STEPS = int(os.environ.get("AGENT_MAX_STEPS", "25"))
-BROWSER_MAX_STEPS = int(os.environ.get("BROWSER_MAX_STEPS", "35"))
+
+
+def _env_num(name: str, default, cast):
+    """Read a numeric env var, falling back to `default` when unset OR empty.
+
+    os.environ.get(name, default) only uses the default when the key is
+    absent; a key present with an empty value (e.g. ".env" line "FOO=")
+    returns "" and crashes cast(""). Treat empty/whitespace as unset.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return cast(raw)
+
+
+APPROVAL_WAIT_TIMEOUT_SECONDS = _env_num("APPROVAL_WAIT_TIMEOUT_SECONDS", 300.0, float)
+PERMISSION_WAIT_TIMEOUT_SECONDS = _env_num("PERMISSION_WAIT_TIMEOUT_SECONDS", 300.0, float)
+AGENT_MAX_STEPS = _env_num("AGENT_MAX_STEPS", 25, int)
+BROWSER_MAX_STEPS = _env_num("BROWSER_MAX_STEPS", 35, int)
 # Desktop/computer tasks click individual controls (one step each), read each
 # outcome back to verify, and may need to undo+redo to recover from a misstep —
 # so they legitimately need MORE budget than a generic agent task, not less. 25
 # was cutting off correct recoveries mid-way (e.g. a chained calculation).
-DESKTOP_MAX_STEPS = int(os.environ.get("DESKTOP_MAX_STEPS", "40"))
+DESKTOP_MAX_STEPS = _env_num("DESKTOP_MAX_STEPS", 40, int)
 
 _SCREENSHOT_ACTIONS = {
     ActionType.mouse_click,
@@ -123,6 +138,22 @@ _VISUAL_DESKTOP_ACTION_TYPES = {
 # screen_context) count so read-only goals ("what's on my screen?") finish
 # without a wasted bounce turn.
 _DESKTOP_EVIDENCE_ACTION_TYPES = _UIA_ACTION_TYPES | _VISUAL_DESKTOP_ACTION_TYPES
+
+# Actions that actually CHANGE the UI (vs read-only lookups). If the most recent one
+# failed or its post-action verification was contradicted (verified is False), a
+# "finish" can't honestly claim complete — used to emit complete:false (#3).
+_DESKTOP_MUTATING_ACTION_TYPES = {
+    ActionType.uia_click,
+    ActionType.uia_click_sequence,
+    ActionType.uia_type,
+    ActionType.mouse_click,
+    ActionType.double_click,
+    ActionType.right_click,
+    ActionType.middle_click,
+    ActionType.left_click_drag,
+    ActionType.keyboard_type,
+    ActionType.type_with_delay,
+}
 
 _TEXT_ONLY_DESKTOP_TOOL_EXCLUDES = _VISUAL_DESKTOP_ACTION_TYPES | {
     ActionType.ocr_image,
@@ -377,12 +408,14 @@ def _git_commit_file(file_path: str, workspace: Path, action_type: str, task_id:
         subject = f"[ai-computer] {action_type}: {os.path.basename(file_path)}"
         msg = f"{subject}\n\ntask: {task_id[:8]}" if task_id else subject
         commit = subprocess.run(
-            ["git", "commit", "-m", msg], cwd=str(ws), capture_output=True, text=True, check=False
+            ["git", "commit", "-m", msg], cwd=str(ws), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False
         )
         if commit.returncode != 0:
             return None
         rev = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ws), capture_output=True, text=True, check=False
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(ws), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", check=False
         )
         return rev.stdout.strip() or None
     except Exception:
@@ -999,7 +1032,7 @@ class SubTaskWorker:
                 if not granted:
                     raise RuntimeError(f"Permission denied for {denied_scope or 'requested scope'}")
 
-                if action.requires_approval or decision.requires_approval:
+                if self.agent_service._approval_gated(self.task_id, action, decision):
                     self.agent_service._prepare_approval_wait(self.task_id, action.id)
                     await self._emit("approval_required", {
                         "action_id": action.id,
@@ -1231,6 +1264,12 @@ class AgentService:
         self._task_environments: Dict[str, Dict[str, Any]] = {}
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._paused_tasks: set[str] = set()
+        # Tasks (e.g. voice/floating-bubble) that run fully autonomous — no
+        # approval prompts. The stop hotkey (Ctrl+Shift+X) is the safety net.
+        # The one exception is catastrophic, unrecoverable shell commands
+        # ("Hard-blocked" in safety.py), which still gate since a stop can't
+        # undo e.g. a disk format.
+        self._approval_bypass_tasks: set[str] = set()
         self._approvals: Dict[str, asyncio.Future] = {}
         self._approval_overrides: Dict[str, str] = {}
         self._permission_waits: Dict[str, asyncio.Future] = {}
@@ -1690,6 +1729,17 @@ class AgentService:
         is_auto_approve = mode in ("coding", "chat", "auto", "computer", "computer_isolated", "computer_use")
         if autonomy_level == "careful":
             is_auto_approve = False
+        # "autonomous" (floating-bubble / voice tasks): run with no approval
+        # prompts at all — the stop hotkey is the safety net. Catastrophic
+        # hard-blocked shell commands are the sole exception (see _approval_gated).
+        if autonomy_level == "autonomous":
+            is_auto_approve = True
+            self._approval_bypass_tasks.add(task_id)
+            # Autonomous = no dashboard popups (consent is handled at the Live voice
+            # layer per the product brief §7.3). The 'desktop' scope is otherwise
+            # explicit-grant-only, so without this an autonomous task that escalates a
+            # click would still hit the enable_desktop_control prompt. Pre-grant it (#4).
+            self.permissions.grant(task_id, "desktop")
         if mode in ("computer", "computer_isolated"):
             self.permissions.grant(task_id, "desktop")
 
@@ -1700,6 +1750,42 @@ class AgentService:
             "tier": getattr(provider, "model_tier", None),
             "local": str(provider_model).startswith("ollama/"),
         })
+
+        # ── Deterministic app-launch fast-path ──────────────────────────────
+        # "open / launch / switch to <known app>" is a bounded, predictable
+        # command — focus the window if it's already up, else launch it and wait
+        # for the window to actually appear. Running it directly (no LLM planner
+        # loop) is ~10x faster and can never mis-report "done" before the window
+        # exists. Anything that isn't a pure known-app launch returns None here
+        # and falls straight through to the normal agent.
+        if mode in ("computer", "auto"):
+            _launch = detect_app_launch_intent(goal)
+            if _launch:
+                _cmd, _title = _launch
+                self.permissions.grant(task_id, "desktop")
+                await self._emit(task_id, "status", {
+                    "message": f"Opening {_title}…", "elapsed_seconds": 0,
+                })
+                try:
+                    res = await asyncio.to_thread(tools.open_known_app, _cmd, _title)
+                except Exception as exc:
+                    res = ToolResult(ok=False, output=f"Couldn't open {_title}: {exc}")
+                now_iso = datetime.now(timezone.utc).isoformat()
+                if res.ok:
+                    self._finalize(task_id, "done", res.output or f"Opened {_title}.")
+                    await self._emit(task_id, "done", {
+                        "complete": True,
+                        "reason": f"Opened {_title}.",
+                        "finished_at": now_iso,
+                    })
+                else:
+                    self._finalize(task_id, "failed", res.output or f"Couldn't open {_title}.")
+                    await self._emit(task_id, "done", {
+                        "complete": False,
+                        "reason": res.output or f"Couldn't open {_title}.",
+                        "finished_at": now_iso,
+                    })
+                return
 
         # Build Skill Instructions
         skill_instructions = ""
@@ -2214,6 +2300,7 @@ class AgentService:
                         "WHEN TO USE TOOLS: only when you actually need to do something (create files, run code, search, etc.).\n"
                         "For questions and conversation, just answer — then finish.\n\n"
                         "DESKTOP: if you need to see or control the Windows desktop or an app, first call enable_desktop_control with a concrete reason. The desktop tools appear only after the user allows that request.\n\n"
+                        "READING FILES: to read, understand, or explain a file's contents (e.g. 'read gemini_live.py'), use read_file. If you were given only a name without a path, locate it first with file_glob (e.g. \"**/gemini_live.py\") then read_file the match. Do NOT open the file in Notepad/an editor or web-search for it — that's only for when the user wants to SEE or EDIT it on screen.\n\n"
                         "EFFICIENCY: Never call the same tool twice with the same args. Never read_file a file you just wrote. Never re-fetch a URL. After getting what you need, call finish.\n\n"
                         f"Available tools:\n{tool_guidance}\n\n"
                         "After each <observation>, decide your next step. Call finish when done."
@@ -2248,6 +2335,10 @@ class AgentService:
                 _recent_calls: list[tuple[str, str]] = []  # (action_type, args_key) last 3 calls
                 _write_cache: dict[str, str] = {}  # path → content of recently written files
                 _last_uia_failed = False
+                # Did the most recent UI-changing action fail / fail to verify? Used so a
+                # "finish" right after a broken click/type reports complete:false (#3).
+                _last_mutation_unverified = False
+                _unrecovered_desktop_failure = False
                 # Finish gate: successful desktop interactions seen so far, and
                 # whether we already bounced one unearned finish (bounce once,
                 # then trust the model — never deadlock the loop).
@@ -2406,6 +2497,7 @@ class AgentService:
                                         await self._emit(task_id, "status", {"message": f"Working on step {step+1}…"})
                                     if event["type"] == "thought":
                                         thought_text += event["content"]
+                                        await self._emit(task_id, "agent_delta", {"delta": event["content"]})
                                         _now = asyncio.get_running_loop().time()
                                         if _now - _last_reason_emit >= _REASON_MIN_INTERVAL:
                                             _last_reason_emit = _now
@@ -2425,6 +2517,13 @@ class AgentService:
                                     elif event["type"] == "tool_call":
                                         action_type = event["name"]
                                         args = event.get("args", {})
+                                        # Guard against a malformed tool payload (model
+                                        # emitted a string/list/null instead of an args
+                                        # object) — a non-dict here would crash every
+                                        # downstream args.get(...). Coerce to {} so the
+                                        # required-arg validator returns a clean message.
+                                        if not isinstance(args, dict):
+                                            args = {}
                                         thought_text = event.get("thought", thought_text)
                                         tool_call_id = event.get("id", f"call-{step}")
                                         # Always emit a finalized reasoning card to show real elapsed time
@@ -2476,6 +2575,7 @@ class AgentService:
                             )
                             import re
                             _got_first_chunk = False
+                            last_emitted_thought_len = 0
                             async for chunk in stream_gen:
                                 if not _got_first_chunk:
                                     _got_first_chunk = True
@@ -2493,9 +2593,17 @@ class AgentService:
                                         # No <thought> wrapper — stream all pre-action text (e.g. nemotron)
                                         thought_text = re.sub(r'<action.*', '', buffer, flags=re.DOTALL).strip()
                                     if thought_text:
+                                        delta_text = thought_text[last_emitted_thought_len:]
+                                        if delta_text:
+                                            await self._emit(task_id, "agent_delta", {"delta": delta_text})
+                                            last_emitted_thought_len = len(thought_text)
                                         await self._emit(task_id, "reasoning", {"stage": f"Step {step+1}", "summary": "Thinking...", "detail": thought_text, "live": True, "elapsed_seconds": _step_elapsed()})
                                 if "</thought>" in buffer and not in_action:
                                     thought_text = buffer.split("<thought>")[1].split("</thought>")[0]
+                                    delta_text = thought_text[last_emitted_thought_len:]
+                                    if delta_text:
+                                        await self._emit(task_id, "agent_delta", {"delta": delta_text})
+                                        last_emitted_thought_len = len(thought_text)
                                     await self._emit(task_id, "reasoning", {"stage": f"Step {step+1}", "summary": thought_text[:50]+"...", "detail": thought_text, "live": False, "elapsed_seconds": _step_elapsed()})
                                 if "<delegate" in buffer and "</delegate>" in buffer and not in_action:
                                     model_match = re.search(r'<delegate\s+model="([^"]+)">', buffer)
@@ -2562,6 +2670,30 @@ class AgentService:
                         return
                     
                     if not action_type:
+                        # Desktop evidence gate: a desktop task that produced ZERO
+                        # interaction can't be "done" just because the model stopped
+                        # emitting actions — that's the false "Done." with no actions.
+                        # Bounce ONCE (like the finish gate) so a text-only reply can't
+                        # false-complete a task that did nothing; if the model insists,
+                        # let it through (it may legitimately be saying it can't).
+                        if (_is_computer_desktop and _desktop_evidence == 0
+                                and not _finish_bounced):
+                            _finish_bounced = True
+                            _gate_obs = (
+                                "[not done] You haven't interacted with any app yet "
+                                "(no click/type/keyboard action), so the task is NOT "
+                                "complete — don't say it's done. Actually do it using the "
+                                "visible control names (uia_click / uia_type / "
+                                "keyboard_type), verify the result, then finish stating "
+                                "what you observed. If the request genuinely needs no "
+                                "desktop action, say that explicitly instead."
+                            )
+                            messages.append({"role": "assistant", "content": thought_text or "(no action)"})
+                            messages.append({"role": "user", "content": f"<observation>\n{_gate_obs}\n</observation>"})
+                            await self._emit(task_id, "status", {
+                                "message": "No desktop interaction yet — asking the agent to actually do the task before finishing.",
+                            })
+                            continue
                         # Model gave a text-only response — that IS the answer.
                         # Emit as a finalized response card only (no duplicate live card).
                         if thought_text and thought_text.strip():
@@ -2872,7 +3004,7 @@ class AgentService:
                     # different code path (hierarchical plan). The streaming loop here runs only when
                     # the hierarchical planner is not used or falls back — no double-evaluation occurs.
                     decision = self.safety.evaluate(act, safe_mode=not is_auto_approve)
-                    if act.requires_approval or decision.requires_approval:
+                    if self._approval_gated(task_id, act, decision):
                         self._prepare_approval_wait(task_id, act.id)
                         await self._emit(task_id, "approval_required", {
                             "action_id": act.id,
@@ -2986,6 +3118,18 @@ class AgentService:
                         _last_uia_failed = not res.ok
                     elif act.type in _VISUAL_DESKTOP_ACTION_TYPES:
                         _last_uia_failed = False
+                    # Track whether the latest UI-changing action actually landed: a
+                    # failure, or an ok=True that post-verification contradicted
+                    # (verified is False), leaves us "unverified". A later successful
+                    # mutation clears it (the model recovered).
+                    if act.type in _DESKTOP_MUTATING_ACTION_TYPES:
+                        _res_data = getattr(res, "data", None)
+                        _verified = _res_data.get("verified") if isinstance(_res_data, dict) else None
+                        _last_mutation_unverified = (not res.ok) or (_verified is False)
+                        if (not res.ok) or (_verified is False):
+                            _unrecovered_desktop_failure = True
+                        elif res.ok and _verified is not False:
+                            _unrecovered_desktop_failure = False
                     
                     # ── Populate write cache so subsequent reads are free ──
                     if act.type == AT.write_file and res.ok:
@@ -3106,6 +3250,21 @@ class AgentService:
                     await self._emit(task_id, "usage_update", {"total_tokens": provider.total_tokens})
                     
                     if act.type == AT.finish:
+                        # Honest completion (#3): if the last UI-changing action failed
+                        # or its verification was contradicted, don't claim success — the
+                        # model is finishing over a broken step. Report it so Live/the
+                        # dashboard say what really happened instead of a false "done".
+                        if _last_mutation_unverified or _unrecovered_desktop_failure:
+                            honest = (res.output or "").strip()
+                            reason = (honest + " " if honest else "") + (
+                                "(Note: the last action didn't verify — the change may "
+                                "not have taken effect.)"
+                            )
+                            self._finalize(task_id, "failed", reason)
+                            await self._emit(task_id, "done", {"complete": False, "reason": reason, "finished_at": datetime.now(timezone.utc).isoformat()})
+                            await asyncio.to_thread(self.memory.summarize_session, task_id, goal, False, reason, mode)
+                            asyncio.create_task(asyncio.to_thread(self.memory.maybe_auto_consolidate))
+                            return
                         self._finalize(task_id, "done", res.output)
                         await self._emit(task_id, "done", {"complete": True, "reason": res.output, "finished_at": datetime.now(timezone.utc).isoformat()})
                         await asyncio.to_thread(self.memory.summarize_session, task_id, goal, True, res.output, mode)
@@ -3165,6 +3324,7 @@ class AgentService:
     def _finalize(self, task_id: str, status: str, reason: str = ""):
         if self._on_task_complete: self._on_task_complete(task_id, status, reason)
         self._paused_tasks.discard(task_id)
+        self._approval_bypass_tasks.discard(task_id)
         self.permissions.clear(task_id)
         self._approvals.pop(task_id, None)
         self._permission_waits.pop(task_id, None)
@@ -3175,6 +3335,17 @@ class AgentService:
 
     def _prepare_approval_wait(self, task_id: str, action_id: str) -> asyncio.Future:
         return self._approvals.setdefault(f"{task_id}:{action_id}", asyncio.Future())
+
+    def _approval_gated(self, task_id: str, action, decision) -> bool:
+        """Whether an action must wait for user approval. Autonomous tasks (the
+        floating-bubble flow) skip every prompt — except catastrophic,
+        unrecoverable shell commands flagged 'Hard-blocked' by safety.py, which
+        a stop hotkey can't undo."""
+        if not (getattr(action, "requires_approval", False) or decision.requires_approval):
+            return False
+        if task_id in self._approval_bypass_tasks:
+            return str(decision.reason or "").startswith("Hard-blocked")
+        return True
 
     async def _wait_for_approval(self, task_id: str, action_id: str) -> bool:
         fut = self._prepare_approval_wait(task_id, action_id)

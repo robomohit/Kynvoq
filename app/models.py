@@ -159,6 +159,8 @@ class TaskRecord(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     finished_at: Optional[str] = None
     goal: Optional[str] = None
+    user_goal: Optional[str] = None
+    prompt_goal: Optional[str] = None
     reason: Optional[str] = None
     model: Optional[str] = None
     mode: Optional[str] = None
