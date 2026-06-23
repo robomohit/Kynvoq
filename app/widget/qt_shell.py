@@ -1610,17 +1610,13 @@ def main(port: int = 8000) -> int:
         def stop(self):
             self._running = False
 
-    # ── animated voice waveform — soft rounded bars that breathe while the mic
-    #    is live (the same look used on the first-run setup screen) ──
+    # ── animated dot-matrix waveform ──
     class Waveform(QWidget):
-        BARS = 18
+        COLS, ROWS = 14, 5
 
         def __init__(self) -> None:
             super().__init__()
-            self.setFixedHeight(26)
-            self.setMinimumWidth(60)
-            self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            self.setFixedSize(78, 18)
             self._active = False
             self._t = 0.0
             self._timer = QTimer(self)
@@ -1629,13 +1625,13 @@ def main(port: int = 8000) -> int:
         def setActive(self, on: bool) -> None:
             self._active = on
             if on and not self._timer.isActive():
-                self._timer.start(33)
+                self._timer.start(60)
             elif not on:
                 self._timer.stop()
                 self.update()
 
         def _tick(self) -> None:
-            self._t += 0.16
+            self._t += 0.18
             self.update()
 
         def paintEvent(self, _e) -> None:
@@ -1643,25 +1639,23 @@ def main(port: int = 8000) -> int:
             p = QPainter(self)
             p.setRenderHint(QPainter.Antialiasing)
             w, h = self.width(), self.height()
-            n = self.BARS
-            bw = 3.0
-            slot = w / n
-            cy = h / 2.0
+            cw, rh = w / self.COLS, h / self.ROWS
+            dot = min(cw, rh) * 0.42
             col = QColor(ACCENT)
-            for i in range(n):
-                env = 0.35 + 0.65 * math.sin((i + 0.5) / n * math.pi)   # tall in middle
+            for c in range(self.COLS):
                 if self._active:
-                    amp  = 0.5 + 0.5 * math.sin(self._t + i * 0.55)
-                    frac = 0.18 + 0.82 * env * amp
-                    col.setAlphaF(0.55 + 0.40 * env * amp)
+                    amp = (math.sin(self._t + c * 0.6) + 1) / 2
+                    lit = 1 + round(amp * (self.ROWS - 1))
                 else:
-                    frac = 0.14
-                    col.setAlphaF(0.30)
-                bh = max(3.0, frac * (h - 4))
-                bx = i * slot + slot / 2.0 - bw / 2.0
-                path = QPainterPath()
-                path.addRoundedRect(bx, cy - bh / 2.0, bw, bh, bw / 2.0, bw / 2.0)
-                p.fillPath(path, col)
+                    lit = 1
+                for r in range(self.ROWS):
+                    on = r >= self.ROWS - lit
+                    col.setAlphaF(0.95 if (on and self._active) else (0.4 if on else 0.12))
+                    p.setBrush(col)
+                    p.setPen(Qt.NoPen)
+                    cx = c * cw + cw / 2
+                    cy = h - (r + 0.5) * rh
+                    p.drawEllipse(QPoint(int(cx), int(cy)), int(dot), int(dot))
             p.end()
 
     # ── Effort slider (draggable, smooth, rainbow-at-Max) ──
@@ -2105,12 +2099,6 @@ def main(port: int = 8000) -> int:
                 "QLineEdit::placeholder{ color: rgba(60,66,78,160); }"
                 % ACCENT)
             pill_row.addWidget(self.input, 1)
-
-            # Animated voice waveform — fills the text area while the mic is live
-            # (hidden otherwise), the same look as the first-run setup screen.
-            self.voice_wave = Waveform()
-            self.voice_wave.hide()
-            pill_row.addWidget(self.voice_wave, 1)
 
             self.status = _plain_label("")
             self.status.setFont(QFont("Segoe UI", 12))
@@ -3014,10 +3002,6 @@ def main(port: int = 8000) -> int:
             self._listening = True
             self.mic_btn.setChecked(True)
             self.top_widget_mic.setChecked(True)
-            # Swap the text field for the live voice waveform.
-            self.input.hide()
-            self.voice_wave.show()
-            self.voice_wave.setActive(True)
             self.status.setText("Listening…")
             self.status.show()
             self._set_capsule_state("listening", "Listening")
@@ -3037,10 +3021,6 @@ def main(port: int = 8000) -> int:
             self._listening = False
             self.mic_btn.setChecked(False)
             self.top_widget_mic.setChecked(False)
-            # Restore the text field; stop the waveform.
-            self.voice_wave.setActive(False)
-            self.voice_wave.hide()
-            self.input.show()
             self.status.hide()
             text = (text or "").strip()
             if not text:
