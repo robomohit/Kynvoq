@@ -249,11 +249,6 @@ def _build():  # imports deferred so importing this module never needs Qt
             self._msg_alpha = 0.0
             self._msg_slide = 10.0
 
-            # The blue mouse pointer's periodic "click" ripple (Orynn lives under
-            # your cursor, so it clicks). -1 = idle, else 0..1 ripple progress.
-            self._click_phase = -1.0
-            self._next_click  = rng.uniform(1.6, 3.0)
-
             # Drifting aurora blobs (x, y, radius, drift speed, phase).
             self._aurora = [
                 [rng.uniform(60, 340), rng.uniform(120, 460),
@@ -345,17 +340,6 @@ def _build():  # imports deferred so importing this module never needs Qt
                         m[1] = 650.0
                         m[0] = _rand.uniform(0, 400)
 
-                # Pointer click ripple cycle.
-                if self._click_phase >= 0.0:
-                    self._click_phase += DT / 0.62
-                    if self._click_phase >= 1.0:
-                        self._click_phase = -1.0
-                        self._next_click = _rand.uniform(2.4, 4.2)
-                else:
-                    self._next_click -= DT
-                    if self._next_click <= 0.0:
-                        self._click_phase = 0.0
-
                 self._render_to_pixmap()
                 self.update()
             except Exception as e:
@@ -369,7 +353,7 @@ def _build():  # imports deferred so importing this module never needs Qt
             p.drawPixmap(0, 0, self._pixmap)
 
         def _render_to_pixmap(self):
-            from PySide6.QtGui import QLinearGradient, QRadialGradient, QPixmap
+            from PySide6.QtGui import QLinearGradient, QRadialGradient, QPixmap, QFontMetrics
             import math
 
             w, h = self.width(), self.height()
@@ -426,115 +410,28 @@ def _build():  # imports deferred so importing this module never needs Qt
                 p.setPen(Qt.NoPen)
                 p.drawEllipse(int(m[0] - m[3] / 2), int(m[1] - m[3] / 2), int(m[3]), int(m[3]))
 
-            # --- The blue mouse pointer (Orynn lives under your cursor) ---
-            breath = 0.5 + 0.5 * math.sin(t * 1.1)
-            S = 2.7                      # pointer scale
-            ARROW_W = 10.0 * S
-            ARROW_H = 18.5 * S
-
-            # Gentle idle drift so the pointer feels alive but calm.
-            drift_x = math.sin(t * 0.7) * 5.0
-            drift_y = math.cos(t * 0.9) * 4.0
-
-            # A small press-dip right as a click fires.
-            press = 1.0
-            if 0.0 <= self._click_phase < 0.16:
-                press = 0.90 + 0.10 * (self._click_phase / 0.16)
-
-            tipx = cx - ARROW_W / 2 + drift_x
-            tipy = h * 0.38 - ARROW_H / 2 + drift_y
-            cursor_bottom = tipy + ARROW_H
-
-            # Soft glow behind the pointer.
-            gcx, gcy = tipx + 5 * S, tipy + 8 * S
-            gr = 44 + 6 * breath
-            glowp = QRadialGradient(gcx, gcy, gr)
-            glowp.setColorAt(0.0, QColor(c1.red(), c1.green(), c1.blue(), int(64 + 26 * breath)))
-            glowp.setColorAt(0.5, QColor(c1.red(), c1.green(), c1.blue(), 20))
-            glowp.setColorAt(1.0, QColor(0, 0, 0, 0))
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(glowp))
-            p.drawEllipse(int(gcx - gr), int(gcy - gr), int(gr * 2), int(gr * 2))
-
-            # Click ripple — concentric rings from the pointer tip.
-            if self._click_phase >= 0.0:
-                p.setBrush(Qt.NoBrush)
-                for k in (0.0, 0.28):
-                    ph = self._click_phase - k
-                    if 0.0 <= ph <= 1.0:
-                        rr = 5 + ph * 30
-                        ra = int((1.0 - ph) ** 2 * 130)
-                        if ra > 0:
-                            p.setPen(QPen(QColor(c3.red(), c3.green(), c3.blue(), ra), 2.0))
-                            p.drawEllipse(int(tipx - rr), int(tipy - rr), int(rr * 2), int(rr * 2))
-
-            # The arrow itself: clean blue fill + crisp light edge.
-            Sp = S * press
-            pts = [(0, 0), (0, 16), (3.5, 12.5), (6.2, 18.5),
-                   (8.4, 17.4), (5.7, 11.4), (10, 11.2)]
-            arrow = QPainterPath()
-            arrow.moveTo(tipx + pts[0][0] * Sp, tipy + pts[0][1] * Sp)
-            for px, py in pts[1:]:
-                arrow.lineTo(tipx + px * Sp, tipy + py * Sp)
-            arrow.closeSubpath()
-
-            afill = QLinearGradient(tipx, tipy, tipx, tipy + 18.5 * Sp)
-            afill.setColorAt(0.0, QColor(min(255, c1.red() + 55), min(255, c1.green() + 48), 255, 255))
-            afill.setColorAt(1.0, QColor(c1.red(), c1.green(), c1.blue(), 255))
-            p.fillPath(arrow, QBrush(afill))
-
-            edge = QPen(QColor(228, 238, 255, 235), 1.4)
-            edge.setJoinStyle(Qt.RoundJoin)
-            p.setPen(edge)
-            p.setBrush(Qt.NoBrush)
-            p.drawPath(arrow)
-
-            # --- Agentic command input: a clean composer pill with a send button ---
-            BOX_MX = 36
+            # --- Voice pill: a soft glass capsule holding a dot-matrix waveform
+            # and the spoken phrase. Voice-first, so there is no send button. ---
+            BOX_MX = 44
             box_x  = float(BOX_MX)
             box_w  = float(w - 2 * BOX_MX)
-            box_h  = 54.0
-            box_y  = float(int(cursor_bottom + 34))
+            box_h  = 50.0
+            box_y  = float(int(h * 0.46 - box_h / 2))
             radius = box_h / 2.0
+            row_cy = box_y + box_h / 2.0
 
             box_path = QPainterPath()
             box_path.addRoundedRect(box_x, box_y, box_w, box_h, radius, radius)
-
-            # Subtle glass fill + a single hairline border. No blooms, no pulsing.
             fill = QLinearGradient(0, box_y, 0, box_y + box_h)
-            fill.setColorAt(0.0, QColor(255, 255, 255, 15))
-            fill.setColorAt(1.0, QColor(255, 255, 255, 7))
+            fill.setColorAt(0.0, QColor(255, 255, 255, 13))
+            fill.setColorAt(1.0, QColor(255, 255, 255, 6))
             p.fillPath(box_path, QBrush(fill))
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(255, 255, 255, 34), 1.0))
+            p.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
             p.drawPath(box_path)
 
-            # Send button — a real submit affordance so it reads as an input.
-            btn_r  = 17.0
-            btn_cx = box_x + box_w - 13.0 - btn_r
-            btn_cy = box_y + box_h / 2.0
-            p.setPen(Qt.NoPen)
-            p.setBrush(QBrush(QColor(c1.red(), c1.green(), c1.blue(), 240)))
-            p.drawEllipse(int(btn_cx - btn_r), int(btn_cy - btn_r), int(btn_r * 2), int(btn_r * 2))
-            arrow = QPainterPath()
-            arrow.moveTo(btn_cx, btn_cy + 6)
-            arrow.lineTo(btn_cx, btn_cy - 6)
-            arrow.moveTo(btn_cx - 5, btn_cy - 1)
-            arrow.lineTo(btn_cx, btn_cy - 6)
-            arrow.lineTo(btn_cx + 5, btn_cy - 1)
-            apen = QPen(QColor(255, 255, 255, 240), 2.0)
-            apen.setCapStyle(Qt.RoundCap)
-            apen.setJoinStyle(Qt.RoundJoin)
-            p.setPen(apen)
-            p.setBrush(Qt.NoBrush)
-            p.drawPath(arrow)
-
-            # Rotating phrase — left-aligned like a real composer, cross-fading.
             msg = self._messages[self._msg_idx]
             ta  = int(max(0.0, min(1.0, self._msg_alpha)) * 255)
-            text_x = int(box_x + 22)
-            text_w = int(btn_cx - btn_r - 12 - text_x)
-            ty     = int(box_y + box_h / 2.0 - 11 + self._msg_slide * 0.5)
 
             font = p.font()
             font.setPointSize(12)
@@ -542,9 +439,34 @@ def _build():  # imports deferred so importing this module never needs Qt
             font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 0.2)
             p.setFont(font)
 
-            if ta > 0 and text_w > 40:
-                p.setPen(QColor(210, 220, 238, ta))
-                p.drawText(QRect(text_x, ty, text_w, 22),
+            fm = QFontMetrics(font)
+            text_w_px = fm.horizontalAdvance(msg)
+
+            # Mini voice waveform (mirrors the capsule's dot-matrix bars).
+            WF_COLS = 5
+            WF_GAP  = 6.0
+            WF_W    = (WF_COLS - 1) * WF_GAP
+            GAP_TW  = 16.0          # gap between waveform and text
+            group_w = WF_W + GAP_TW + text_w_px
+            gx0     = cx - group_w / 2.0
+
+            # Waveform dots/bars — animated, soft cyan, gently breathing.
+            for i in range(WF_COLS):
+                env = math.sin((i / (WF_COLS - 1)) * math.pi)        # tallest in middle
+                amp = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 3.4 + i * 0.9))
+                bh  = 5 + 13 * env * amp
+                bx  = gx0 + i * WF_GAP
+                ba  = int(150 + 90 * env * amp)
+                bar = QPainterPath()
+                bar.addRoundedRect(bx - 1.4, row_cy - bh / 2, 2.8, bh, 1.4, 1.4)
+                p.fillPath(bar, QBrush(QColor(c3.red(), c3.green(), c3.blue(), ba)))
+
+            # The spoken phrase, cross-fading next to the waveform.
+            if ta > 0:
+                text_x = int(gx0 + WF_W + GAP_TW)
+                ty     = int(row_cy - 11 + self._msg_slide * 0.4)
+                p.setPen(QColor(222, 230, 244, ta))
+                p.drawText(QRect(text_x, ty, text_w_px + 6, 22),
                            Qt.AlignVCenter | Qt.AlignLeft, msg)
 
             # --- Vignette for depth (soft) ---
