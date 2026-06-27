@@ -84,7 +84,9 @@ async def _lifespan(application):
     async def _queue_watchdog_loop():
         """Keep the task queue self-healing: periodically reap stuck/zombie/runaway
         tasks and re-drain queued work, so a hung task can never permanently wedge
-        the queue (which would make every future task hang forever as 'queued')."""
+        the queue (which would make every future task hang forever as 'queued').
+        Also keep the local planner proxy alive — if it dies, multi-step desktop
+        tasks would silently fail over to a rate-limited public model."""
         while True:
             await asyncio.sleep(_WATCHDOG_INTERVAL)
             try:
@@ -92,8 +94,26 @@ async def _lifespan(application):
                 _start_next_queued_task()
             except Exception as exc:
                 _lifespan_log.warning("queue watchdog tick failed: %s", exc)
+            try:
+                from .proxy_supervisor import ensure_proxy_running
+
+                ensure_proxy_running(wait=0.0)
+            except Exception as exc:
+                _lifespan_log.warning("proxy supervisor tick failed: %s", exc)
 
     global _telegram_task, _discord_task, _automation_task, _session_prune_task, _queue_watchdog_task
+    # Ensure the local planner proxy is up before tasks can be submitted, so the very
+    # first multi-step desktop task has a working free model (not a 429 fallback).
+    try:
+        from .proxy_supervisor import ensure_proxy_running
+
+        if not ensure_proxy_running():
+            _lifespan_log.warning(
+                "Planner proxy (127.0.0.1:8080) is configured but not reachable; "
+                "multi-step desktop tasks may fall back to a rate-limited model."
+            )
+    except Exception as exc:
+        _lifespan_log.warning("proxy supervisor startup failed: %s", exc)
     await _init_mcp()
     def _external_submit(*, goal: str, task_id: Optional[str] = None, source: str = "external") -> TaskRecord:
         return _submit_managed_task(goal=goal, task_id=task_id, source=source)

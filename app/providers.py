@@ -1472,6 +1472,9 @@ class PlannerProvider:
         self._openrouter_key: Optional[str] = os.environ.get("OPENROUTER_API_KEY")
         self._groq_key: Optional[str] = os.environ.get("GROQ_API_KEY")
         self._ollama_base_url: str = os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+        self._openrouter_base_url: str = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1/chat/completions").rstrip("/")
+        self._real_openrouter_url = "https://openrouter.ai/api/v1/chat/completions"
+        self._proxy_fallback_model = "openai/gpt-oss-120b:free"
         self._total_input_tokens: int = 0
         self._total_output_tokens: int = 0
         self.thinking_budget: str = "off"
@@ -1683,22 +1686,33 @@ class PlannerProvider:
                 payload = {"model": current_model, "messages": messages}
 
                 is_last_model = (current_model == models_to_try[-1])
-                try:
-                    resp = _execute_with_retry(
-                        lambda: self._http_client.post(
-                            "https://openrouter.ai/api/v1/chat/completions",
-                            headers={"Authorization": f"Bearer {self._openrouter_key}"},
-                            json=payload,
-                        ),
-                        log_prefix=f"OpenRouter call ({current_model})",
-                        max_attempts=3 if is_last_model else 1
-                    )
-                    resp_json = resp.json()
-                    if "choices" not in resp_json:
-                        raise RuntimeError(f"Unexpected OpenRouter response: {str(resp_json)[:200]}")
-                    return _extract_chat_message_text(resp_json)
-                except (httpx.HTTPStatusError, httpx.TransportError, RuntimeError) as e:
-                    last_err = e
+                _chat_fallback_tried = False
+                _chat_url = self._openrouter_base_url
+                for _chat_attempt in range(2):
+                    try:
+                        resp = _execute_with_retry(
+                            lambda u=_chat_url: self._http_client.post(
+                                u,
+                                headers={"Authorization": f"Bearer {self._openrouter_key}"},
+                                json=payload,
+                            ),
+                            log_prefix=f"OpenRouter call ({current_model})",
+                            max_attempts=3 if is_last_model else 1
+                        )
+                        resp_json = resp.json()
+                        if "choices" not in resp_json:
+                            raise RuntimeError(f"Unexpected OpenRouter response: {str(resp_json)[:200]}")
+                        return _extract_chat_message_text(resp_json)
+                    except (httpx.HTTPStatusError, httpx.TransportError, RuntimeError, OSError) as e:
+                        # Proxy fallback: if using a local proxy, retry with real OpenRouter
+                        _is_proxy = "127.0.0.1" in _chat_url or "localhost" in _chat_url
+                        if _is_proxy and not _chat_fallback_tried and _chat_attempt == 0:
+                            _chat_fallback_tried = True
+                            _chat_url = self._real_openrouter_url
+                            payload["model"] = self._proxy_fallback_model
+                            print(f"[proxy] Chat endpoint failed, falling back to {self._proxy_fallback_model} via OpenRouter", flush=True)
+                            continue
+                        last_err = e
                     if not is_last_model:
                         # Fail over to next model
                         continue
@@ -1985,12 +1999,15 @@ class PlannerProvider:
             model = self.model.replace("groq/", "")
             models_to_try = [model]
         else: # Default OpenRouter
-            url = "https://openrouter.ai/api/v1/chat/completions"
             key = self._openrouter_key
+            url = self._openrouter_base_url
             models_to_try = self._openrouter_models_to_try(
                 self.model.replace("openrouter/", ""), screenshot_b64
             )
             model = models_to_try[0]
+            # Proxy fallback: if URL points to a local proxy and it fails,
+            # silently retry with the real OpenRouter + a free desktop model.
+            _use_proxy_fallback = "127.0.0.1" in self._openrouter_base_url or "localhost" in self._openrouter_base_url
 
         if not self._is_openai() and not self._is_groq():
             # model already set above
@@ -2052,6 +2069,7 @@ class PlannerProvider:
             # When OpenRouter already has a model fallback chain, fail over quickly
             # instead of spending a full backoff ladder on a rate-limited first choice.
             _retry_delays = [] if len(models_to_try) > 1 else [5, 15, 30]
+            _fallback_tried = False
             for _attempt, _delay in enumerate([0] + _retry_delays):
                 if _delay:
                     await asyncio.sleep(_delay)
@@ -2086,12 +2104,21 @@ class PlannerProvider:
                                     except json.JSONDecodeError:
                                         pass
                     return
-                except httpx.HTTPStatusError as e:
-                    last_err = e
-                    if e.response.status_code in (402, 429) and _attempt < len(_retry_delays):
-                        continue
-                    if e.response.status_code in (402, 429):
-                        break  # move to next model fallback
+                except (httpx.HTTPStatusError, httpx.TransportError, OSError) as e:
+                    # Proxy fallback: if using a local proxy and it fails without
+                    # streaming any content, retry with real OpenRouter + free model.
+                    if _use_proxy_fallback and not _fallback_tried:
+                        _fallback_tried = True
+                        url = self._real_openrouter_url
+                        payload["model"] = self._proxy_fallback_model
+                        print(f"[proxy] Zen endpoint failed, falling back to {self._proxy_fallback_model} via OpenRouter", flush=True)
+                        continue  # retry with real URL
+                    if isinstance(e, httpx.HTTPStatusError):
+                        last_err = e
+                        if e.response.status_code in (402, 429) and _attempt < len(_retry_delays):
+                            continue
+                        if e.response.status_code in (402, 429):
+                            break  # move to next model fallback
                     raise
 
         if last_err:
@@ -2222,7 +2249,7 @@ class PlannerProvider:
             model = self.model.replace("groq/", "")
             models_to_try = [model]
         else:
-            url = "https://openrouter.ai/api/v1/chat/completions"
+            url = self._openrouter_base_url
             key = self._openrouter_key
             models_to_try = self._openrouter_models_to_try(
                 self.model.replace("openrouter/", ""), screenshot_b64

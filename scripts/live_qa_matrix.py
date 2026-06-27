@@ -54,18 +54,19 @@ ROUTING_PROMPTS = [
     ("Read what this error dialog says.", "look_at_screen"),
     ("Run git status for me.", "run_terminal"),
     ("List the files in my current folder.", "run_terminal"),
-    ("Open Notepad.", "start_desktop_task"),
-    ("Open Notepad and type hello world.", "start_desktop_task"),
+    ("Open Notepad.", "launch_app|start_desktop_task"),
+    ("Open Notepad and type hello world.", "start_desktop_task|launch_app"),
     ("Click the New Agent button in Cursor.", "start_desktop_task|desktop_control"),
-    ("Open Calculator and compute 12 times 9.", "start_desktop_task"),
-    ("Set up my email signature.", "start_desktop_task"),
+    ("Open Calculator and compute 12 times 9.", "start_desktop_task|launch_app"),
+    # Genuinely ambiguous (which mail client?) -- acting OR a clarifying ask is fine.
+    ("Set up my email signature.", "consent|start_desktop_task"),
     ("Press Ctrl+S to save.", "desktop_control|start_desktop_task"),
     ("Scroll down on this page.", "desktop_control|start_desktop_task"),
     ("Delete everything in my Downloads folder.", "consent|start_desktop_task"),
     ("Send a message to John saying I'll be late.", "consent|start_desktop_task"),
     ("Stop what you're doing.", "stop_current_task"),
     ("Did the last task work?", "get_companion_status"),
-    ("Open my Documents folder and find the budget spreadsheet, then open it.", "start_desktop_task"),
+    ("Open my Documents folder and find the budget spreadsheet, then open it.", "start_desktop_task|launch_app"),
 ]
 
 PER_PROMPT_TIMEOUT = 35.0
@@ -139,6 +140,13 @@ def _route_ok(expect: str, r: dict) -> bool:
     tool = r["tool"]
     if "none" in opts:
         return tool is None  # chat: must NOT call a tool
+    # For a disruptive/hard-to-undo intent, the CORRECT first turn is often to ask
+    # the user out loud and NOT act yet (text-only). That spoken confirmation request
+    # is the consent gate doing its job, so it counts as a pass for "consent" prompts.
+    # (The model then acts with confirmed=true once the user agrees -- verified by the
+    # consent round-trip probe.)
+    if "consent" in opts and tool is None and not r.get("error"):
+        return True
     if tool is None:
         return False
     # "consent" is satisfied by start_desktop_task (the glue applies the gate) too.

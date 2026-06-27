@@ -36,7 +36,14 @@ from app.widget.gemini_live import (  # noqa: E402
 from app.widget.textbox_overlay import build_task_payload  # noqa: E402
 
 PORT = 8000
-REQUEST = "Use your desktop tool to open the Notepad app on my Windows computer. Just open it."
+# NOTE: a *pure* "open Notepad" is now routed by the model to the faster local
+# launch_app tool (verified in scripts/live_chain_e2e.py), which never touches the
+# backend task queue this script watches. To keep exercising the backend
+# start_desktop_task chain, we ask for a multi-step open-and-type goal (which the
+# model correctly routes to start_desktop_task). For the launch_app fast path,
+# use live_chain_e2e.py instead.
+REQUEST = ("Use your desktop tool to open Notepad on my Windows computer and type "
+           "the words 'orynn live check' into it.")
 HARD_CAP_SECONDS = 90.0
 TERMINAL = {"completed", "complete", "done", "succeeded", "success", "finished",
             "error", "failed", "cancelled", "canceled", "killed", "stopped", "timeout"}
@@ -127,6 +134,10 @@ async def drive_gemini(client: Client) -> str | None:
             tc = getattr(message, "tool_call", None)
             calls = getattr(tc, "function_calls", None) if tc else None
             if not calls:
+                sc = getattr(message, "server_content", None)
+                if sc and getattr(sc, "turn_complete", False):
+                    print("(model finished its turn without calling a desktop tool)")
+                    return None
                 continue
             for call in calls:
                 name = str(getattr(call, "name", "") or "")

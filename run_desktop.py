@@ -244,6 +244,18 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[Desktop] Setup window unavailable ({exc}); continuing.", file=sys.stderr)
 
+    # 0. Auto-start the local planner proxy (deepseek_proxy.py) if the planner is
+    #    configured to use it and it isn't already running. Shared, self-healing
+    #    logic lives in app.proxy_supervisor (the backend keeps it alive too).
+    try:
+        from app.proxy_supervisor import ensure_proxy_running
+
+        if not ensure_proxy_running():
+            print("[Desktop] Planner proxy configured but couldn't start; "
+                  "multi-step desktop tasks may use a rate-limited fallback model.")
+    except Exception as _exc:
+        print(f"[Desktop] Proxy supervisor unavailable: {_exc}")
+
     # 1. Start the backend server in a background thread, unless one is already
     #    running (e.g. the capsule launched us to open a second native window).
     port = _start_backend(PORT)

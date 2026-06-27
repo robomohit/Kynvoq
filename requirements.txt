@@ -1,4 +1,11 @@
 fastapi==0.116.1
+# Pin starlette: fastapi 0.116.1 requires <0.48.0, but google-genai/mcp can pull
+# starlette 1.x which removed the on_startup kwarg fastapi passes -> backend won't
+# even import. Keep these two pinned together so the whole app stays bootable.
+starlette==0.47.2
+# sse-starlette 3.x demands starlette>=0.49.1 (conflicts with the pin above); 2.1.3
+# satisfies mcp's >=1.6.1 and works on starlette 0.47.x.
+sse-starlette==2.1.3
 uvicorn==0.35.0
 pydantic==2.11.7
 python-multipart==0.0.20
