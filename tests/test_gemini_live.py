@@ -67,6 +67,9 @@ def test_function_declarations_cover_desktop_tools():
         "run_workflow",
         "save_workflow",
         "forget_workflow",
+        "set_timer",
+        "get_clipboard",
+        "set_clipboard",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")
@@ -3391,3 +3394,254 @@ def test_live_autostart_enabled_env(monkeypatch):
     assert gl.live_autostart_enabled() is False  # off by default (privacy + quota)
     monkeypatch.setenv("ORYNN_LIVE_AUTOSTART", "1")
     assert gl.live_autostart_enabled() is True
+
+
+# ── set_timer / get_clipboard / set_clipboard ────────────────────────────────
+
+def test_set_timer_fires_send_task_update():
+    """Timer fires send_task_update on the companion after the countdown."""
+    import time
+
+    c = _controller()
+    spoken: list[str] = []
+
+    class FakeCompanion:
+        def send_task_update(self, text: str) -> None:
+            spoken.append(text)
+
+    c._live = FakeCompanion()
+    res = c._live_tool("set_timer", {"seconds": 0.05, "label": "test alert"})
+    assert res["ok"] is True
+    assert res["seconds"] == 0.05
+    assert "test alert" in res["label"]
+    # Give the background thread time to fire.
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not spoken:
+        time.sleep(0.02)
+    assert spoken == ["test alert"], f"alert not spoken within 2s: {spoken}"
+
+
+def test_set_timer_zero_seconds_rejected():
+    c = _controller()
+    res = c._live_tool("set_timer", {"seconds": 0})
+    assert res["ok"] is False
+    assert "positive" in res["message"].lower()
+
+
+def test_set_timer_no_seconds_rejected():
+    c = _controller()
+    res = c._live_tool("set_timer", {"label": "no seconds given"})
+    assert res["ok"] is False
+
+
+def test_set_timer_exceeds_24h_rejected():
+    c = _controller()
+    res = c._live_tool("set_timer", {"seconds": 86_401})
+    assert res["ok"] is False
+    assert "24" in res["message"]
+
+
+def test_set_timer_default_label():
+    """When no label is given the timer still fires with a default message."""
+    import time
+
+    c = _controller()
+    spoken: list[str] = []
+
+    class FakeCompanion:
+        def send_task_update(self, text: str) -> None:
+            spoken.append(text)
+
+    c._live = FakeCompanion()
+    res = c._live_tool("set_timer", {"seconds": 0.05})
+    assert res["ok"] is True
+    deadline = time.time() + 2.0
+    while time.time() < deadline and not spoken:
+        time.sleep(0.02)
+    assert spoken  # some default message was spoken
+    assert "timer" in spoken[0].lower() or "up" in spoken[0].lower()
+
+
+def test_set_timer_declared_in_function_declarations():
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    decls = gl._function_declarations(types)
+    names = {d.name for d in decls}
+    assert "set_timer" in names
+    timer_decl = next(d for d in decls if d.name == "set_timer")
+    schema = timer_decl.parameters_json_schema
+    assert "seconds" in schema["properties"]
+    assert schema["required"] == ["seconds"]
+
+
+def test_get_clipboard_returns_text():
+    from app.models import ToolResult
+
+    c = _controller()
+
+    class FakeTools:
+        def get_clipboard(self):
+            return ToolResult(ok=True, output="hello from clipboard")
+
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("get_clipboard", {})
+    assert res["ok"] is True
+    assert res["text"] == "hello from clipboard"
+
+
+def test_get_clipboard_empty():
+    from app.models import ToolResult
+
+    c = _controller()
+
+    class FakeTools:
+        def get_clipboard(self):
+            return ToolResult(ok=True, output="")
+
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("get_clipboard", {})
+    assert res["ok"] is True
+    assert res["text"] == ""
+    assert "empty" in res["message"].lower()
+
+
+def test_get_clipboard_truncates_long_content():
+    from app.models import ToolResult
+
+    c = _controller()
+    long_text = "x" * 5000
+
+    class FakeTools:
+        def get_clipboard(self):
+            return ToolResult(ok=True, output=long_text)
+
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("get_clipboard", {})
+    assert res["ok"] is True
+    assert len(res["text"]) <= 4001  # 4000 chars + ellipsis
+    assert res["truncated"] is True
+    assert res["length"] == 5000
+
+
+def test_set_clipboard_writes_and_confirms():
+    from app.models import ToolResult
+
+    c = _controller()
+    written: list[str] = []
+
+    class FakeTools:
+        def set_clipboard(self, text: str):
+            written.append(text)
+            return ToolResult(ok=True, output="ok")
+
+    c._desktop_tools = FakeTools()
+    res = c._live_tool("set_clipboard", {"text": "paste me"})
+    assert res["ok"] is True
+    assert written == ["paste me"]
+    assert "paste" in res["message"].lower() or "clipboard" in res["message"].lower()
+
+
+def test_set_clipboard_empty_text_rejected():
+    c = _controller()
+    res = c._live_tool("set_clipboard", {"text": ""})
+    assert res["ok"] is False
+
+
+def test_clipboard_tools_in_function_declarations():
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    decls = gl._function_declarations(types)
+    names = {d.name for d in decls}
+    assert "get_clipboard" in names
+    assert "set_clipboard" in names
+    sc = next(d for d in decls if d.name == "set_clipboard")
+    assert sc.parameters_json_schema["required"] == ["text"]
+
+
+# ── partial-failure recovery: last_step in failure response ──────────────────
+
+def test_await_task_outcome_failure_includes_last_step_when_progress_tracked():
+    """When a desktop task fails, the failure response should include the last
+    known step so the Live model can tell the user how far the task got."""
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {}
+            if path.startswith("/api/tasks/"):
+                return {
+                    "status": "failed",
+                    "complete": False,
+                    "reason": "Could not locate the submit button.",
+                }
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+
+    # Simulate progress that was tracked before the failure (e.g. "clicking Submit")
+    task_id_holder: list[str] = []
+    orig_touch = c._touch_desktop_busy
+
+    def patched_touch():
+        orig_touch()
+
+    c._touch_desktop_busy = patched_touch
+
+    # Plant progress BEFORE the task poll so _await_task_outcome can read it.
+    # We intercept _live_start_desktop_task to grab the task_id, then plant
+    # progress keyed on that id.
+    orig_await = c._await_task_outcome
+
+    def intercepted_await(task_id, goal):
+        # Plant a progress entry as if the SSE loop had received an action event.
+        c._live_task_ids[task_id] = goal
+        c._live_task_progress[task_id] = {
+            "task_id": task_id,
+            "goal": goal,
+            "step": "clicking Submit",
+            "updated_at": 1.0,
+        }
+        return orig_await(task_id, goal)
+
+    c._await_task_outcome = intercepted_await
+
+    res = c._live_tool("start_desktop_task", {"goal": "submit the form", "confirmed": True})
+
+    assert res["ok"] is False
+    assert res.get("last_step") == "clicking Submit", (
+        f"Expected last_step='clicking Submit', got: {res}"
+    )
+
+
+def test_await_task_outcome_failure_no_last_step_when_no_progress():
+    """If no progress was tracked (task failed before any action), the failure
+    response must not include a last_step key at all — no spurious noise."""
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {}
+            if path.startswith("/api/tasks/"):
+                return {
+                    "status": "failed",
+                    "complete": False,
+                    "reason": "App never opened.",
+                }
+            return {}
+
+    c = _controller()
+    c.client = FakeClient()
+
+    res = c._live_tool("start_desktop_task", {"goal": "open an app"})
+
+    assert res["ok"] is False
+    assert "last_step" not in res, (
+        f"Unexpected last_step in response when no progress tracked: {res}"
+    )

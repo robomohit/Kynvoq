@@ -1375,6 +1375,64 @@ def _function_declarations(types: Any) -> list[Any]:
                 "required": ["name"],
             },
         ),
+        types.FunctionDeclaration(
+            name="set_timer",
+            description=(
+                "Set a countdown timer or reminder. Orynn will speak the label out loud when "
+                "the time is up. Use for 'remind me in X minutes', 'timer for Y seconds', "
+                "'alert me in Z hours'. Supports multiple concurrent timers. "
+                "Returns immediately; the alert fires in the background."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "number",
+                        "description": "How long to wait before the alert (in seconds).",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": (
+                            "What to say when the timer fires, e.g. 'check the oven', "
+                            "'meeting in 5 minutes', 'take a break'. Keep it short."
+                        ),
+                    },
+                },
+                "required": ["seconds"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="get_clipboard",
+            description=(
+                "Read whatever text is currently in the clipboard. Use when the user says "
+                "'what did I just copy', 'read my clipboard', 'what's in my clipboard', or "
+                "when a task should act on copied text (e.g. 'summarize what I copied', "
+                "'fix the error I copied'). Returns the clipboard text as-is."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        types.FunctionDeclaration(
+            name="set_clipboard",
+            description=(
+                "Write text to the clipboard so the user can paste it anywhere. Use when "
+                "the user says 'copy that to my clipboard', 'put X in my clipboard', or "
+                "after generating something (a summary, translation, code snippet) they'll "
+                "want to paste. Confirm out loud what you placed."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The text to place in the clipboard.",
+                    },
+                },
+                "required": ["text"],
+            },
+        ),
     ]
 
 

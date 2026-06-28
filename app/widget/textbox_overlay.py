@@ -2025,6 +2025,98 @@ class OverlayController(QObject):
         return {"ok": True, "removed": removed,
                 "message": (f"Forgot {removed} workflow(s)." if removed else "I didn't have a workflow matching that.")}
 
+    def _live_set_timer(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Fire a spoken alert after a countdown. Returns immediately; runs in a daemon
+        thread so the timer survives even if the user barge-ins mid-conversation."""
+        try:
+            seconds = float(args.get("seconds") or 0)
+        except (TypeError, ValueError):
+            return {"ok": False, "message": "Tell me how long — e.g. 'set a timer for 5 minutes'."}
+        if seconds <= 0:
+            return {"ok": False, "message": "Timer duration must be positive."}
+        # Cap at 24 hours to guard against model hallucinating enormous values.
+        if seconds > 86_400:
+            return {"ok": False, "message": "Timer limit is 24 hours. Did you mean a shorter duration?"}
+        label = _clean_text(args.get("label") or "").strip()
+        alert_text = label or "Your timer is up!"
+
+        companion_ref = self._live  # capture now; may be replaced if user restarts Live
+
+        def _fire() -> None:
+            import time as _t
+            _t.sleep(seconds)
+            # Best-effort: if Live restarted, the new companion hears the alert too.
+            live = self._live if self._live is not None else companion_ref
+            if live is not None:
+                try:
+                    live.send_task_update(alert_text)
+                except Exception:
+                    pass
+
+        import threading
+        t = threading.Thread(target=_fire, daemon=True, name=f"orynn-timer-{int(seconds)}s")
+        t.start()
+        mins, secs = divmod(int(seconds), 60)
+        hrs, mins = divmod(mins, 60)
+        if hrs:
+            duration_str = f"{hrs}h {mins}m" if mins else f"{hrs} hour{'s' if hrs != 1 else ''}"
+        elif mins:
+            duration_str = f"{mins}m {secs}s" if secs else f"{mins} minute{'s' if mins != 1 else ''}"
+        else:
+            duration_str = f"{secs} second{'s' if secs != 1 else ''}"
+        self._set_label(f"Timer set: {duration_str}", source="live_tool", force=True)
+        return {
+            "ok": True,
+            "seconds": seconds,
+            "label": alert_text,
+            "message": (
+                f"Timer set for {duration_str}. I'll speak '{alert_text}' when it fires. "
+                "Tell the user the timer is set and how long, and you'll alert them when done."
+            ),
+        }
+
+    def _live_get_clipboard(self) -> dict[str, Any]:
+        """Read the current clipboard text and return it to the model."""
+        tools = self._live_desktop_tools()
+        try:
+            result = tools.get_clipboard()
+        except Exception as exc:
+            return {"ok": False, "message": f"Couldn't read clipboard: {str(exc)[:120]}"}
+        if not getattr(result, "ok", False):
+            return {"ok": False, "message": getattr(result, "output", "Clipboard unavailable.")}
+        text = (getattr(result, "output", "") or "").strip()
+        if not text:
+            return {"ok": True, "text": "", "message": "The clipboard is empty."}
+        # Truncate very long clipboard contents so the model response stays manageable.
+        MAX = 4000
+        truncated = len(text) > MAX
+        preview = text[:MAX] + ("…" if truncated else "")
+        return {
+            "ok": True,
+            "text": preview,
+            "truncated": truncated,
+            "length": len(text),
+        }
+
+    def _live_set_clipboard(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Write text to the clipboard."""
+        text = args.get("text") or ""
+        if not isinstance(text, str):
+            text = str(text)
+        if not text:
+            return {"ok": False, "message": "What should I copy to the clipboard?"}
+        tools = self._live_desktop_tools()
+        try:
+            result = tools.set_clipboard(text)
+        except Exception as exc:
+            return {"ok": False, "message": f"Couldn't write clipboard: {str(exc)[:120]}"}
+        if not getattr(result, "ok", False):
+            return {"ok": False, "message": getattr(result, "output", "Clipboard unavailable.")}
+        preview = text[:80] + ("…" if len(text) > 80 else "")
+        self._set_label("Copied to clipboard", source="live_tool", force=True)
+        return {"ok": True, "text": preview, "length": len(text),
+                "message": "Copied to clipboard. Tell the user it's ready to paste."}
+
     def _run_workflow_step(self, step: dict[str, Any]) -> dict[str, Any]:
         """Execute ONE workflow step synchronously through Orynn's already-verified
         tiers (so a workflow never adds new, untested behavior). Returns {ok, label}."""
@@ -2305,6 +2397,12 @@ class OverlayController(QObject):
             return self._live_save_workflow(args)
         if name == "forget_workflow":
             return self._live_forget_workflow(args)
+        if name == "set_timer":
+            return self._live_set_timer(args)
+        if name == "get_clipboard":
+            return self._live_get_clipboard()
+        if name == "set_clipboard":
+            return self._live_set_clipboard(args)
         if name == "get_companion_status":
             try:
                 data = self.client.request("GET", "/api/active-tasks", timeout=3.0)
@@ -2893,11 +2991,26 @@ class OverlayController(QObject):
             # "Failed: Server restarted or task was abandoned."). Live speaks the real,
             # honest explanation from the `result`/`message` below.
             self._set_label("Couldn't complete that", source="live_tool", force=True)
-            return {"ok": False, "task_id": task_id, "status": fail_status,
-                    "result": _short(summary, 600) or "The task didn't complete.",
-                    "message": ("The desktop task FAILED or did not fully succeed. Tell the "
-                                "user honestly what went wrong. Do NOT say it's done, finished, "
-                                "or opened — explain the problem plainly.")}
+            failure: dict[str, Any] = {
+                "ok": False,
+                "task_id": task_id,
+                "status": fail_status,
+                "result": _short(summary, 600) or "The task didn't complete.",
+                "message": ("The desktop task FAILED or did not fully succeed. Tell the "
+                            "user honestly what went wrong. Do NOT say it's done, finished, "
+                            "or opened — explain the problem plainly."),
+            }
+            # Include the last known step so the model can tell the user how far
+            # the task got before failing (e.g. "opened Chrome but couldn't find
+            # the login button"). This is the in-memory progress snapshot, updated
+            # from SSE events by _update_live_task_progress; it may be absent for
+            # tasks that failed before taking any visible action.
+            last_step = (self._live_task_progress.get(task_id) or {}).get("step")
+            # "on it" is the initial placeholder set at task launch, not real
+            # progress — only surface a step if the agent made a visible action.
+            if last_step and last_step != "on it":
+                failure["last_step"] = last_step
+            return failure
         return {"ok": True, "task_id": task_id, "status": "running",
                 "message": ("The desktop agent is working on this in the background. "
                             "Tell the user OUT LOUD in one short sentence that you've "

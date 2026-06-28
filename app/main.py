@@ -790,6 +790,7 @@ def _reap_stuck_tasks() -> None:
                     rec.reason = rec.reason or f"Reaped: exceeded max runtime ({_TASK_MAX_RUNTIME:.0f}s)."
                     rec.finished_at = now.isoformat()
                     _save_task_record(rec)
+                    log_emitter.cleanup_task(tid)
                     service._active_tasks.pop(tid, None)
         except Exception as exc:
             _lifespan_log.warning("reap of task %s failed: %s", tid, exc)
@@ -2457,6 +2458,7 @@ async def cancel_task(task_id: str):
         _tasks[task_id].reason = "Queued task cancelled by user"
         _save_task_record(_tasks[task_id])
         log_emitter.emit(task_id, "cancelled", {"message": "Queued task cancelled by user", "finished_at": datetime.now(timezone.utc).isoformat()})
+        log_emitter.cleanup_task(task_id)
         return {"task_id": task_id, "status": "cancelled"}
     cancelled = service.cancel_task(task_id)
     if not cancelled:
@@ -2846,7 +2848,7 @@ async def stream_task(task_id: str, request: Request, since: int = 0, keepalive_
         try:
             terminal_seen = False
             last_seq = (int(since) - 1) if since else -1
-            for ev in log_emitter.read_log(task_id, since=max(0, since)):
+            for ev in log_emitter.read_log(task_id, since=max(0, min(since, 10_000_000))):
                 event_id = ev.get("seq")
                 if isinstance(event_id, int):
                     last_seq = max(last_seq, event_id)
