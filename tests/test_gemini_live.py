@@ -70,6 +70,7 @@ def test_function_declarations_cover_desktop_tools():
         "set_timer",
         "get_clipboard",
         "set_clipboard",
+        "list_workflows",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")
@@ -3645,3 +3646,461 @@ def test_await_task_outcome_failure_no_last_step_when_no_progress():
     assert "last_step" not in res, (
         f"Unexpected last_step in response when no progress tracked: {res}"
     )
+
+
+# ── Item 1: Workflow trigger bypass ──────────────────────────────────────────
+
+def test_start_desktop_task_redirects_to_workflow_on_trigger_match(tmp_path, monkeypatch):
+    """When start_desktop_task goal matches a saved workflow (>=2 keyword tokens),
+    the workflow is run directly instead of spinning up the back-office agent."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "workflows.json")
+    wf.add_workflow(
+        "post anime edit",
+        description="Post my anime edit to Instagram",
+        triggers=["post anime", "post my edit"],
+        steps=[{"action": "open", "app": "Instagram"}],
+        owner="user",
+    )
+
+    c = _controller()
+    agent_called = []
+
+    def fake_start_desktop_task(args):
+        agent_called.append(args)
+        return {"ok": True, "task_id": "x", "status": "done", "result": "done"}
+
+    workflow_called = []
+
+    def fake_run_workflow(args):
+        workflow_called.append(args)
+        return {"ok": True, "total": 1, "message": "ran it"}
+
+    c._live_start_desktop_task = fake_start_desktop_task
+    c._live_run_workflow = fake_run_workflow
+
+    res = c._live_tool("start_desktop_task", {"goal": "post my anime edit"})
+
+    assert not agent_called, "Full agent should NOT be called when workflow matches"
+    assert workflow_called, "Workflow runner should have been called"
+    assert res["ok"] is True
+
+
+def test_start_desktop_task_no_redirect_when_no_workflow_match(tmp_path, monkeypatch):
+    """If no workflow matches the goal (or match has <2 tokens), the full agent runs."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "workflows.json")
+    wf.add_workflow(
+        "post anime edit",
+        description="Post my anime edit to Instagram",
+        triggers=["post anime"],
+        steps=[{"action": "open", "app": "Instagram"}],
+        owner="user",
+    )
+
+    c = _controller()
+    agent_called = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {}
+            if path.startswith("/api/tasks/"):
+                return {"status": "done", "complete": True, "reason": "done"}
+            return {}
+
+    c.client = FakeClient()
+
+    orig = c._live_start_desktop_task
+
+    def tracked(*args, **kwargs):
+        agent_called.append(True)
+        return orig(*args, **kwargs)
+
+    c._live_start_desktop_task = tracked
+
+    # "open notepad" shares 0 keyword tokens with "post anime edit"
+    c._live_tool("start_desktop_task", {"goal": "open notepad"})
+    assert agent_called, "Full agent must run when goal doesn't match any workflow"
+
+
+def test_start_desktop_task_skip_workflow_check_flag(tmp_path, monkeypatch):
+    """skip_workflow_check=True bypasses the workflow redirect even on a match."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "workflows.json")
+    wf.add_workflow(
+        "post anime edit",
+        triggers=["post anime edit"],
+        steps=[{"action": "open", "app": "Instagram"}],
+    )
+
+    c = _controller()
+    agent_called = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=4.0, **kw):
+            if path == "/api/tasks/preflight":
+                return {"blocked": False}
+            if path == "/api/tasks":
+                return {}
+            if path.startswith("/api/tasks/"):
+                return {"status": "done", "complete": True, "reason": "done"}
+            return {}
+
+    c.client = FakeClient()
+    orig = c._live_start_desktop_task
+
+    def tracked(*a, **kw):
+        agent_called.append(True)
+        return orig(*a, **kw)
+
+    c._live_start_desktop_task = tracked
+    c._live_tool("start_desktop_task", {"goal": "post anime edit", "skip_workflow_check": True})
+    assert agent_called, "Agent must run when skip_workflow_check=True"
+
+
+# ── Items 2a & 2b: build_task_payload injects workflows + connector briefs ───
+
+def test_build_task_payload_injects_workflow_block(tmp_path, monkeypatch):
+    """build_task_payload should include matching workflow names in the goal."""
+    import app.workflows as wf
+    from app.widget.textbox_overlay import build_task_payload
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "workflows.json")
+    wf.add_workflow(
+        "morning setup",
+        description="Open apps for the morning routine",
+        triggers=["morning setup", "start my morning"],
+        steps=[{"action": "open", "app": "Chrome"}],
+    )
+
+    payload = build_task_payload("start my morning routine")
+    goal_text = payload["goal"]
+    assert "morning setup" in goal_text.lower() or "morning" in goal_text.lower(), (
+        f"Workflow block should appear in payload goal, got: {goal_text[:300]}"
+    )
+
+
+def test_build_task_payload_no_workflow_block_when_no_match(tmp_path, monkeypatch):
+    """When no workflows match, the workflow block is simply absent — no crash."""
+    import app.workflows as wf
+    from app.widget.textbox_overlay import build_task_payload
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "no_wf.json")
+    # No workflows saved
+    payload = build_task_payload("do something completely unrelated")
+    # Should not raise; goal is still a non-empty string
+    assert isinstance(payload["goal"], str) and payload["goal"]
+
+
+def test_build_task_payload_connector_brief_injected(monkeypatch):
+    """build_task_payload injects connector skill briefs for matching goals."""
+    import app.connectors as conn
+    from app.widget.textbox_overlay import build_task_payload
+
+    # Stub relevant_briefs to return a fake brief
+    monkeypatch.setattr(conn, "relevant_briefs", lambda goal: [("FakeSvc", "FAKESVC SKILL: do stuff")])
+
+    payload = build_task_payload("check my email in fakesvc")
+    assert "FAKESVC SKILL" in payload["goal"], (
+        f"Connector brief should be injected, got: {payload['goal'][:400]}"
+    )
+
+
+def test_build_task_payload_no_connector_brief_when_none(monkeypatch):
+    """build_task_payload is safe when relevant_briefs returns empty list."""
+    import app.connectors as conn
+    from app.widget.textbox_overlay import build_task_payload
+
+    monkeypatch.setattr(conn, "relevant_briefs", lambda goal: [])
+    payload = build_task_payload("open notepad")
+    assert isinstance(payload["goal"], str) and payload["goal"]
+
+
+# ── Item 3: list_workflows tool ───────────────────────────────────────────────
+
+def test_list_workflows_returns_current_list(tmp_path, monkeypatch):
+    """list_workflows returns a live list including workflows saved mid-session."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "wf.json")
+    wf.add_workflow("do dishes", description="Clean the dishes", steps=[{"action": "open", "app": "Notes"}])
+    wf.add_workflow("morning routine", description="Start the day", steps=[{"action": "open", "app": "Chrome"}])
+
+    c = _controller()
+    res = c._live_tool("list_workflows", {})
+
+    assert res["ok"] is True
+    assert res["count"] == 2
+    names = [w["title"] for w in res["workflows"]]
+    assert any("dishes" in n.lower() for n in names)
+    assert any("morning" in n.lower() for n in names)
+
+
+def test_list_workflows_empty(tmp_path, monkeypatch):
+    """list_workflows returns a helpful message when no workflows exist."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "empty.json")
+
+    c = _controller()
+    res = c._live_tool("list_workflows", {})
+
+    assert res["ok"] is True
+    assert res["count"] == 0
+    assert "save_workflow" in res["message"]
+
+
+def test_list_workflows_with_query_filter(tmp_path, monkeypatch):
+    """list_workflows with a query returns only relevant workflows."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "wf2.json")
+    wf.add_workflow("email cleanup", description="Sort inbox", steps=[{"action": "open", "app": "Gmail"}])
+    wf.add_workflow("code review", description="Review PRs", steps=[{"action": "open", "app": "GitHub"}])
+
+    c = _controller()
+    res = c._live_tool("list_workflows", {"query": "email"})
+
+    assert res["ok"] is True
+    # email workflow should appear; may or may not include code review
+    titles = [w["title"].lower() for w in res["workflows"]]
+    assert any("email" in t for t in titles)
+
+
+def test_list_workflows_declared_in_function_declarations():
+    """list_workflows must be in the Gemini Live function declarations."""
+    from google.genai import types
+    from app.widget import gemini_live as gl
+
+    decls = gl._function_declarations(types)
+    names = {d.name for d in decls}
+    assert "list_workflows" in names
+
+
+# ── Item 4: get_companion_status enrichment ───────────────────────────────────
+
+def test_get_companion_status_includes_linked_connectors(monkeypatch, tmp_path):
+    """get_companion_status should report which connectors are currently linked."""
+    import app.connectors as conn
+
+    monkeypatch.setattr(conn, "linked_only", lambda: [{"id": "gmail"}, {"id": "notion"}])
+
+    c = _controller()
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=3.0, **kw):
+            return {"tasks": []}
+
+    c.client = FakeClient()
+    res = c._live_tool("get_companion_status", {})
+
+    assert res["ok"] is True
+    assert "linked_connectors" in res
+    assert "gmail" in res["linked_connectors"]
+    assert "notion" in res["linked_connectors"]
+
+
+def test_get_companion_status_includes_workflow_count(tmp_path, monkeypatch):
+    """get_companion_status should include the number of saved workflows."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "wf.json")
+    wf.add_workflow("task one", steps=[{"action": "open", "app": "Chrome"}])
+    wf.add_workflow("task two", steps=[{"action": "open", "app": "Notes"}])
+
+    c = _controller()
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=3.0, **kw):
+            return {"tasks": []}
+
+    c.client = FakeClient()
+    res = c._live_tool("get_companion_status", {})
+
+    assert res["ok"] is True
+    assert res.get("workflow_count") == 2
+
+
+def test_get_companion_status_includes_knowledge_count(monkeypatch):
+    """get_companion_status should include the number of knowledge facts."""
+    import app.knowledge as know
+
+    monkeypatch.setattr(know, "all_facts", lambda: [{"text": "a"}, {"text": "b"}, {"text": "c"}])
+
+    c = _controller()
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=3.0, **kw):
+            return {"tasks": []}
+
+    c.client = FakeClient()
+    res = c._live_tool("get_companion_status", {})
+
+    assert res["ok"] is True
+    assert res.get("knowledge_facts") == 3
+
+
+# ── Item 5: success narration ─────────────────────────────────────────────────
+
+def test_narration_phrase_action_result_failure():
+    """action_result with ok=False still says 'that didn't work'."""
+    c = _controller()
+    phrase = c._narration_phrase_for_event({
+        "type": "action_result", "ok": False, "action_type": "uia_click",
+    })
+    assert "didn't work" in phrase
+
+
+def test_narration_phrase_action_result_success_vision():
+    """action_result success for observe/screenshot gives a spoken phrase."""
+    c = _controller()
+    phrase = c._narration_phrase_for_event({
+        "type": "action_result", "ok": True, "action_type": "observe",
+    })
+    assert phrase  # should be non-empty for screen-read success
+
+
+def test_narration_phrase_action_result_success_file_write():
+    """action_result success for write_file gives a spoken phrase."""
+    c = _controller()
+    phrase = c._narration_phrase_for_event({
+        "type": "action_result", "ok": True, "action_type": "write_file",
+    })
+    assert phrase
+
+
+def test_narration_phrase_action_result_success_click_is_silent():
+    """action_result success for a plain click should be silent — too noisy."""
+    c = _controller()
+    phrase = c._narration_phrase_for_event({
+        "type": "action_result", "ok": True, "action_type": "uia_click",
+    })
+    assert phrase == "", f"Expected silence for click success, got: {phrase!r}"
+
+
+# ── Item 6: memory recall failure logging ─────────────────────────────────────
+
+def test_recall_sessions_failure_returns_empty_and_logs(capsys):
+    """recall_sessions catches errors and prints to stderr — not silent."""
+    from unittest.mock import MagicMock
+    from app.memory import MemoryStore
+
+    store = MagicMock(spec=MemoryStore)
+
+    class BadCollection:
+        def count(self):
+            return 10
+
+        def query(self, **kw):
+            raise RuntimeError("ChromaDB unavailable")
+
+    store.collection = BadCollection()
+    # Call the real recall_sessions on our patched object
+    result = MemoryStore.recall_sessions(store, "find something", 5)
+
+    assert result == [], "Should return empty list on error"
+    captured = capsys.readouterr()
+    assert "recall_sessions" in captured.err or "ChromaDB" in captured.err, (
+        f"Expected error logged to stderr, got: {captured.err!r}"
+    )
+
+
+# ── Item 7: workflow control name validation warnings ─────────────────────────
+
+def test_save_workflow_warns_on_click_step_without_target(tmp_path, monkeypatch):
+    """A click step with no target triggers a validation warning in the response."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "wf.json")
+
+    c = _controller()
+    res = c._live_tool("save_workflow", {
+        "name": "bad click",
+        "steps": [{"action": "click"}],  # no target
+    })
+
+    assert res["ok"] is True  # still saved (fail-soft)
+    assert "warnings" in res
+    assert any("no target" in w.lower() for w in res["warnings"])
+
+
+def test_save_workflow_warns_on_very_long_target(tmp_path, monkeypatch):
+    """A click step with an absurdly long target triggers a warning."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "wf2.json")
+
+    c = _controller()
+    long_target = "x" * 200
+    res = c._live_tool("save_workflow", {
+        "name": "long target wf",
+        "steps": [{"action": "click", "target": long_target}],
+    })
+
+    assert res["ok"] is True
+    assert "warnings" in res
+    assert any("long" in w.lower() for w in res["warnings"])
+
+
+def test_save_workflow_no_warnings_on_valid_steps(tmp_path, monkeypatch):
+    """A well-formed workflow produces no warnings."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "store_path", lambda: tmp_path / "wf3.json")
+
+    c = _controller()
+    res = c._live_tool("save_workflow", {
+        "name": "open chrome",
+        "steps": [{"action": "open", "app": "Chrome"}, {"action": "click", "target": "New Tab"}],
+    })
+
+    assert res["ok"] is True
+    assert "warnings" not in res
+
+
+# ── Item 8: broad exception logging ──────────────────────────────────────────
+
+def test_live_context_block_logs_on_workflow_error(monkeypatch, capsys):
+    """_live_context_block logs to stderr when workflow read fails."""
+    import app.workflows as wf
+
+    monkeypatch.setattr(wf, "as_prompt_block", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("disk error")))
+
+    c = _controller()
+    result = c._live_context_block()
+    # Should not raise; returns whatever knowledge block there is
+    assert isinstance(result, str)
+    captured = capsys.readouterr()
+    assert "disk error" in captured.err or "_live_context_block" in captured.err
+
+
+def test_build_task_payload_logs_on_workflow_inject_error(monkeypatch, capsys):
+    """build_task_payload logs to stderr when workflow injection fails."""
+    import app.workflows as wf
+    from app.widget.textbox_overlay import build_task_payload
+
+    monkeypatch.setattr(wf, "as_prompt_block", lambda *a, **kw: (_ for _ in ()).throw(OSError("no disk")))
+
+    payload = build_task_payload("open something")
+    assert isinstance(payload["goal"], str)
+    captured = capsys.readouterr()
+    assert "no disk" in captured.err or "workflow inject" in captured.err
+
+
+def test_build_task_payload_logs_on_connector_inject_error(monkeypatch, capsys):
+    """build_task_payload logs to stderr when connector brief injection fails."""
+    import app.connectors as conn
+    from app.widget.textbox_overlay import build_task_payload
+
+    monkeypatch.setattr(conn, "relevant_briefs", lambda goal: (_ for _ in ()).throw(OSError("conn error")))
+
+    payload = build_task_payload("check my email")
+    assert isinstance(payload["goal"], str)
+    captured = capsys.readouterr()
+    assert "conn error" in captured.err or "connector brief" in captured.err

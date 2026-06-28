@@ -574,6 +574,30 @@ def build_task_payload(goal: str) -> dict[str, Any]:
                 payload_goal = mem + "\n\n" + payload_goal
         except Exception:
             pass
+        # Inject relevant workflow list so the back-office agent knows which
+        # saved procedures match this goal and can use them instead of re-planning.
+        try:
+            from app import workflows as _wf
+            wf_block = _wf.as_prompt_block(goal, limit=6)
+            if wf_block:
+                payload_goal = wf_block + "\n\n" + payload_goal
+        except Exception as _wf_exc:
+            import sys
+            print(f"[Orynn] build_task_payload: workflow inject failed: {_wf_exc}",
+                  file=sys.stderr, flush=True)
+        # Inject connector skill briefs so the back-office agent knows how to
+        # drive any linked service this goal refers to (mirrors agent.py L2 injection
+        # but ensures the widget's own path has the context too).
+        try:
+            from app import connectors as _conn
+            briefs = _conn.relevant_briefs(goal)
+            if briefs:
+                brief_block = "\n\n".join(f"[{name} SKILL]\n{manual}" for name, manual in briefs)
+                payload_goal = brief_block + "\n\n" + payload_goal
+        except Exception as _conn_exc:
+            import sys
+            print(f"[Orynn] build_task_payload: connector brief inject failed: {_conn_exc}",
+                  file=sys.stderr, flush=True)
         if mode in {"computer", "computer_use", "computer_isolated"}:
             payload_goal = DESKTOP_HARDENING + payload_goal
         payload_goal = payload_goal + VOICE_BREVITY
@@ -2010,9 +2034,28 @@ class OverlayController(QObject):
                 "I couldn't save that — a workflow needs a name and at least one valid "
                 "step (open/click/type/press_keys/scroll/focus/run/wait).")}
         self._set_label(f"Saved workflow: {_short(saved['title'], 50)}", source="live_tool", force=True)
-        return {"ok": True, "name": saved["name"], "steps": len(saved["steps"]),
-                "message": (f"Saved the '{saved['title']}' workflow ({len(saved['steps'])} steps). "
-                            "Tell the user they can ask you to run it anytime.")}
+        # Structural validation: flag steps whose click/focus target looks suspicious
+        # (empty after cleanup, or too long to be a real UIA control name). We save
+        # anyway (fail-soft), but warn so the user knows to double-check.
+        warnings: list[str] = []
+        for i, step in enumerate(saved.get("steps", []), 1):
+            action = step.get("action", "")
+            target = step.get("target", "")
+            if action in ("click", "focus") and not target:
+                warnings.append(f"Step {i} ({action}) has no target — it may not work.")
+            elif target and len(target) > 120:
+                warnings.append(f"Step {i} target is very long ({len(target)} chars) — "
+                                "UIA control names are usually short.")
+        resp: dict[str, Any] = {
+            "ok": True, "name": saved["name"], "steps": len(saved["steps"]),
+            "message": (f"Saved the '{saved['title']}' workflow ({len(saved['steps'])} steps). "
+                        "Tell the user they can ask you to run it anytime."),
+        }
+        if warnings:
+            resp["warnings"] = warnings
+            resp["message"] += (f" Note: {len(warnings)} step(s) may need checking — "
+                                "tell the user and offer to test it.")
+        return resp
 
     def _live_forget_workflow(self, args: dict[str, Any]) -> dict[str, Any]:
         from app import workflows
@@ -2024,6 +2067,45 @@ class OverlayController(QObject):
                         source="live_tool", force=True)
         return {"ok": True, "removed": removed,
                 "message": (f"Forgot {removed} workflow(s)." if removed else "I didn't have a workflow matching that.")}
+
+    def _live_list_workflows(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Return a live, current list of saved workflows — always fresh from disk so
+        mid-session saves are immediately visible without a reconnect."""
+        from app import workflows as _wf
+        query = _clean_text(args.get("query") or "")
+        try:
+            wfs = _wf.relevant(query, limit=20) if query else _wf.all_workflows()
+        except Exception:
+            wfs = []
+        if not wfs:
+            return {
+                "ok": True,
+                "count": 0,
+                "workflows": [],
+                "message": ("No workflows saved yet. You can teach me one with save_workflow — "
+                            "just describe the steps and I'll remember them."),
+            }
+        items = []
+        for w in wfs:
+            entry: dict[str, Any] = {
+                "name": w.get("name", ""),
+                "title": w.get("title") or w.get("name", ""),
+                "description": w.get("description", ""),
+                "steps": len(w.get("steps", [])),
+                "runs": w.get("runs", 0),
+            }
+            if w.get("triggers"):
+                entry["triggers"] = w["triggers"]
+            items.append(entry)
+        return {
+            "ok": True,
+            "count": len(items),
+            "workflows": items,
+            "message": (
+                f"You have {len(items)} workflow{'s' if len(items) != 1 else ''}. "
+                "Tell the user their names and what they do in a short, natural summary."
+            ),
+        }
 
     def _live_set_timer(self, args: dict[str, Any]) -> dict[str, Any]:
         """Fire a spoken alert after a countdown. Returns immediately; runs in a daemon
@@ -2259,8 +2341,10 @@ class OverlayController(QObject):
             wb = workflows.as_prompt_block()
             if wb:
                 parts.append(wb)
-        except Exception:
-            pass
+        except Exception as _wf_exc:
+            import sys
+            print(f"[Orynn] _live_context_block: workflow read failed: {_wf_exc}",
+                  file=sys.stderr, flush=True)
         return "\n\n".join(parts)
 
     def _notify_live_memory_updated(self) -> None:
@@ -2362,6 +2446,31 @@ class OverlayController(QObject):
                 routed = self._desktop_control_route(click_args)
                 if routed is not None:
                     return routed
+            # Check saved workflows BEFORE escalating to the full agent. A goal
+            # that matches a workflow trigger runs it directly — faster (2-4s vs
+            # 10-30s) and deterministic. Only redirects on a high-confidence match
+            # (top hit has at least 2 keyword tokens in common with the goal) so
+            # we don't accidentally hijack unrelated goals.
+            if not self._live_bool(args.get("skip_workflow_check")):
+                try:
+                    from app import workflows as _wf
+                    candidates = _wf.relevant(goal, limit=1)
+                    if candidates:
+                        top = candidates[0]
+                        goal_terms = set(
+                            t for t in __import__("re").findall(r"[a-z0-9]+", goal.lower())
+                            if len(t) > 2
+                        )
+                        haystack = " ".join([
+                            top.get("title", ""), top.get("name", ""), top.get("description", ""),
+                            " ".join(top.get("triggers", [])),
+                        ]).lower()
+                        matched = sum(1 for t in goal_terms if t in haystack)
+                        if matched >= 2:
+                            wf_args = {"name": top.get("name", ""), "confirmed": args.get("confirmed")}
+                            return self._live_run_workflow(wf_args)
+                except Exception:
+                    pass
             return self._live_start_desktop_task(args)
         if name == "web_search":
             return self._live_web_search(args)
@@ -2397,6 +2506,8 @@ class OverlayController(QObject):
             return self._live_save_workflow(args)
         if name == "forget_workflow":
             return self._live_forget_workflow(args)
+        if name == "list_workflows":
+            return self._live_list_workflows(args)
         if name == "set_timer":
             return self._live_set_timer(args)
         if name == "get_clipboard":
@@ -2418,6 +2529,28 @@ class OverlayController(QObject):
                     }
                 if self._last_task_result:
                     resp["last_result"] = self._last_task_result
+                # Connector status: which connectors are linked so Live can answer
+                # "is Gmail linked?", "what services do you have access to?", etc.
+                try:
+                    from app import connectors as _conn
+                    linked = _conn.linked_only()
+                    if linked:
+                        resp["linked_connectors"] = [c.get("id", "") for c in linked]
+                except Exception:
+                    pass
+                # Workflow count so Live can say "you have N workflows"
+                try:
+                    from app import workflows as _wf
+                    wf_list = _wf.all_workflows()
+                    resp["workflow_count"] = len(wf_list)
+                except Exception:
+                    pass
+                # Knowledge fact count so Live can say "I know N facts about you"
+                try:
+                    from app import knowledge as _know
+                    resp["knowledge_facts"] = len(_know.all_facts())
+                except Exception:
+                    pass
                 return resp
             except Exception as exc:
                 return {"ok": False, "message": str(exc)[:200]}
@@ -3110,8 +3243,23 @@ class OverlayController(QObject):
         if et == "control_profile":
             app = _clean_text(ev.get("window_title") or ev.get("app") or "")
             return f"working in {_short(app, 40)}" if app else ""
-        if et == "action_result" and ev.get("ok") is False:
-            return "that didn't work, trying another way"
+        if et == "action_result":
+            if ev.get("ok") is False:
+                return "that didn't work, trying another way"
+            # Narrate meaningful successes (found target, read content, etc.) but
+            # not trivial ones — don't speak after every single click/type.
+            action = str(ev.get("action_type") or ev.get("name") or "").lower()
+            if action in ("screen_context", "observe", "get_screenshot"):
+                return "looking at the screen"
+            if action in ("read_file",):
+                return "read the file"
+            if action in ("write_file", "edit_file"):
+                return "updated the file"
+            if action in ("run_command", "bash", "terminal"):
+                return "command ran"
+            if action in ("web_fetch", "web_search"):
+                return "got the info"
+            return ""  # clicks/types: too noisy; success is implied
         if et != "action_start":
             return ""
         action = str(ev.get("action_type") or ev.get("name") or "").lower()

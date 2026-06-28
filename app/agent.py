@@ -2048,6 +2048,10 @@ class AgentService:
                 screenshot_b64 = await asyncio.to_thread(_capture_screenshot_b64, screen_width, screen_height)
 
             prior_sessions = await asyncio.to_thread(self.memory.recall_sessions, goal, 5)
+            if not prior_sessions:
+                import sys
+                print(f"[Orynn] memory recall empty for task={task_id!r} — "
+                      "no session history or recall backend unavailable", file=sys.stderr, flush=True)
             relevant_history_block = (
                 "<relevant_history>\n"
                 + "\n".join(f"- {getattr(s, 'content', s)}" for s in prior_sessions)

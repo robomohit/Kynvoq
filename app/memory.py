@@ -384,7 +384,10 @@ class MemoryStore:
                 n_results=min(max(n * 4, 12), total),
                 where={"kind": "session_summary"},
             )
-        except Exception:
+        except Exception as _recall_exc:
+            import sys
+            print(f"[Orynn] memory.recall_sessions failed for query={query!r}: {_recall_exc}",
+                  file=sys.stderr, flush=True)
             return []
 
         ids = results.get("ids", [[]])[0]

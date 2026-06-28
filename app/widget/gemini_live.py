@@ -1376,6 +1376,24 @@ def _function_declarations(types: Any) -> list[Any]:
             },
         ),
         types.FunctionDeclaration(
+            name="list_workflows",
+            description=(
+                "List all saved workflows and their descriptions. Use when the user asks "
+                "'what workflows do you have?', 'what can you do?', 'what tasks have I "
+                "taught you?', or 'show me my workflows'. Returns a live list that is "
+                "always up-to-date, even if new workflows were saved mid-session."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Optional filter — only return workflows relevant to this topic.",
+                    },
+                },
+            },
+        ),
+        types.FunctionDeclaration(
             name="set_timer",
             description=(
                 "Set a countdown timer or reminder. Orynn will speak the label out loud when "
