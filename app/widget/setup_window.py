@@ -198,10 +198,10 @@ def ensure_keys_configured() -> bool:
 
 def _build():  # imports deferred so importing this module never needs Qt
     import math
-    from PySide6.QtCore import Qt, Signal, QTimer, QRect
+    from PySide6.QtCore import Qt, Signal, QTimer, QRect, QPropertyAnimation, QEasingCurve, QPoint
     from PySide6.QtWidgets import (
         QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
-        QGraphicsDropShadowEffect, QStackedWidget, QComboBox,
+        QGraphicsDropShadowEffect, QStackedWidget, QComboBox, QGraphicsOpacityEffect,
     )
     from PySide6.QtGui import QColor, QPainter, QRadialGradient, QBrush, QPen, QPainterPath, QFont
 
@@ -209,8 +209,7 @@ def _build():  # imports deferred so importing this module never needs Qt
         return f'<a href="{url}" style="color:{ACCENT};text-decoration:none;">{text}</a>'
 
     class BreathingOrbWidget(QWidget):
-        """Cinematic left pane: an ambient aurora field, a tall glowing blue
-        caret that breathes and blinks, and a glass command box below it where
+        """Cinematic left pane: an ambient aurora field, a glass command box where
         prompt phrases cross-fade in and out. One blue accent, lots of space."""
 
         def __init__(self, parent=None):
@@ -247,21 +246,27 @@ def _build():  # imports deferred so importing this module never needs Qt
             self._msg_phase = "in"      # in -> hold -> out
             self._msg_t     = 0.0
             self._msg_alpha = 0.0
-            self._msg_slide = 10.0
+            self._msg_slide = 14.0      # start at full slide-in offset
 
             # Drifting aurora blobs (x, y, radius, drift speed, phase).
             self._aurora = [
-                [rng.uniform(60, 340), rng.uniform(120, 460),
-                 rng.uniform(150, 230), rng.uniform(0.06, 0.16), rng.uniform(0, 6.28)]
-                for _ in range(3)
+                [rng.uniform(60, 340), rng.uniform(100, 480),
+                 rng.uniform(160, 250), rng.uniform(0.06, 0.14), rng.uniform(0, 6.28)]
+                for _ in range(4)   # one extra blob for more ambient depth
             ]
 
             # Rising dust motes (x, y, vy, size, base alpha).
             self._motes = [
                 [rng.uniform(0, 400), rng.uniform(0, 640),
-                 rng.uniform(6, 16), rng.uniform(0.8, 1.8), rng.uniform(0.12, 0.45)]
-                for _ in range(22)
+                 rng.uniform(8, 18), rng.uniform(1.0, 2.2), rng.uniform(0.28, 0.65)]
+                for _ in range(28)  # more motes, higher alpha range
             ]
+
+            # Cached static background pixmap — background gradient + clip path
+            # are constant; only rebuilt when widget is resized, not every frame.
+            self._bg_pixmap  = None
+            self._bg_size    = (0, 0)
+            self._clip_path  = None     # cached clip path for current size
 
             self._pixmap = None
             self.timer = QTimer(self)
@@ -279,6 +284,10 @@ def _build():  # imports deferred so importing this module never needs Qt
         @staticmethod
         def _ease_in(x):
             return x * x * x
+
+        @staticmethod
+        def _ease_in_out(x):
+            return x * x * (3.0 - 2.0 * x)
 
         def _tick(self):
             import math
@@ -304,38 +313,40 @@ def _build():  # imports deferred so importing this module never needs Qt
                     tc1, tc2, tc3 = QColor(0, 220, 140), QColor(0, 160, 90), QColor(60, 255, 180)
 
                 def lp(c, tc):
-                    return QColor(int(c.red() + (tc.red() - c.red()) * 0.06),
-                                  int(c.green() + (tc.green() - c.green()) * 0.06),
-                                  int(c.blue() + (tc.blue() - c.blue()) * 0.06))
+                    # 0.12 → state transitions visible in ~0.4s instead of ~0.8s
+                    return QColor(int(c.red()   + (tc.red()   - c.red())   * 0.12),
+                                  int(c.green() + (tc.green() - c.green()) * 0.12),
+                                  int(c.blue()  + (tc.blue()  - c.blue())  * 0.12))
                 self._c1 = lp(self._c1, tc1)
                 self._c2 = lp(self._c2, tc2)
                 self._c3 = lp(self._c3, tc3)
 
-                # Cross-fading prompt phrases.
+                # Cross-fading prompt phrases with 14px slide (was 4px effective).
                 self._msg_t += DT
                 if self._msg_phase == "in":
-                    p = min(1.0, self._msg_t / 0.55)
+                    p = min(1.0, self._msg_t / 0.50)
                     self._msg_alpha = self._ease_out(p)
-                    self._msg_slide = 10.0 * (1.0 - self._ease_out(p))
+                    self._msg_slide = 14.0 * (1.0 - self._ease_in_out(p))
                     if p >= 1.0:
                         self._msg_phase, self._msg_t = "hold", 0.0
                 elif self._msg_phase == "hold":
                     self._msg_alpha, self._msg_slide = 1.0, 0.0
-                    if self._msg_t > 2.4:
+                    if self._msg_t > 2.6:
                         self._msg_phase, self._msg_t = "out", 0.0
                 else:
-                    p = min(1.0, self._msg_t / 0.5)
+                    p = min(1.0, self._msg_t / 0.40)
                     self._msg_alpha = 1.0 - self._ease_in(p)
-                    self._msg_slide = -10.0 * self._ease_in(p)
+                    self._msg_slide = -14.0 * self._ease_in_out(p)
                     if p >= 1.0:
                         self._msg_idx = (self._msg_idx + 1) % len(self._messages)
                         self._msg_phase, self._msg_t = "in", 0.0
+                        self._msg_slide = 14.0  # clean reset — no single-frame pop
 
                 # Drift aurora, rise motes.
                 for a in self._aurora:
                     a[4] += a[3] * DT
                 for m in self._motes:
-                    m[1] -= m[2] * DT * 3.0
+                    m[1] -= m[2] * DT * 2.2   # slightly slower, more graceful rise
                     if m[1] < -8:
                         m[1] = 650.0
                         m[0] = _rand.uniform(0, 400)
@@ -352,20 +363,13 @@ def _build():  # imports deferred so importing this module never needs Qt
             p = QPainter(self)
             p.drawPixmap(0, 0, self._pixmap)
 
-        def _render_to_pixmap(self):
-            from PySide6.QtGui import QLinearGradient, QRadialGradient, QPixmap, QFontMetrics
-            import math
-
-            w, h = self.width(), self.height()
-            if w <= 0 or h <= 0:
-                return
-            if self._pixmap is None or self._pixmap.width() != w or self._pixmap.height() != h:
-                self._pixmap = QPixmap(w, h)
-            self._pixmap.fill(Qt.transparent)
-
-            p = QPainter(self._pixmap)
-            p.setRenderHint(QPainter.Antialiasing)
-            p.setRenderHint(QPainter.TextAntialiasing)
+        def _rebuild_bg(self, w: int, h: int):
+            """Rebuild the static background pixmap (only on resize)."""
+            from PySide6.QtGui import QLinearGradient, QPixmap as _QPixmap
+            self._bg_pixmap = _QPixmap(w, h)
+            self._bg_pixmap.fill(Qt.transparent)
+            bp = QPainter(self._bg_pixmap)
+            bp.setRenderHint(QPainter.Antialiasing)
 
             # Clip to the card's rounded-left corners (right edge is square).
             clip = QPainterPath()
@@ -375,59 +379,90 @@ def _build():  # imports deferred so importing this module never needs Qt
             clip.arcTo(0, h - 40, 40, 40, 180, 90)
             clip.lineTo(w, h)
             clip.closeSubpath()
-            p.setClipPath(clip)
+            self._clip_path = clip
+            bp.setClipPath(clip)
 
-            t   = self._time
-            cx  = w / 2
+            # Richer dark background — deep blue-black, not pure black.
+            bg = QLinearGradient(0, 0, 0, h)
+            bg.setColorAt(0.0,  QColor(8, 10, 26))
+            bg.setColorAt(0.45, QColor(5, 6, 18))
+            bg.setColorAt(1.0,  QColor(3, 3, 12))
+            bp.fillRect(QRect(0, 0, w, h), QBrush(bg))
+            bp.end()
+            self._bg_size = (w, h)
+
+        def _render_to_pixmap(self):
+            from PySide6.QtGui import QLinearGradient, QRadialGradient, QPixmap, QFontMetrics
+            import math
+
+            w, h = self.width(), self.height()
+            if w <= 0 or h <= 0:
+                return
+            if self._pixmap is None or self._pixmap.width() != w or self._pixmap.height() != h:
+                self._pixmap = QPixmap(w, h)
+
+            # Rebuild static background only on size change.
+            if self._bg_size != (w, h):
+                self._rebuild_bg(w, h)
+
+            self._pixmap.fill(Qt.transparent)
+            p = QPainter(self._pixmap)
+            p.setRenderHint(QPainter.Antialiasing)
+            p.setRenderHint(QPainter.TextAntialiasing)
+
+            # Blit pre-rendered static background.
+            p.drawPixmap(0, 0, self._bg_pixmap)
+
+            # Restore clip for dynamic elements.
+            if self._clip_path is not None:
+                p.setClipPath(self._clip_path)
+
+            t  = self._time
+            cx = w / 2
             c1, c2, c3 = self._c1, self._c2, self._c3
 
-            # --- Deep background: vertical gradient into near-black ---
-            bg = QLinearGradient(0, 0, 0, h)
-            bg.setColorAt(0.0, QColor(9, 11, 24))
-            bg.setColorAt(0.5, QColor(6, 7, 16))
-            bg.setColorAt(1.0, QColor(3, 3, 9))
-            p.fillRect(QRect(0, 0, w, h), QBrush(bg))
-
-            # --- Ambient: a couple of soft, slow blue glows for quiet depth ---
+            # --- Aurora blobs — alpha raised 13→55 core / 6→28 mid; visibly breathe ---
             for a in self._aurora:
-                ax = a[0] + math.cos(a[4]) * 26
-                ay = a[1] + math.sin(a[4] * 0.8) * 22
-                rad = a[2] + 14 * math.sin(a[4] * 1.3)
+                ax  = a[0] + math.cos(a[4]) * 30
+                ay  = a[1] + math.sin(a[4] * 0.8) * 26
+                rad = a[2] + 18 * math.sin(a[4] * 1.2)
+                pulse = 0.75 + 0.25 * math.sin(t * 0.55 + a[4])
                 glow = QRadialGradient(ax, ay, rad)
-                glow.setColorAt(0.0, QColor(c2.red(), c2.green(), c2.blue(), 13))
-                glow.setColorAt(0.5, QColor(c1.red(), c1.green(), c1.blue(), 6))
-                glow.setColorAt(1.0, QColor(0, 0, 0, 0))
+                glow.setColorAt(0.0,  QColor(c2.red(), c2.green(), c2.blue(), int(55 * pulse)))
+                glow.setColorAt(0.45, QColor(c1.red(), c1.green(), c1.blue(), int(28 * pulse)))
+                glow.setColorAt(1.0,  QColor(0, 0, 0, 0))
                 p.setPen(Qt.NoPen)
                 p.setBrush(QBrush(glow))
                 p.drawEllipse(int(ax - rad), int(ay - rad), int(rad * 2), int(rad * 2))
 
-            # --- A few slow dust motes for life (very faint) ---
+            # --- Dust motes — alpha cap raised (*55 → *95) ---
             for m in self._motes:
-                ma = int(max(0, m[4] * (0.5 + 0.5 * math.sin(t * 1.0 + m[0]))) * 55)
+                ma = int(max(0, m[4] * (0.5 + 0.5 * math.sin(t * 1.2 + m[0]))) * 95)
                 if ma <= 0:
                     continue
-                p.setBrush(QBrush(QColor(170, 195, 235, ma)))
+                p.setBrush(QBrush(QColor(170, 200, 240, ma)))
                 p.setPen(Qt.NoPen)
                 p.drawEllipse(int(m[0] - m[3] / 2), int(m[1] - m[3] / 2), int(m[3]), int(m[3]))
 
-            # --- Voice pill: a soft glass capsule holding a dot-matrix waveform
-            # and the spoken phrase. Voice-first, so there is no send button. ---
-            BOX_MX = 44
+            # --- Voice pill capsule ---
+            BOX_MX = 40
             box_x  = float(BOX_MX)
             box_w  = float(w - 2 * BOX_MX)
-            box_h  = 50.0
-            box_y  = float(int(h * 0.46 - box_h / 2))
+            box_h  = 54.0   # taller pill for more presence
+            box_y  = float(int(h * 0.44 - box_h / 2))
             radius = box_h / 2.0
             row_cy = box_y + box_h / 2.0
 
+            # Pill border breathes subtly with a slow pulse.
+            border_a = int(36 + 18 * math.sin(t * 0.9))
             box_path = QPainterPath()
             box_path.addRoundedRect(box_x, box_y, box_w, box_h, radius, radius)
             fill = QLinearGradient(0, box_y, 0, box_y + box_h)
-            fill.setColorAt(0.0, QColor(255, 255, 255, 13))
-            fill.setColorAt(1.0, QColor(255, 255, 255, 6))
+            fill.setColorAt(0.0, QColor(255, 255, 255, 18))
+            fill.setColorAt(1.0, QColor(255, 255, 255, 9))
             p.fillPath(box_path, QBrush(fill))
             p.setBrush(Qt.NoBrush)
-            p.setPen(QPen(QColor(255, 255, 255, 30), 1.0))
+            p.setPen(QPen(QColor(255, 255, 255, border_a), 1.0))
             p.drawPath(box_path)
 
             msg = self._messages[self._msg_idx]
@@ -442,46 +477,45 @@ def _build():  # imports deferred so importing this module never needs Qt
             fm = QFontMetrics(font)
             text_w_px = fm.horizontalAdvance(msg)
 
-            # Mini voice waveform (mirrors the capsule's dot-matrix bars).
-            WF_COLS = 5
-            WF_GAP  = 6.0
+            # Waveform: 7 bars (was 5), 4px wide (was 2.8px), 5.5 rad/s (was 3.4).
+            WF_COLS = 7
+            WF_GAP  = 7.0
             WF_W    = (WF_COLS - 1) * WF_GAP
-            GAP_TW  = 16.0          # gap between waveform and text
+            GAP_TW  = 14.0
             group_w = WF_W + GAP_TW + text_w_px
             gx0     = cx - group_w / 2.0
 
-            # Waveform dots/bars — animated, soft cyan, gently breathing.
             for i in range(WF_COLS):
-                env = math.sin((i / (WF_COLS - 1)) * math.pi)        # tallest in middle
-                amp = 0.35 + 0.65 * (0.5 + 0.5 * math.sin(t * 3.4 + i * 0.9))
-                bh  = 5 + 13 * env * amp
+                env = math.sin((i / (WF_COLS - 1)) * math.pi)
+                amp = 0.3 + 0.7 * (0.5 + 0.5 * math.sin(t * 5.5 + i * 1.1))
+                bh  = 4 + 16 * env * amp
                 bx  = gx0 + i * WF_GAP
-                ba  = int(150 + 90 * env * amp)
+                ba  = int(160 + 80 * env * amp)
                 bar = QPainterPath()
-                bar.addRoundedRect(bx - 1.4, row_cy - bh / 2, 2.8, bh, 1.4, 1.4)
+                bar.addRoundedRect(bx - 2.0, row_cy - bh / 2, 4.0, bh, 2.0, 2.0)
                 p.fillPath(bar, QBrush(QColor(c3.red(), c3.green(), c3.blue(), ba)))
 
-            # The spoken phrase, cross-fading next to the waveform.
+            # Spoken phrase — full 14px slide (was dampened to ~4px by * 0.4).
             if ta > 0:
                 text_x = int(gx0 + WF_W + GAP_TW)
-                ty     = int(row_cy - 11 + self._msg_slide * 0.4)
-                p.setPen(QColor(222, 230, 244, ta))
-                p.drawText(QRect(text_x, ty, text_w_px + 6, 22),
+                ty     = int(row_cy - 11 + self._msg_slide)
+                p.setPen(QColor(222, 232, 248, ta))
+                p.drawText(QRect(text_x, ty, text_w_px + 8, 22),
                            Qt.AlignVCenter | Qt.AlignLeft, msg)
 
-            # --- Vignette for depth (soft) ---
-            vg = QRadialGradient(cx, h * 0.46, max(w, h) * 0.80)
+            # --- Vignette for depth ---
+            vg = QRadialGradient(cx, h * 0.44, max(w, h) * 0.82)
             vg.setColorAt(0.0,  QColor(0, 0, 0, 0))
-            vg.setColorAt(0.55, QColor(0, 0, 0, 0))
-            vg.setColorAt(1.0,  QColor(0, 0, 0, 130))
+            vg.setColorAt(0.5,  QColor(0, 0, 0, 0))
+            vg.setColorAt(1.0,  QColor(0, 0, 0, 140))
             p.fillRect(QRect(0, 0, w, h), QBrush(vg))
 
-            # --- Wordmark ---
-            p.setPen(QColor(236, 240, 250, 200))
-            font.setPointSize(16); font.setBold(True)
-            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3.2)
+            # --- Wordmark — moved up to h-56, opacity 200→220 ---
+            p.setPen(QColor(236, 240, 252, 220))
+            font.setPointSize(15); font.setBold(True)
+            font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3.5)
             p.setFont(font)
-            p.drawText(0, h - 70, w, 28, Qt.AlignCenter, "O R Y N N")
+            p.drawText(0, h - 56, w, 28, Qt.AlignCenter, "O R Y N N")
 
             p.end()
 
@@ -821,12 +855,12 @@ def _build():  # imports deferred so importing this module never needs Qt
             self.orb_pane.set_state("idle")
             self._set_status("", error=False)
             self.sub.setText("Customize your Orynn experience.")
-            self.stacked.setCurrentWidget(self.page_prefs)
+            self._switch_page(self.page_prefs)
 
         def _on_back(self):
             self.orb_pane.set_state("idle")
             self.sub.setText("Let's get you set up — this only takes a moment.")
-            self.stacked.setCurrentWidget(self.page_keys)
+            self._switch_page(self.page_keys)
 
         def _on_finish(self):
             self.btn_finish.setEnabled(False)
@@ -872,9 +906,44 @@ def _build():  # imports deferred so importing this module never needs Qt
             # 3. Success page transition
             self.orb_pane.set_state("success")
             self.sub.setText("")
-            self.stacked.setCurrentWidget(self.page_success)
+            self._switch_page(self.page_success)
             from PySide6.QtCore import QTimer
             QTimer.singleShot(1500, self.close)
+
+        def _switch_page(self, widget: QWidget):
+            """Cross-fade the stacked widget to the target page (200ms ease-out)."""
+            if self.stacked.currentWidget() is widget:
+                return
+            # Fade out current page, switch, fade in new page.
+            out_fx = QGraphicsOpacityEffect(self.stacked)
+            self.stacked.currentWidget().setGraphicsEffect(out_fx)
+            anim_out = QPropertyAnimation(out_fx, b"opacity", self)
+            anim_out.setDuration(160)
+            anim_out.setStartValue(1.0)
+            anim_out.setEndValue(0.0)
+            anim_out.setEasingCurve(QEasingCurve.Type.InQuad)
+
+            def _do_switch():
+                self.stacked.setCurrentWidget(widget)
+                # Clean up old effect.
+                try:
+                    self.stacked.widget(self.stacked.indexOf(
+                        self.stacked.currentWidget())).setGraphicsEffect(None)
+                except Exception:
+                    pass
+                # Fade in.
+                in_fx = QGraphicsOpacityEffect(widget)
+                widget.setGraphicsEffect(in_fx)
+                anim_in = QPropertyAnimation(in_fx, b"opacity", self)
+                anim_in.setDuration(200)
+                anim_in.setStartValue(0.0)
+                anim_in.setEndValue(1.0)
+                anim_in.setEasingCurve(QEasingCurve.Type.OutCubic)
+                anim_in.finished.connect(lambda: widget.setGraphicsEffect(None))
+                anim_in.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
+
+            anim_out.finished.connect(_do_switch)
+            anim_out.start(QPropertyAnimation.DeletionPolicy.DeleteWhenStopped)
 
         def _set_status(self, text: str, error: bool):
             self.status.setText(text)
