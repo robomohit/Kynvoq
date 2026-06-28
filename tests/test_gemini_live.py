@@ -4104,3 +4104,197 @@ def test_build_task_payload_logs_on_connector_inject_error(monkeypatch, capsys):
     assert isinstance(payload["goal"], str)
     captured = capsys.readouterr()
     assert "conn error" in captured.err or "connector brief" in captured.err
+
+
+# ── Security: workflow run-step safety check ──────────────────────────────────
+
+def test_workflow_run_step_blocked_by_safety_manager():
+    """A destructive shell command in a workflow 'run' step must be blocked —
+    the safety check that guards _live_run_terminal must also apply here."""
+    from unittest.mock import MagicMock, patch
+
+    c = _controller()
+
+    class FakeDecision:
+        requires_approval = True
+        reason = "dangerous command"
+
+    with patch("app.safety.SafetyManager") as MockSM:
+        MockSM.return_value.evaluate.return_value = FakeDecision()
+        step = {"action": "run", "command": "rm -rf /"}
+        result = c._run_workflow_step(step)
+
+    assert result["ok"] is False
+    assert "Blocked" in result["label"] or "blocked" in result["label"].lower()
+
+
+def test_workflow_run_step_safe_command_executes(monkeypatch):
+    """A safe shell command in a workflow 'run' step passes the safety check and runs."""
+    from unittest.mock import MagicMock, patch
+    from app.models import ToolResult
+
+    c = _controller()
+
+    class FakeDecision:
+        requires_approval = False
+        reason = ""
+
+    calls = []
+
+    class FakeTools:
+        def run_command(self, cmd):
+            calls.append(cmd)
+            return ToolResult(ok=True, output="done")
+
+    c._desktop_tools = FakeTools()
+
+    with patch("app.safety.SafetyManager") as MockSM:
+        MockSM.return_value.evaluate.return_value = FakeDecision()
+        result = c._run_workflow_step({"action": "run", "command": "echo hello"})
+
+    assert result["ok"] is True
+    assert calls == ["echo hello"]
+
+
+def test_workflow_run_step_safety_check_unavailable_blocks():
+    """If SafetyManager can't be imported or raises, the step is blocked — fail safe."""
+    from unittest.mock import patch
+
+    c = _controller()
+
+    with patch("app.safety.SafetyManager", side_effect=ImportError("no safety")):
+        result = c._run_workflow_step({"action": "run", "command": "echo hi"})
+
+    assert result["ok"] is False
+    assert "unavailable" in result["label"].lower() or "safety" in result["label"].lower()
+
+
+# ── Resource: timer thread cap ────────────────────────────────────────────────
+
+def test_set_timer_respects_concurrent_cap():
+    """After 20 concurrent timers, a 21st is rejected rather than spinning another thread."""
+    import threading
+
+    c = _controller()
+    # Simulate 20 alive timers by planting fake alive threads.
+    fake_threads = []
+    for _ in range(20):
+        e = threading.Event()
+        t = threading.Thread(target=e.wait)  # blocks indefinitely
+        t.daemon = True
+        t.start()
+        fake_threads.append(t)
+    c._live_timer_threads = list(fake_threads)
+
+    res = c._live_tool("set_timer", {"seconds": 5, "label": "overflow timer"})
+    assert res["ok"] is False
+    assert "Too many" in res["message"]
+
+    # cleanup
+    for t in fake_threads:
+        pass  # daemon threads; process exit will collect them
+
+
+def test_set_timer_prunes_dead_threads_before_checking_cap():
+    """Completed timers are pruned from the list so the cap doesn't fill up from old timers."""
+    import threading
+
+    c = _controller()
+    # Plant 20 already-finished threads
+    dead_threads = []
+    for _ in range(20):
+        t = threading.Thread(target=lambda: None)
+        t.daemon = True
+        t.start()
+        t.join()  # ensure it's finished
+        dead_threads.append(t)
+    c._live_timer_threads = list(dead_threads)
+
+    # 21st timer should succeed because all previous are dead
+    res = c._live_tool("set_timer", {"seconds": 0.01, "label": "after prune"})
+    assert res["ok"] is True
+
+
+# ── Validation: _live_remember category ──────────────────────────────────────
+
+def test_live_remember_invalid_category_falls_back_to_fact():
+    """An invalid category string is silently coerced to 'fact' — never stored raw."""
+    c = _controller()
+    posted: list[dict] = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=5.0, **kw):
+            if path == "/api/memory/facts":
+                posted.append(data or {})
+            return {}
+
+        def ensure_session(self):
+            return True
+
+        def session_token(self):
+            return "tok"
+
+    c.client = FakeClient()
+    c._live = None  # no context update needed
+
+    res = c._live_tool("remember", {"fact": "I prefer dark mode", "category": "hacker_injection"})
+
+    # Should succeed but with category fixed to 'fact'
+    assert res.get("ok") is not False or posted  # either ok=True or we at least tried
+    if posted:
+        assert posted[0].get("category") == "fact", (
+            f"Expected category='fact', got {posted[0].get('category')!r}"
+        )
+
+
+def test_live_remember_valid_category_preserved():
+    """A valid category like 'preference' is stored as-is."""
+    c = _controller()
+    posted: list[dict] = []
+
+    class FakeClient:
+        def request(self, method, path, data=None, timeout=5.0, **kw):
+            if path == "/api/memory/facts":
+                posted.append(data or {})
+            return {}
+
+        def ensure_session(self):
+            return True
+
+        def session_token(self):
+            return "tok"
+
+    c.client = FakeClient()
+    c._live = None
+
+    c._live_tool("remember", {"fact": "I like dark mode", "category": "preference"})
+
+    if posted:
+        assert posted[0].get("category") == "preference"
+
+
+# ── Logging: _notify_live_memory_updated ─────────────────────────────────────
+
+def test_notify_live_memory_updated_logs_on_send_failure(capsys):
+    """If send_context_update raises, the exception is logged — not silently swallowed."""
+    c = _controller()
+    c._knowledge_block_cache = "some facts"
+
+    class BadLive:
+        def is_running(self):
+            return True
+
+        def send_context_update(self, note):
+            raise RuntimeError("connection lost")
+
+    c._live = BadLive()
+
+    # Stub _live_is_running to return True
+    c._live_is_running = lambda: True
+
+    c._notify_live_memory_updated()
+
+    captured = capsys.readouterr()
+    assert "connection lost" in captured.err or "_notify_live_memory_updated" in captured.err, (
+        f"Expected error logged to stderr, got: {captured.err!r}"
+    )

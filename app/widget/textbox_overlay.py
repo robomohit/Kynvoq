@@ -718,6 +718,7 @@ class OverlayController(QObject):
         self._knowledge_refreshed_at = 0.0
         self._live: Any = None
         self._live_cancel = threading.Event()
+        self._live_timer_threads: list[threading.Thread] = []  # cap concurrent timers
         # Wake-word mode: a background listener wakes Live on "Orynn" and lets it
         # sleep again after idle. _live_last_activity tracks the last user speech so
         # the session sleeps back to local wake-listening instead of streaming forever.
@@ -1984,6 +1985,9 @@ class OverlayController(QObject):
             return {"ok": False, "message": "Nothing to remember — say the fact."}
         owner = _clean_text(args.get("owner") or "user").lower()
         category = _clean_text(args.get("category") or "fact").lower()
+        _VALID_CATEGORIES = ("rule", "preference", "location", "vocab", "fact", "app")
+        if category not in _VALID_CATEGORIES:
+            category = "fact"
         try:
             self.client.request("POST", "/api/memory/facts",
                                 {"text": fact, "app": _clean_text(args.get("app") or ""),
@@ -2122,6 +2126,17 @@ class OverlayController(QObject):
         label = _clean_text(args.get("label") or "").strip()
         alert_text = label or "Your timer is up!"
 
+        # Prune completed timers and enforce a cap — prevents the model from
+        # accidentally (or maliciously) spawning thousands of sleeping threads.
+        _MAX_CONCURRENT_TIMERS = 20
+        self._live_timer_threads = [t for t in self._live_timer_threads if t.is_alive()]
+        if len(self._live_timer_threads) >= _MAX_CONCURRENT_TIMERS:
+            return {
+                "ok": False,
+                "message": f"Too many timers already running ({_MAX_CONCURRENT_TIMERS} max). "
+                           "Wait for one to fire before setting another.",
+            }
+
         companion_ref = self._live  # capture now; may be replaced if user restarts Live
 
         def _fire() -> None:
@@ -2138,6 +2153,7 @@ class OverlayController(QObject):
         import threading
         t = threading.Thread(target=_fire, daemon=True, name=f"orynn-timer-{int(seconds)}s")
         t.start()
+        self._live_timer_threads.append(t)
         mins, secs = divmod(int(seconds), 60)
         hrs, mins = divmod(mins, 60)
         if hrs:
@@ -2216,6 +2232,21 @@ class OverlayController(QObject):
             cmd = _clean_text(step.get("command") or "")
             if not cmd:
                 return {"ok": False, "label": "Empty command"}
+            # Run workflow steps through the SAME safety gate as _live_run_terminal —
+            # workflows bypass the terminal tool's explicit check, so we must guard here
+            # too. Fail SAFE on any error (same pattern: if the check fails, block).
+            try:
+                from app.safety import SafetyManager
+                from app.models import Action, ActionType
+                decision = SafetyManager().evaluate(
+                    Action(id="wf-run", type=ActionType.run_command, args={"command": cmd}),
+                    safe_mode=False,
+                )
+                if getattr(decision, "requires_approval", False):
+                    reason = getattr(decision, "reason", "safety check")
+                    return {"ok": False, "label": f"Blocked ({_short(reason, 60)})"}
+            except Exception:
+                return {"ok": False, "label": "Safety check unavailable — step skipped"}
             res = tools.run_command(cmd)
             return {"ok": bool(getattr(res, "ok", False)), "label": f"Ran: {_short(cmd, 40)}"}
         if action == "open":
@@ -2362,8 +2393,10 @@ class OverlayController(QObject):
         )
         try:
             live.send_context_update(note)
-        except Exception:
-            pass
+        except Exception as exc:
+            import sys
+            print(f"[Orynn] _notify_live_memory_updated: send_context_update failed: {exc}",
+                  file=sys.stderr, flush=True)
 
     def _touch_desktop_busy(self) -> None:
         self._active_task_running = True
