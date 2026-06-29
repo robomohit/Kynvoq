@@ -22,7 +22,7 @@ DEFAULTS: dict[str, Any] = {
     "effort": "medium",         # low | medium | high | max — trades speed for a
                                 # bigger model (free models have no reasoning knob)
     "onboarded": False,         # has the user finished first-run setup?
-    "first_live_run": True,     # is it the first time launching Gemini Live?
+    "active_skills": [],        # list of skill-ids toggled on by the user
 }
 
 _ALLOWED = {
@@ -51,6 +51,8 @@ def get_all() -> dict[str, Any]:
 def _coerce(key: str, value: Any) -> Any:
     """Validate/normalize a single preference against its default's type."""
     default = DEFAULTS[key]
+    if isinstance(default, list):
+        return list(value) if isinstance(value, (list, tuple)) else default
     if isinstance(default, bool):
         return bool(value)
     if key in _ALLOWED:

@@ -130,7 +130,11 @@
           </div>
         </div>
         <label class="onb-pref">
-          <span class="onb-pref-label">Let the AI talk back<span class="onb-pref-sub">Reads answers aloud + enables the mic</span></span>
+          <span class="onb-pref-label">Speak replies aloud<span class="onb-pref-sub">Read the agent's answers aloud with your PC voice</span></span>
+          <input type="checkbox" id="onb-speak" class="pref-switch">
+        </label>
+        <label class="onb-pref">
+          <span class="onb-pref-label">Voice input<span class="onb-pref-sub">Show the mic so you can talk to the agent</span></span>
           <input type="checkbox" id="onb-voice" class="pref-switch">
         </label>
         <button class="onb-primary" type="button" data-onb-next>Continue</button>
@@ -280,6 +284,28 @@
           </div>
           <p class="settings-hint trust-updated" id="trust-updated">Not loaded yet</p>
         </div>
+        <div class="skills-section" id="workflows-section" data-settings-tab="extensions">
+          <div class="history-header"><span>Workflow Library</span><span id="workflow-count">0</span></div>
+          <div class="skills-grid" id="workflows-grid" style="max-height:260px;overflow-y:auto;">
+            <!-- Rendered via JS -->
+          </div>
+        </div>
+        <div class="skills-section" id="memory-section" data-settings-tab="extensions">
+          <div class="history-header"><span>Knowledge Memory</span><span id="memory-count">0</span></div>
+          <div class="memory-search-row">
+            <input type="text" id="memory-search" class="pref-input" placeholder="Search facts…" style="flex:1">
+            <button class="key-save" id="memory-search-btn" type="button">Search</button>
+          </div>
+          <div class="skills-grid" id="memory-grid" style="max-height:260px;overflow-y:auto;">
+            <!-- Rendered via JS -->
+          </div>
+        </div>
+        <div class="skills-section" id="connectors-section" data-settings-tab="extensions">
+          <div class="history-header"><span>Linked Services</span><span id="connector-count">0</span></div>
+          <div class="skills-grid" id="connectors-grid">
+            <!-- Rendered via JS -->
+          </div>
+        </div>
         <div class="skills-section" id="skills-section" data-settings-tab="extensions">
           <div class="history-header"><span>Expertise Library</span><span id="skill-count">0</span></div>
           <div class="skills-grid" id="skills-grid">
@@ -362,6 +388,12 @@
             </button>
             <button class="example-btn" type="button" data-example="Clean up my Downloads folder by grouping obvious files, but ask before moving anything.">
               <div class="ex-body"><strong>Organize Downloads</strong><span>Plan first, ask before file moves, then verify.</span></div>
+            </button>
+            <button class="example-btn" type="button" data-example="Read my latest emails and give me a two-sentence summary of anything that needs a reply today.">
+              <div class="ex-body"><strong>Email digest</strong><span>Read inbox, flag anything needing a reply.</span></div>
+            </button>
+            <button class="example-btn" type="button" data-example="I'll describe what I want — listen to me speak, then carry out the task on my desktop.">
+              <div class="ex-body"><strong>Voice task</strong><span>Enable the mic in Settings → voice input, then speak your request.</span></div>
             </button>
           </div>
         </section>
@@ -508,6 +540,9 @@
       <div class="shortcut-row"><span>Command palette</span><kbd>Ctrl+K</kbd></div>
       <div class="shortcut-row"><span>Pause / resume</span><kbd>Space</kbd></div>
       <div class="shortcut-row"><span>Close modal</span><kbd>Esc</kbd></div>
+      <div class="shortcut-row"><span>Summon floating assistant</span><kbd>Ctrl+Shift+Space</kbd></div>
+      <div class="shortcut-row"><span>Start Live mode</span><kbd>Ctrl+Shift+L</kbd></div>
+      <div class="shortcut-row"><span>Emergency stop</span><kbd>Ctrl+Shift+X</kbd></div>
     </div>
   </div>
 </div>
@@ -562,6 +597,22 @@
       <button class="modal-btn" id="readiness-preflight-settings" type="button">Open Settings</button>
       <button class="modal-btn" id="readiness-preflight-cancel" type="button">Cancel</button>
       <button class="modal-btn primary" id="readiness-preflight-continue" type="button">Run Anyway</button>
+    </div>
+  </div>
+</div>
+
+<!-- Save-as-workflow modal -->
+<div class="overlay" id="save-workflow">
+  <div class="modal">
+    <div class="eyebrow" style="color: var(--accent); font-size: var(--fs-label); font-weight: 600; letter-spacing: var(--track-cap); text-transform: uppercase;">Save as workflow</div>
+    <h3>Save this task as a reusable workflow</h3>
+    <p style="font-size:var(--fs-label);color:var(--muted-2);margin:4px 0 10px">Give it a name and Orynn will recognise it next time you describe a similar task.</p>
+    <input type="text" id="wf-name" class="pref-input" placeholder="Workflow name" style="margin-bottom:8px">
+    <textarea id="wf-desc" class="pref-input" rows="2" placeholder="Optional description" style="resize:vertical;margin-bottom:8px"></textarea>
+    <input type="text" id="wf-triggers" class="pref-input" placeholder="Trigger phrases (comma-separated, optional)">
+    <div class="modal-actions" style="margin-top:14px">
+      <button class="modal-btn" id="wf-cancel" type="button">Cancel</button>
+      <button class="modal-btn primary" id="wf-save" type="button">Save workflow</button>
     </div>
   </div>
 </div>

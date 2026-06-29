@@ -737,7 +737,7 @@ def _build():  # imports deferred so importing this module never needs Qt
             success_title.setAlignment(Qt.AlignCenter)
             success_lay.addWidget(success_title)
 
-            success_desc = QLabel("Orynn is starting now. Press the hotkey to activate.")
+            success_desc = QLabel("Orynn is starting now. Press Ctrl+Shift+Space to summon the floating assistant, or Ctrl+Shift+L to start Live mode.")
             success_desc.setStyleSheet(f"color:{MUTED};font-size:13px;")
             success_desc.setAlignment(Qt.AlignCenter)
             success_desc.setWordWrap(True)
@@ -894,7 +894,6 @@ def _build():  # imports deferred so importing this module never needs Qt
                 "voice_input": self.btn_mic.isChecked(),
                 "wake_word": self.wake_word.text().strip() or "Orynn",
                 "onboarded": True,
-                "first_live_run": True,
             }
             
             try:

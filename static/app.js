@@ -122,10 +122,19 @@
       loadReadiness();
       loadTrustReport();
       loadCodingBackends();
+      loadConnectors();
+      loadWorkflows();
+      loadMemoryFacts();
     };
     const close = () => overlay.classList.remove('show');
     openBtn.onclick = open;
     if (closeBtn) closeBtn.onclick = close;
+    document.getElementById('memory-search-btn')?.addEventListener('click', () => {
+      loadMemoryFacts(($('memory-search')?.value || '').trim());
+    });
+    document.getElementById('memory-search')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') loadMemoryFacts((e.target.value || '').trim());
+    });
     overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape' && overlay.classList.contains('show')) {
@@ -1099,10 +1108,40 @@
     if (taskId) {
       const up = mk('up', 'Good response', () => sendMessageFeedback(taskId, 'up', up, down));
       const down = mk('down', 'Needs work', () => sendMessageFeedback(taskId, 'down', down, up));
-      bar.append(up, down);
+      const save = mk('save-wf', 'Save as workflow', () => openSaveWorkflowModal(text));
+      bar.append(up, down, save);
     }
     el.appendChild(bar);
   };
+  const openSaveWorkflowModal = (taskText = '') => {
+    const overlay = $('save-workflow');
+    if (!overlay) return;
+    const nameEl = $('wf-name');
+    const descEl = $('wf-desc');
+    const triggersEl = $('wf-triggers');
+    if (nameEl) nameEl.value = '';
+    if (descEl) descEl.value = '';
+    if (triggersEl) triggersEl.value = taskText.slice(0, 120);
+    overlay.classList.add('show');
+    setTimeout(() => nameEl?.focus(), 60);
+  };
+
+  $('wf-cancel')?.addEventListener('click', () => $('save-workflow')?.classList.remove('show'));
+  $('wf-save')?.addEventListener('click', async () => {
+    const name = ($('wf-name')?.value || '').trim();
+    if (!name) { $('wf-name')?.focus(); return; }
+    const desc = ($('wf-desc')?.value || '').trim();
+    const triggers = ($('wf-triggers')?.value || '').split(',').map((s) => s.trim()).filter(Boolean);
+    try {
+      await api('/api/workflows', 'POST', { name, description: desc, triggers, steps: [] });
+      $('save-workflow')?.classList.remove('show');
+      toast('Workflow saved.', 'ok', 1800);
+      loadWorkflows();
+    } catch (e) {
+      toast('Could not save workflow.', 'warn', 2000);
+    }
+  });
+
   const sendMessageFeedback = (taskId, rating, btn, other) => {
     if (btn.classList.contains('chosen')) return;
     btn.classList.add('chosen');
@@ -1257,10 +1296,17 @@
           ['Stop control', 'Pause or cancel from the top bar at any time', 'Available']
         ];
     list.innerHTML = '';
-    rows.forEach(([title, copy, badge]) => {
+    rows.forEach(([title, copy, badge], idx) => {
       const row = document.createElement('div');
       row.className = 'desktop-access-row';
+      const chk = document.createElement('input');
+      chk.type = 'checkbox';
+      chk.checked = true;
+      chk.id = `dac-${idx}`;
+      chk.dataset.scope = title.toLowerCase().replace(/\s+/g, '_');
+      chk.style.cssText = 'margin-right:10px;flex-shrink:0;accent-color:var(--accent);';
       const text = document.createElement('div');
+      text.style.flex = '1';
       const strong = document.createElement('strong');
       strong.textContent = title;
       const span = document.createElement('span');
@@ -1270,6 +1316,7 @@
       const badgeEl = document.createElement('div');
       badgeEl.className = 'desktop-access-badge';
       badgeEl.textContent = badge;
+      row.appendChild(chk);
       row.appendChild(text);
       row.appendChild(badgeEl);
       list.appendChild(row);
@@ -1514,7 +1561,8 @@
     item.className = `history-item${makeActive ? ' active' : ''}${isTerminal ? ' terminal' : ''}`;
     item.dataset.taskId = taskRecord.id || '';
     const dotState = (status === 'running' || status === 'queued' || status === 'pending') ? 'running'
-      : status === 'paused' ? 'paused' : '';
+      : status === 'paused' ? 'paused'
+      : (status === 'failed' || status === 'error') ? 'failed' : '';
     const dot = document.createElement('span');
     dot.className = `history-dot ${dotState}`.trim();
     const copy = document.createElement('span');
@@ -4106,6 +4154,10 @@
     $('permission').classList.remove('show');
   };
   const resolveDesktopAccess = (allow) => {
+    const checkedScopes = allow
+      ? Array.from($('desktop-access-list')?.querySelectorAll('input[type=checkbox]:checked') || [])
+          .map((el) => el.dataset.scope).filter(Boolean)
+      : [];
     $('desktop-access').classList.remove('show');
     if (window.pendingDesktopPermission) {
       api('/api/permissions', 'POST', {
@@ -4113,13 +4165,14 @@
         action_id: window.pendingPermissionId,
         grant: allow,
         scope: window.pendingPermissionScope || 'desktop',
+        desktop_scope: checkedScopes,
       }).catch(() => {});
       window.pendingDesktopPermission = false;
       window.pendingPermissionId = null;
       window.pendingPermissionScope = null;
       return;
     }
-    if (desktopAccessResolver) desktopAccessResolver(allow);
+    if (desktopAccessResolver) desktopAccessResolver(allow ? { allow: true, scopes: checkedScopes } : { allow: false, scopes: [] });
     desktopAccessResolver = null;
   };
 
@@ -4435,6 +4488,7 @@
       }).catch(() => { suppressHistoryReflow = false; });
       await recoverActiveTask();
       loadSkills();
+      loadConnectors();
       loadReadiness();
       loadTrustReport();
       loadMCP();
@@ -4464,6 +4518,187 @@
   };
   setInterval(refreshProviderChips, 60000);
 
+  let allWorkflows = [];
+
+  const loadWorkflows = async () => {
+    try {
+      const d = await api('/api/workflows');
+      allWorkflows = d.workflows || [];
+      renderWorkflows();
+    } catch (e) { console.error('Failed to load workflows', e); }
+  };
+
+  const renderWorkflows = () => {
+    const grid = $('workflows-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    const countEl = $('workflow-count');
+    if (!allWorkflows.length) {
+      const empty = document.createElement('p');
+      empty.className = 'grid-empty';
+      empty.textContent = 'No workflows saved yet. Complete a task and save it as a workflow.';
+      grid.appendChild(empty);
+      if (countEl) countEl.textContent = '0';
+      return;
+    }
+    if (countEl) countEl.textContent = allWorkflows.length;
+    allWorkflows.forEach((wf) => {
+      const item = document.createElement('div');
+      item.className = 'skill-item';
+      const info = document.createElement('div');
+      info.className = 'skill-info';
+      info.style.flex = '1';
+      const name = document.createElement('div');
+      name.className = 'skill-name';
+      name.textContent = wf.name || wf.title || 'Workflow';
+      const desc = document.createElement('div');
+      desc.className = 'skill-desc';
+      const parts = [];
+      if (wf.description) parts.push(wf.description);
+      if (wf.run_count) parts.push(`${wf.run_count} run${wf.run_count !== 1 ? 's' : ''}`);
+      desc.textContent = parts.join(' · ');
+      info.append(name, desc);
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'skill-toggle';
+      del.textContent = '×';
+      del.title = 'Delete workflow';
+      del.style.cssText = 'width:26px;min-width:26px;font-size:15px;background:transparent;color:var(--err);border-color:transparent;';
+      del.addEventListener('click', async () => {
+        del.disabled = true;
+        try {
+          await api(`/api/workflows/${encodeURIComponent(wf.name || wf.title)}`, 'DELETE');
+          allWorkflows = allWorkflows.filter((x) => (x.name || x.title) !== (wf.name || wf.title));
+          renderWorkflows();
+        } catch (_) { del.disabled = false; }
+      });
+      item.append(info, del);
+      grid.appendChild(item);
+    });
+  };
+
+  let memoryFacts = [];
+
+  const loadMemoryFacts = async (q = '') => {
+    try {
+      const url = q ? `/api/memory/facts?q=${encodeURIComponent(q)}` : '/api/memory/facts';
+      const d = await api(url);
+      memoryFacts = d.facts || [];
+      renderMemoryFacts();
+    } catch (e) { console.error('Failed to load memory facts', e); }
+  };
+
+  const renderMemoryFacts = () => {
+    const grid = $('memory-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    const countEl = $('memory-count');
+    if (!memoryFacts.length) {
+      const empty = document.createElement('p');
+      empty.className = 'grid-empty';
+      empty.textContent = 'No facts stored yet. Orynn learns as you work.';
+      grid.appendChild(empty);
+      if (countEl) countEl.textContent = '0';
+      return;
+    }
+    if (countEl) countEl.textContent = memoryFacts.length;
+    memoryFacts.forEach((f) => {
+      const item = document.createElement('div');
+      item.className = 'skill-item';
+      item.style.flexWrap = 'wrap';
+      const info = document.createElement('div');
+      info.className = 'skill-info';
+      info.style.flex = '1';
+      const text = document.createElement('div');
+      text.className = 'skill-name';
+      text.style.fontWeight = 'normal';
+      text.textContent = f.text || '';
+      const meta = document.createElement('div');
+      meta.className = 'skill-desc';
+      meta.textContent = [f.category, f.owner, f.app].filter(Boolean).join(' · ');
+      info.append(text, meta);
+      const del = document.createElement('button');
+      del.type = 'button';
+      del.className = 'skill-toggle';
+      del.textContent = '×';
+      del.title = 'Forget this fact';
+      del.style.cssText = 'width:26px;min-width:26px;font-size:15px;background:transparent;color:var(--err);border-color:transparent;';
+      del.addEventListener('click', async () => {
+        del.disabled = true;
+        try {
+          await api('/api/memory/forget', 'POST', { query: f.text });
+          memoryFacts = memoryFacts.filter((x) => x.text !== f.text);
+          renderMemoryFacts();
+        } catch (_) { del.disabled = false; }
+      });
+      item.append(info, del);
+      grid.appendChild(item);
+    });
+  };
+
+  let allConnectors = [];
+
+  const loadConnectors = async () => {
+    try {
+      const d = await api('/api/connectors');
+      allConnectors = d.connectors || [];
+      renderConnectors();
+    } catch (e) { console.error('Failed to load connectors', e); }
+  };
+
+  const renderConnectors = () => {
+    const grid = $('connectors-grid');
+    if (!grid) return;
+    grid.innerHTML = '';
+    if (!allConnectors.length) {
+      const empty = document.createElement('p');
+      empty.className = 'grid-empty';
+      empty.textContent = 'No connectors available.';
+      grid.appendChild(empty);
+      const countEl = $('connector-count');
+      if (countEl) countEl.textContent = '0';
+      return;
+    }
+    let linked = 0;
+    allConnectors.forEach((c) => {
+      const item = document.createElement('div');
+      item.className = 'skill-item';
+      const info = document.createElement('div');
+      info.className = 'skill-info';
+      const name = document.createElement('div');
+      name.className = 'skill-name';
+      name.textContent = c.name || c.id || 'Service';
+      const desc = document.createElement('div');
+      desc.className = 'skill-desc';
+      desc.textContent = c.description || '';
+      info.append(name, desc);
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = `skill-toggle connector-btn${c.linked ? ' active' : ''}`;
+      btn.textContent = c.linked ? 'Unlink' : 'Link';
+      btn.style.cssText = 'width:auto;min-width:56px;font-size:11px;padding:3px 8px;';
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          if (c.linked) {
+            await api(`/api/connectors/${encodeURIComponent(c.id)}/unlink`, 'POST');
+            c.linked = false;
+          } else {
+            await api(`/api/connectors/${encodeURIComponent(c.id)}/link`, 'POST');
+            c.linked = true;
+          }
+          renderConnectors();
+        } catch (_) { btn.disabled = false; }
+      });
+      item.append(info, btn);
+      grid.appendChild(item);
+      if (c.linked) linked++;
+    });
+    const countEl = $('connector-count');
+    if (countEl) countEl.textContent = linked;
+  };
+
   let allSkills = [];
   let activeSkillIds = new Set();
 
@@ -4480,6 +4715,14 @@
     const grid = $('skills-grid');
     if (!grid) return;
     grid.innerHTML = '';
+    if (!allSkills.length) {
+      const empty = document.createElement('p');
+      empty.className = 'grid-empty';
+      empty.textContent = 'No skills found. Add skill files to the skills/ folder.';
+      grid.appendChild(empty);
+      $('skill-count').textContent = '0';
+      return;
+    }
     allSkills.forEach((s) => {
       const item = document.createElement('button');
       item.type = 'button';
@@ -4508,6 +4751,11 @@
     if (activeSkillIds.has(id)) activeSkillIds.delete(id);
     else activeSkillIds.add(id);
     renderSkills();
+    fetch('/api/preferences', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ preferences: { active_skills: Array.from(activeSkillIds) } }),
+    }).catch(() => {});
   };
 
   let readinessState = { checks: [], overall: 'unknown', score: 0, summary: {} };
@@ -4570,8 +4818,14 @@
       name.textContent = check.label || check.key || 'Capability';
       const detail = document.createElement('div');
       detail.className = 'readiness-detail';
-      detail.textContent = check.detail || check.fix || '';
+      detail.textContent = check.detail || '';
       info.append(name, detail);
+      if (check.fix && check.fix !== check.detail) {
+        const fix = document.createElement('div');
+        fix.className = 'readiness-fix';
+        fix.textContent = check.fix;
+        info.appendChild(fix);
+      }
 
       const badge = document.createElement('span');
       badge.className = 'readiness-status';
@@ -4855,6 +5109,15 @@
     const grid = $('mcp-grid');
     if (!grid) return;
     grid.innerHTML = '';
+    if (!allMCPServers.length) {
+      const empty = document.createElement('p');
+      empty.className = 'grid-empty';
+      empty.textContent = 'No MCP servers configured. Add servers in mcp_servers.json.';
+      grid.appendChild(empty);
+      const countEl = $('mcp-count');
+      if (countEl) countEl.textContent = '0';
+      return;
+    }
     allMCPServers.forEach((s, idx) => {
       const item = document.createElement('button');
       item.type = 'button';
@@ -4887,6 +5150,15 @@
     if (!grid) return;
     const backends = codingBackendState.backends || [];
     grid.innerHTML = '';
+    if (!backends.length) {
+      const empty = document.createElement('p');
+      empty.className = 'grid-empty';
+      empty.textContent = 'No coding backends detected. Install Claude Code, Cursor, or a similar tool.';
+      grid.appendChild(empty);
+      const countEl = $('coding-backend-count');
+      if (countEl) countEl.textContent = '0';
+      return;
+    }
     backends.forEach((backend) => {
       const item = document.createElement('div');
       item.className = 'skill-item';
@@ -5746,6 +6018,10 @@
     chk('pref-voice-input', prefs.voice_input);
     chk('pref-glow', prefs.show_action_glow);
     chk('pref-confirm', prefs.confirm_sensitive);
+    if (Array.isArray(prefs.active_skills)) {
+      activeSkillIds = new Set(prefs.active_skills);
+      renderSkills();
+    }
   }
 
   function flashSaved(){
@@ -5821,7 +6097,7 @@
   const steps = Array.from(overlay.querySelectorAll('.onb-step'));
   const TOTAL = steps.length;
   let cur = 1;
-  const draft = { voice: false };
+  const draft = { speak: false, voice: false };
 
   async function ensureSession(){ try { await fetch('/api/session', {method:'POST'}); } catch(_){} }
 
@@ -5880,7 +6156,7 @@
 
   // ── Finish ──
   async function finish(){
-    await savePrefs({ onboarded: true, speak_replies: draft.voice, voice_input: draft.voice });
+    await savePrefs({ onboarded: true, speak_replies: draft.speak, voice_input: draft.voice });
     overlay.hidden = true;
   }
 
@@ -5903,6 +6179,7 @@
       applyThemeNow(t);
       savePrefs({ theme: t });
     }));
+    document.getElementById('onb-speak')?.addEventListener('change', e => { draft.speak = e.target.checked; });
     document.getElementById('onb-voice')?.addEventListener('change', e => { draft.voice = e.target.checked; });
     document.getElementById('onb-finish')?.addEventListener('click', finish);
   }

@@ -1922,6 +1922,52 @@ async def unlink_connector(connector_id: str):
     return unlink(connector_id)
 
 
+@app.get("/api/workflows", dependencies=[Depends(verify_token)])
+async def get_workflows(q: str = ""):
+    """List all saved workflows, optionally filtered by query."""
+    from . import workflows as wf_mod
+    if q:
+        items = wf_mod.relevant(q, limit=50)
+    else:
+        items = wf_mod.all_workflows()
+    return {"workflows": items}
+
+
+class _WorkflowBody(BaseModel):
+    name: str
+    description: str = ""
+    triggers: list[str] = []
+    steps: list[dict] = []
+    owner: str = "user"
+
+
+@app.post("/api/workflows", dependencies=[Depends(verify_token)])
+async def save_workflow(body: _WorkflowBody):
+    """Save a new workflow (or overwrite one with the same name)."""
+    from . import workflows as wf_mod
+    wf = await asyncio.to_thread(
+        wf_mod.add_workflow,
+        body.name,
+        description=body.description,
+        triggers=body.triggers,
+        steps=body.steps,
+        owner=body.owner,
+    )
+    if wf is None:
+        raise HTTPException(status_code=400, detail="Workflow name is required and steps must not be empty.")
+    return {"ok": True, "workflow": wf}
+
+
+@app.delete("/api/workflows/{name}", dependencies=[Depends(verify_token)])
+async def delete_workflow(name: str):
+    """Delete a workflow by name (URL-decoded)."""
+    from . import workflows as wf_mod
+    removed = await asyncio.to_thread(wf_mod.forget_workflow, name)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Workflow not found.")
+    return {"ok": True, "removed": removed}
+
+
 # ── Desktop-features API (snap layouts, telemetry promise, autostart) ──
 @app.get("/api/desktop/telemetry", dependencies=[Depends(verify_token)])
 async def telemetry_promise():

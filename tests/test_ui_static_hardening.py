@@ -238,7 +238,8 @@ def test_settings_modal_surfaces_readiness_preflight():
     assert "renderReadiness" in js
     assert "/api/readiness" in js
     assert "await keyReady;\n      readinessState = await api('/api/readiness')" in js
-    assert "detail.textContent = check.detail || check.fix || ''" in js
+    assert "detail.textContent = check.detail || ''" in js
+    assert "readiness-fix" in js
     assert ".readiness-grid" in css
     assert ".readiness-item" in css
     assert "#readiness-score[data-status='ready']" in css
