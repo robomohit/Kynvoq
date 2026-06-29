@@ -10,14 +10,21 @@ import pytest
 
 def _make_client(tmp_path, monkeypatch):
     """Return a TestClient with a fresh temp workspace so tests don't share state."""
-    monkeypatch.setenv("ORYNN_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("APP_SECRET", "test-secret")
     monkeypatch.setenv("SESSION_TOKEN", "test-token")
 
+    # Patch store_path directly so test writes go to tmp_path, not the real workspace.
+    wf_store = tmp_path / "workflows" / "workflows.json"
+    pref_store = tmp_path / "preferences.json"
+
     import app.workflows as wf_mod
     importlib.reload(wf_mod)
+    monkeypatch.setattr(wf_mod, "store_path", lambda: wf_store)
+
     import app.preferences as pref_mod
     importlib.reload(pref_mod)
+    monkeypatch.setattr(pref_mod, "store_path", lambda: pref_store)
+
     import app.main as main_mod
     importlib.reload(main_mod)
 

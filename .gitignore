@@ -29,6 +29,7 @@ test_workspace/
 chroma_memory/
 tasks/*.json
 !tasks/.gitkeep
+workflows/workflows.json
 *.log
 workspace/logs/
 screenshots/
