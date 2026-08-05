@@ -81,6 +81,7 @@ def test_function_declarations_cover_desktop_tools():
         "add_watcher",
         "list_watchers",
         "remove_watcher",
+        "suggestion_feedback",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")

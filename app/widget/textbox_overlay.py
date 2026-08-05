@@ -1370,6 +1370,12 @@ class OverlayController(QObject):
         self._set_glow_visible(True)
         self.glowStateRequested.emit("attention")
         self.notifyRequested.emit("Orynn", _short(message, 200))
+        # Voice-first response channel: a proactive OFFER stays silent on this
+        # ladder, but if a Live session is up, slip it into the model's context
+        # (NOT spoken) so the user can simply talk back — "yes, do it" — and
+        # Live routes it to suggestion_feedback.
+        if str(event.get("kind") or "") == "suggestion":
+            self._notify_live_offer(message)
         if severity in ("notice", "critical"):
             try:
                 from . import voice
@@ -1392,6 +1398,26 @@ class OverlayController(QObject):
                 self._set_glow_visible(False)
 
         threading.Thread(target=settle, daemon=True).start()
+
+    def _notify_live_offer(self, message: str) -> None:
+        """Tell an ACTIVE Live session about a just-surfaced proactive offer —
+        as silent context, never a spoken alert (the offer's whole contract is
+        that it doesn't interrupt). Best-effort: no session, no harm; a woken
+        session later still learns of pending offers via _live_context_block."""
+        try:
+            if not self._live_is_running():
+                return
+            live = self._live
+            if live is None or not hasattr(live, "send_context_update"):
+                return
+            live.send_context_update(
+                "[context, not the user] Orynn just showed the user a proactive "
+                f"suggestion SILENTLY (taskbar glow + notification): \"{message}\" "
+                "Do NOT bring it up or speak about it unprompted. If the user "
+                "responds to it — \"yes do it\", \"not now\", \"stop suggesting "
+                "that\" — call suggestion_feedback (accept / not_now / mute).")
+        except Exception:
+            pass
 
     def _idle_watchdog_loop(self) -> None:
         """Always-on enforcement of the wake-mode idle timeout. The old
@@ -2898,6 +2924,43 @@ class OverlayController(QObject):
             ),
         }
 
+    def _live_suggestion_feedback(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Voice is the response channel for proactive offers: the user talks
+        back naturally ("yes, do it" / "not now" / "stop suggesting that") and
+        Live routes it here. Resolution + learning signals live in
+        app/proactivity.py (same cooldown/strike/mute gauntlet as always);
+        an accept additionally RUNS the offered goal as a background task —
+        the one place a suggestion turns into action, and only on the user's
+        spoken yes."""
+        from ..proactivity import respond_to_offer
+        offer, action, err = respond_to_offer(
+            _clean_text(args.get("response") or "").strip(),
+            _clean_text(args.get("query") or "").strip(),
+        )
+        if offer is None:
+            return {"ok": False,
+                    "message": f"Couldn't apply that: {err}. If the user "
+                               "wasn't answering a suggestion, just respond "
+                               "normally instead."}
+        goal = str(offer.get("goal") or "").strip()
+        if action == "accept":
+            if not goal:
+                return {"ok": True, "action": action,
+                        "message": "Noted as accepted, but there was no "
+                                   "runnable goal attached."}
+            self._submit_voice_task(goal)
+            return {"ok": True, "action": action, "goal": goal,
+                    "message": f"Started in the background: {goal}. Tell the "
+                               "user it's underway — you'll report when done."}
+        if action == "not_now":
+            return {"ok": True, "action": action,
+                    "message": f"Okay — '{goal}' won't be suggested again for "
+                               "about a week. Acknowledge briefly."}
+        return {"ok": True, "action": action,
+                "message": f"Muted — Orynn will never suggest '{goal}' again "
+                           "unless the user asks to unmute it. Acknowledge "
+                           "briefly."}
+
     def _live_list_watchers(self) -> dict[str, Any]:
         """Return every watcher plus recent fires so the model can read them out."""
         from ..watchers import get_engine
@@ -3414,6 +3477,16 @@ class OverlayController(QObject):
             import sys
             print(f"[Orynn] _live_context_block: workflow read failed: {_wf_exc}",
                   file=sys.stderr, flush=True)
+        # Pending proactive offers (app/proactivity.py) — so a Live session
+        # woken AFTER a silent glow+toast offer still understands "yes, do it"
+        # and routes it to suggestion_feedback. Tiny local JSON read.
+        try:
+            from ..proactivity import offers_prompt_block
+            ob = offers_prompt_block()
+            if ob:
+                parts.append(ob)
+        except Exception:
+            pass
         return "\n\n".join(parts)
 
     def _notify_live_memory_updated(self) -> None:
@@ -3600,6 +3673,8 @@ class OverlayController(QObject):
             return self._live_list_watchers()
         if name == "remove_watcher":
             return self._live_remove_watcher(args)
+        if name == "suggestion_feedback":
+            return self._live_suggestion_feedback(args)
         if name == "get_notifications":
             return self._live_get_notifications(args)
         if name == "get_clipboard":

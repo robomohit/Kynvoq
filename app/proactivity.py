@@ -68,6 +68,9 @@ HABIT_SPREAD_H = 1.5           # max mean deviation from the habitual hour
 HABIT_FIRE_WINDOW_H = 0.75     # fires only within ±45 min of the habitual hour
 SEQ_MIN_COUNT = 3              # times A→B must repeat before it's a pattern
 SEQ_WINDOW_S = 45 * 60         # max gap for "B follows A"
+
+OFFER_TTL_S = 2 * 3600         # a spoken "yes" only makes sense near the offer
+OFFERS_MAX = 6                 # pending-offer memory cap
 STALE_MIN_COUNT = 3            # occurrences before a cadence is "established"
 STALE_MIN_INTERVAL_S = 20 * 3600       # cadences shorter than ~a day aren't habits
 STALE_OVERDUE_FACTOR = 1.5     # overdue by 1.5× the usual interval → mention it
@@ -160,6 +163,8 @@ def _load_brain() -> dict[str, Any]:
         data["decisions"] = []
     if not isinstance(data.get("budget"), dict):
         data["budget"] = {}
+    if not isinstance(data.get("offers"), list):
+        data["offers"] = []
     return data
 
 
@@ -685,6 +690,9 @@ def emit_due_suggestions(on_event: Callable[[dict[str, Any]], None], *,
             "confidence": s["confidence"],
         }
         _mark_surfaced(s["key"], now_ts, counted=True)
+        _remember_offer({"key": s["key"], "kind": s["kind"],
+                         "goal": s["goal"], "message": message,
+                         "ts": now_ts})
         _journal_decision(event, "surfaced", "llm" if use_llm else "rule",
                           s["confidence"], f"mined {s['kind']} pattern",
                           now=now_ts)
@@ -694,6 +702,140 @@ def emit_due_suggestions(on_event: Callable[[dict[str, Any]], None], *,
             pass
         emitted.append(event)
     return emitted
+
+
+# ── the voice feedback loop: spoken answers to surfaced offers ───────────────
+# The glow + toast is the SURFACE; the user's voice is the response channel.
+# Every offer that surfaces is remembered briefly, so when the user says
+# "yes, do it" / "not now" / "stop suggesting that" — to Gemini Live, seconds
+# or minutes later — the reply can be resolved back to the right suggestion
+# and fed into exactly the same learning signals the gauntlet already uses.
+
+# Keys are matched after lowercasing and underscore→space folding, so
+# "not_now", "Not now", and "NOT NOW" all land on the same entry.
+_RESPONSE_ALIASES: dict[str, str] = {
+    "accept": "accept", "yes": "accept", "yeah": "accept", "sure": "accept",
+    "ok": "accept", "okay": "accept", "do it": "accept", "run": "accept",
+    "run it": "accept", "go": "accept", "go ahead": "accept",
+    "not now": "not_now", "later": "not_now", "no": "not_now",
+    "nope": "not_now", "decline": "not_now", "dismiss": "not_now",
+    "skip": "not_now", "not today": "not_now",
+    "mute": "mute", "stop": "mute", "never": "mute", "stop suggesting": "mute",
+    "stop suggesting that": "mute", "never again": "mute", "don't ask": "mute",
+}
+
+
+def normalize_response(text: str) -> str | None:
+    """Map a spoken/model-supplied response to accept | not_now | mute."""
+    t = re.sub(r"\s+", " ", str(text or "").replace("_", " ")).strip().lower()
+    return _RESPONSE_ALIASES.get(t)
+
+
+def _prune_offers(offers: Any, now_ts: float) -> list[dict[str, Any]]:
+    out = [o for o in (offers if isinstance(offers, list) else [])
+           if isinstance(o, dict) and o.get("key")
+           and now_ts - float(o.get("ts", 0.0)) <= OFFER_TTL_S]
+    return out[-OFFERS_MAX:]
+
+
+def _remember_offer(offer: dict[str, Any]) -> None:
+    ts = float(offer.get("ts") or time.time())
+    with _BRAIN_LOCK:
+        brain = _load_brain()
+        offers = _prune_offers(brain["offers"], ts)
+        offers = [o for o in offers if o.get("key") != offer.get("key")]
+        offers.append(dict(offer))
+        brain["offers"] = offers[-OFFERS_MAX:]
+        _save_brain(brain)
+
+
+def recent_offers(now: float | None = None,
+                  limit: int = OFFERS_MAX) -> list[dict[str, Any]]:
+    """Unanswered offers still fresh enough to respond to, newest last."""
+    now_ts = time.time() if now is None else float(now)
+    with _BRAIN_LOCK:
+        brain = _load_brain()
+        offers = _prune_offers(brain["offers"], now_ts)
+    return [dict(o) for o in offers[-max(1, int(limit)):]]
+
+
+def respond_to_offer(response: str, query: str = "",
+                     now: float | None = None,
+                     ) -> tuple[dict[str, Any] | None, str, str]:
+    """THE voice-feedback entry point. Resolve a spoken reply to one pending
+    offer and apply the matching learning signal:
+
+      accept  → record_feedback(accepted=True) — strikes reset, habit confirmed
+                (the caller runs the offer's goal; this module never acts)
+      not_now → record_feedback(accepted=False) — a week of silence
+      mute    → mute(key, forever=True) — never again unless unmuted
+
+    ``query`` narrows WHICH offer ("the backup one"); empty means the most
+    recent. Returns (offer, action, error) — offer is None with a helpful
+    error when nothing matches, and the offer is consumed on success so the
+    same "yes" can't be applied twice."""
+    now_ts = time.time() if now is None else float(now)
+    action = normalize_response(response)
+    if action is None:
+        return None, "", ("say it as accept, not_now, or mute "
+                          f"(got '{str(response)[:40]}')")
+    q = re.sub(r"\s+", " ", str(query or "")).strip().lower()
+    with _BRAIN_LOCK:
+        brain = _load_brain()
+        offers = _prune_offers(brain["offers"], now_ts)
+        if not q:
+            pick = offers[-1] if offers else None
+        else:
+            matches = [o for o in offers
+                       if q == str(o.get("key", "")).lower()
+                       or q in " ".join(str(o.get(k, ""))
+                                        for k in ("message", "goal", "kind",
+                                                  "key")).lower()]
+            pick = matches[-1] if matches else None
+        if pick is None:
+            brain["offers"] = offers
+            _save_brain(brain)
+            if not offers:
+                return None, action, "no recent suggestion to respond to"
+            listing = "; ".join(str(o.get("goal") or o.get("key"))[:60]
+                                for o in offers[-3:])
+            return None, action, f"no suggestion matches — pending: {listing}"
+        brain["offers"] = [o for o in offers if o is not pick]
+        _save_brain(brain)
+    key = str(pick.get("key"))
+    if action == "accept":
+        record_feedback(key, accepted=True, now=now_ts)
+    elif action == "not_now":
+        record_feedback(key, accepted=False, now=now_ts)
+    else:
+        mute(key, forever=True, now=now_ts)
+    _journal_decision(
+        {"kind": "suggestion", "label": pick.get("kind"), "severity": "info"},
+        f"user_{action}", "voice", 1.0, f"user responded '{action}' to {key}",
+        now=now_ts)
+    return dict(pick), action, ""
+
+
+def offers_prompt_block(now: float | None = None) -> str:
+    """A compact block for the Live system prompt / context updates so the
+    model knows what Orynn recently offered and can route a natural spoken
+    reply ("yes do it", "not now", "stop suggesting that") to
+    suggestion_feedback. "" when nothing is pending."""
+    now_ts = time.time() if now is None else float(now)
+    offers = recent_offers(now_ts, limit=3)
+    if not offers:
+        return ""
+    lines = []
+    for o in reversed(offers):           # newest first
+        age_m = max(0, int((now_ts - float(o.get("ts", now_ts))) // 60))
+        lines.append(f"- ({o.get('kind')}, {age_m}m ago) {o.get('message')}")
+    return (
+        "ORYNN PROACTIVE OFFERS — suggestions Orynn recently showed the user "
+        "SILENTLY (taskbar glow + notification; you did not speak them). If "
+        "the user responds to one — \"yes, do it\", \"not now\", \"stop "
+        "suggesting that\" — call suggestion_feedback (response = accept / "
+        "not_now / mute; query = which one, if several). Newest first:\n"
+        + "\n".join(lines))
 
 
 def start_suggestion_daemon(on_event: Callable[[dict[str, Any]], None], *,

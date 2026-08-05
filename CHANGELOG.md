@@ -33,6 +33,17 @@
 - Wired into both shells (overlay `_route_watcher_event`, Capsule tray toast)
   and the agent's completion path (`_finalize` → observation journal).
   Pinned by `tests/test_proactivity.py` (26 tests).
+- **Voice-first feedback loop.** Spoken replies are the primary response
+  channel for proactive offers: a new `suggestion_feedback` Gemini Live tool
+  routes "yes, do it" / "not now" / "stop suggesting that" to the existing
+  accept / decline / mute learning paths (accept also RUNS the offered goal
+  as a background task — the only way a suggestion turns into action, and
+  only on the user's spoken yes; decline sleeps it a week; mute is
+  permanent). Surfaced offers are remembered for 2 h so a "yes" minutes
+  later still resolves; a running Live session gets each offer slipped in
+  as silent context (never spoken), and freshly woken sessions see pending
+  offers via an ORYNN PROACTIVE OFFERS prompt block. Same journal, same
+  cooldowns, same budgets. 14 more tests in `tests/test_proactivity.py`.
 
 ### Voice presence: sound-reactive taskbar glow (replaces the floating textbox)
 - **The taskbar itself is now Orynn's voice indicator.** Instead of a floating

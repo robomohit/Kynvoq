@@ -1837,6 +1837,39 @@ def _function_declarations(types: Any) -> list[Any]:
                 "required": ["query"],
             },
         ),
+        types.FunctionDeclaration(
+            name="suggestion_feedback",
+            description=(
+                "The user is answering one of Orynn's PROACTIVE SUGGESTIONS — "
+                "offers Orynn showed silently as a taskbar glow + notification "
+                "(listed under ORYNN PROACTIVE OFFERS in your context, e.g. "
+                "'Around this time you usually open OBS. Want me to?'). Route "
+                "their spoken reply here so Orynn learns: response='accept' for "
+                "yes / do it / sure (Orynn then starts the suggested task in "
+                "the background — tell them it's underway), 'not_now' for not "
+                "now / no thanks (that suggestion sleeps for a week), 'mute' "
+                "for stop suggesting that / never again (silenced for good). "
+                "Use query to say WHICH suggestion if several are pending "
+                "(a few words from it); leave it empty for the most recent. "
+                "ONLY for replies to a proactive suggestion — a yes/no in "
+                "normal conversation is NOT this."
+            ),
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "response": {
+                        "type": "string",
+                        "description": "accept, not_now, or mute.",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": ("Optional: words identifying which "
+                                        "suggestion (its topic or text)."),
+                    },
+                },
+                "required": ["response"],
+            },
+        ),
     ]
 
 
@@ -1898,6 +1931,9 @@ def _default_system_instruction() -> str:
         "→ run_workflow with that name (the fast reliable repeat — not start_desktop_task)\n"
         "- \"save that as a workflow called X\" / \"remember how to do this\" → "
         "save_workflow with clear named steps\n"
+        "- \"yes, do it\" / \"not now\" / \"stop suggesting that\" RIGHT AFTER a "
+        "proactive offer (see ORYNN PROACTIVE OFFERS in your context) → "
+        "suggestion_feedback once; on accept Orynn starts it — confirm out loud\n"
         "- \"stop\" / \"cancel\" / \"never mind\" → stop_current_task\n\n"
         "WHILE WORKING\n"
         "Commands: one short ack (\"On it\", \"Sure\"), then let tools run — they see "

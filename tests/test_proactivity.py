@@ -339,6 +339,106 @@ def test_broken_listener_never_raises():
     assert len(emitted) == 1                     # emission survived the listener
 
 
+# ── the voice feedback loop: spoken answers to surfaced offers ───────────────
+
+def _surface_one(now=None):
+    """Surface the habit offer and return (key, now_ts)."""
+    now_ts = T(5, 9, 10) if now is None else now
+    events = _habit_history()
+    emitted = pro.emit_due_suggestions(lambda e: None, now=now_ts, events=events)
+    assert len(emitted) == 1
+    return emitted[0]["suggestion_key"], now_ts
+
+
+def test_surfaced_offers_are_remembered_and_expire():
+    key, now_ts = _surface_one()
+    offers = pro.recent_offers(now_ts + 60)
+    assert [o["key"] for o in offers] == [key]
+    assert offers[0]["goal"] == "open obs studio"
+    # Past the TTL a stale "yes" resolves to nothing.
+    assert pro.recent_offers(now_ts + pro.OFFER_TTL_S + 1) == []
+
+
+def test_normalize_response_handles_natural_speech():
+    for spoken in ("yes", "Yeah", "do it", "GO AHEAD", "accept", "sure"):
+        assert pro.normalize_response(spoken) == "accept"
+    for spoken in ("not now", "not_now", "later", "no", "dismiss"):
+        assert pro.normalize_response(spoken) == "not_now"
+    for spoken in ("mute", "stop suggesting that", "never again", "Stop"):
+        assert pro.normalize_response(spoken) == "mute"
+    assert pro.normalize_response("what's the weather") is None
+
+
+def test_accept_consumes_offer_and_resets_strikes():
+    key, now_ts = _surface_one()
+    offer, action, err = pro.respond_to_offer("yes", now=now_ts + 60)
+    assert err == "" and action == "accept" and offer["key"] == key
+    # Consumed: the same yes can't apply twice.
+    _, _, err2 = pro.respond_to_offer("yes", now=now_ts + 120)
+    assert "no recent suggestion" in err2
+    # Accepted → ignore strikes reset (the habit is confirmed, keeps offering
+    # after the cooldown).
+    rec = pro._load_brain()["surfaced"][key]
+    assert rec["ignored"] == 0 and rec["accepted"] == 1
+    assert pro.recent_decisions(1)[0]["action"] == "user_accept"
+
+
+def test_not_now_sleeps_a_week_via_the_same_gauntlet():
+    key, now_ts = _surface_one()
+    offer, action, err = pro.respond_to_offer("not now", now=now_ts + 60)
+    assert err == "" and action == "not_now"
+    events = _habit_history()
+    assert pro.pending_suggestions(T(6, 9, 10), events) == []      # asleep
+    assert len(pro.pending_suggestions(T(13, 9, 10), events)) == 1  # wakes
+
+
+def test_mute_by_voice_is_permanent():
+    key, now_ts = _surface_one()
+    offer, action, err = pro.respond_to_offer("stop suggesting that",
+                                              now=now_ts + 60)
+    assert err == "" and action == "mute"
+    assert pro.pending_suggestions(T(20, 9, 10), _habit_history()) == []
+    pro.unmute(key)
+    assert len(pro.pending_suggestions(T(20, 9, 10), _habit_history())) == 1
+
+
+def test_query_picks_the_right_offer_and_ambiguity_defaults_to_newest():
+    now_ts = T(5, 9, 10)
+    events = (_habit_history("open obs studio")
+              + _habit_history("check my email"))
+    emitted = pro.emit_due_suggestions(lambda e: None, now=now_ts,
+                                       events=events)
+    assert len(emitted) == 2
+    offer, action, err = pro.respond_to_offer("yes", query="email",
+                                              now=now_ts + 60)
+    assert err == "" and offer["goal"] == "check my email"
+    # No query → the most recent remaining offer.
+    offer2, _, err2 = pro.respond_to_offer("yes", now=now_ts + 90)
+    assert err2 == "" and offer2["goal"] == "open obs studio"
+
+
+def test_unmatched_query_lists_pending_offers():
+    _surface_one()
+    offer, action, err = pro.respond_to_offer("yes", query="quantum blender",
+                                              now=T(5, 9, 20))
+    assert offer is None and "pending" in err
+
+
+def test_unrecognized_response_is_a_helpful_error():
+    _surface_one()
+    offer, action, err = pro.respond_to_offer("purple", now=T(5, 9, 20))
+    assert offer is None and "accept" in err
+
+
+def test_offers_prompt_block_teaches_the_routing():
+    assert pro.offers_prompt_block(T(5, 9, 10)) == ""        # nothing pending
+    _, now_ts = _surface_one()
+    block = pro.offers_prompt_block(now_ts + 120)
+    assert "ORYNN PROACTIVE OFFERS" in block
+    assert "suggestion_feedback" in block
+    assert "open obs studio" in block
+
+
 # ── wiring: the overlay routes fired events through the judgment layer ───────
 
 def test_overlay_routes_watcher_events_through_decide(monkeypatch):
@@ -355,3 +455,94 @@ def test_overlay_routes_watcher_events_through_decide(monkeypatch):
     controller._route_watcher_event(event)
     assert routed["event"] == event
     assert routed["render"] == controller._on_watcher_event
+
+
+# ── wiring: voice is the response channel (Live tool → feedback paths) ───────
+
+def _controller():
+    pytest.importorskip("PySide6")
+    tbo = importlib.import_module("app.widget.textbox_overlay")
+    return tbo.OverlayController(8000)
+
+
+def _seed_offer(goal="open obs studio", kind="habit"):
+    """Plant a fresh pending offer at REAL wall time — the Live handler runs
+    on time.time(), so fixed 2026 timestamps would fall outside the offer TTL
+    depending on when the suite runs."""
+    key = f"{kind}:{goal}"
+    pro._remember_offer({
+        "key": key, "kind": kind, "goal": goal,
+        "message": f"Around this time you usually “{goal}”. Want me to?",
+        "ts": time.time()})
+    return key
+
+
+def test_live_accept_runs_the_goal_and_feeds_learning(monkeypatch):
+    controller = _controller()
+    key = _seed_offer()
+    submitted = []
+    monkeypatch.setattr(controller, "_submit_voice_task", submitted.append)
+    res = controller._live_suggestion_feedback({"response": "yes"})
+    assert res["ok"] and res["action"] == "accept"
+    assert submitted == ["open obs studio"]          # the offer became a task
+    assert "underway" in res["message"]              # model told to confirm
+    rec = pro._load_brain()["surfaced"][key]
+    assert rec["accepted"] == 1 and rec["ignored"] == 0
+
+
+def test_live_not_now_and_mute_never_run_anything(monkeypatch):
+    controller = _controller()
+    key = _seed_offer()
+    submitted = []
+    monkeypatch.setattr(controller, "_submit_voice_task", submitted.append)
+    res = controller._live_suggestion_feedback({"response": "not now"})
+    assert res["ok"] and res["action"] == "not_now" and submitted == []
+    assert "week" in res["message"]
+    assert pro._load_brain()["muted"].get(key)       # the same week-sleep path
+    _seed_offer()                                    # a fresh offer later
+    res2 = controller._live_suggestion_feedback(
+        {"response": "mute", "query": "obs"})
+    assert res2["ok"] and res2["action"] == "mute" and submitted == []
+    assert "never suggest" in res2["message"]
+    assert pro._load_brain()["muted"].get(key) == -1.0   # permanent
+
+
+def test_live_feedback_with_nothing_pending_degrades_gracefully(monkeypatch):
+    controller = _controller()
+    submitted = []
+    monkeypatch.setattr(controller, "_submit_voice_task", submitted.append)
+    res = controller._live_suggestion_feedback({"response": "yes"})
+    assert not res["ok"] and submitted == []
+    assert "respond normally" in res["message"]      # model told to just talk
+
+
+def test_suggestion_surfacing_slips_context_into_running_live(monkeypatch):
+    controller = _controller()
+    notes = []
+
+    class FakeLive:
+        def send_context_update(self, text):
+            notes.append(text)
+    controller._live = FakeLive()
+    monkeypatch.setattr(controller, "_live_is_running", lambda: True)
+    tbo = importlib.import_module("app.widget.textbox_overlay")
+    monkeypatch.setattr(tbo.time, "sleep", lambda s: None)
+    controller._on_watcher_event({
+        "kind": "suggestion", "label": "habit", "severity": "info",
+        "message": "Around this time you usually open OBS. Want me to?"})
+    assert len(notes) == 1
+    assert "SILENTLY" in notes[0] and "suggestion_feedback" in notes[0]
+    assert "open OBS" in notes[0]
+    # A plain watcher event does NOT get the offer note.
+    controller._on_watcher_event({
+        "kind": "disk_low", "label": "disk", "severity": "info",
+        "message": "Drive C:\\ is down to 9 GB."})
+    assert len(notes) == 1
+
+
+def test_live_context_block_includes_pending_offers():
+    controller = _controller()
+    _seed_offer()
+    block = controller._live_context_block()
+    assert "ORYNN PROACTIVE OFFERS" in block
+    assert "open obs studio" in block
