@@ -1319,6 +1319,13 @@ class AgentService:
         self._total_tokens_spent += tokens
 
     async def _emit(self, task_id: str, event: str, data: Dict[str, Any]):
+        # Keep the SSE "done" event consistent with the verification-adjusted
+        # record: if the verifier rewrote the completion reason (couldn't
+        # confirm the claimed outcome), every consumer hears the honest one.
+        if event == "done":
+            note = getattr(self, "_verify_note", {}).pop(task_id, None)
+            if note and isinstance(data, dict):
+                data = {**data, "reason": note}
         self.log_emitter.emit(task_id, event, data)
         await asyncio.sleep(0)
 
@@ -1711,6 +1718,18 @@ class AgentService:
         tools = self._get_task_tools(task_id)
         if project_folder and task_id not in self._task_tools:
             tools = self._assign_task_tools(task_id, Path(project_folder).expanduser().resolve())
+        # Post-task verification (app/verifier.py): fresh evidence for this run,
+        # and remember which executor to audit when the task finalizes.
+        tools.verify_evidence = []
+        if not hasattr(self, "_verify_ctx"):
+            self._verify_ctx = {}
+        if not hasattr(self, "_verify_note"):
+            self._verify_note = {}
+        self._verify_ctx[task_id] = tools
+        # _finalize has no goal in scope; stash it for the promotion tally.
+        if not hasattr(self, "_task_goals"):
+            self._task_goals = {}
+        self._task_goals[task_id] = goal
         environment_payload = dict(self._task_environments.get(task_id) or environment or {})
         if not environment_payload:
             environment_payload = _build_environment_payload(tools.workspace, self.home_dir, project_folder_selected=bool(project_folder))
@@ -2057,6 +2076,16 @@ class AgentService:
                 + "\n".join(f"- {getattr(s, 'content', s)}" for s in prior_sessions)
                 + "\n</relevant_history>"
             ) if prior_sessions else ""
+            # Learned caution: if this app's recent tasks have a record of
+            # UNCONFIRMED successes (verifier feedback loop), warn the planner
+            # up front to verify on screen before declaring done.
+            try:
+                from .verifier import verify_caution
+                _caution = verify_caution(isolated_app or infer_isolated_app_name(goal) or "")
+                if _caution:
+                    relevant_history_block += f"\n<learned_caution>{_caution}</learned_caution>"
+            except Exception:
+                pass
 
             if screenshot_b64:
                 from .providers import _get_active_window_rect
@@ -2350,6 +2379,7 @@ class AgentService:
                 _finish_bounced = False
                 _preserve_screenshot_once = False
                 xml_fallback_steps = 0
+                _stream_retries = 0   # transient planner failures (429/5xx/net)
                 max_steps = (
                     BROWSER_MAX_STEPS if _is_browser_use
                     else DESKTOP_MAX_STEPS if _is_computer_desktop
@@ -2669,6 +2699,27 @@ class AgentService:
                             elif action_type and not action_args_json:
                                 _log.warning(f"Action '{action_type}' had no args between tags; executing with empty args")
                     except Exception as e:
+                        # Transient planner hiccups (429 rate-limit, 5xx, network
+                        # drops, idle-timeouts) used to KILL the whole task on the
+                        # spot — the #1 real-world "it just failed" cause in the
+                        # task history. Retry the step with backoff instead; only
+                        # a persistent failure ends the task.
+                        msg = str(e)
+                        retryable = any(tok in msg for tok in (
+                            "429", "Too Many Requests", "502", "503", "504",
+                            "timed out", "timeout", "Connection", "connection",
+                            "RemoteProtocolError", "ReadError", "unavailable",
+                        ))
+                        if retryable and _stream_retries < 3:
+                            _stream_retries += 1
+                            delay = (2.0, 6.0, 15.0)[_stream_retries - 1]
+                            _log.warning(
+                                f"Streaming hiccup (attempt {_stream_retries}/3, "
+                                f"retrying in {delay:.0f}s): {msg[:120]}")
+                            await self._emit(task_id, "status", {
+                                "message": "Planner busy — retrying…"})
+                            await asyncio.sleep(delay)
+                            continue    # retry this step from the top
                         _log.error(f"Streaming failed: {e}")
                         self._finalize(task_id, "failed", f"Streaming failed: {e}")
                         return
@@ -3326,6 +3377,62 @@ class AgentService:
 
 
     def _finalize(self, task_id: str, status: str, reason: str = ""):
+        # Independent verification gate: before a "done" is reported anywhere,
+        # audit the run's evidence targets (windows that should exist, files
+        # that should be on disk — app/verifier.py). If reality disagrees, the
+        # reason is rewritten to be honest, so the bubble/voice never claims an
+        # unconfirmed success. Cheap (<0.5s), read-only, no LLM.
+        if status == "done":
+            try:
+                from .verifier import run_checks, honest_reason, learn_from_result
+                tools = getattr(self, "_verify_ctx", {}).pop(task_id, None)
+                evidence = list(getattr(tools, "verify_evidence", []) or [])
+                result = run_checks(evidence)
+                # Self-learning: tally confirmed/unconfirmed outcomes per app in
+                # the adaptive memory, so repeat offenders earn a caution in
+                # future task prompts (see verify_caution at task start).
+                learn_from_result(evidence, result)
+                adjusted = honest_reason(reason, result)
+                if adjusted != reason:
+                    _log.warning(f"[verify] task {task_id}: {result['summary']}")
+                    reason = adjusted
+                    if not hasattr(self, "_verify_note"):
+                        self._verify_note = {}
+                    self._verify_note[task_id] = adjusted
+                else:
+                    _log.info(f"[verify] task {task_id}: {result['summary']}")
+                # Promotion pipeline (app/promotion.py): a goal that keeps
+                # succeeding WITH verified evidence earns a one-line offer to
+                # become a saved workflow. Gate on checked > 0 — "no checkable
+                # evidence" verifies trivially and must not count.
+                if result.get("verified") and result.get("checked", 0) > 0:
+                    from .promotion import note_verified_success
+                    goal_text = getattr(self, "_task_goals", {}).get(task_id, "")
+                    offer = note_verified_success(goal_text)
+                    if offer:
+                        _log.info(f"[promote] task {task_id}: offering workflow save")
+                        reason = f"{reason.rstrip()} {offer}".strip()
+                        if not hasattr(self, "_verify_note"):
+                            self._verify_note = {}
+                        self._verify_note[task_id] = reason
+                # Observation journal (app/proactivity.py): every completed
+                # goal is one data point for the pattern miner — habits,
+                # sequences, staleness. Its own try so a journal hiccup can
+                # never eat the verify/promotion result above.
+                try:
+                    from .proactivity import note_observation
+                    note_observation(
+                        "task",
+                        getattr(self, "_task_goals", {}).get(task_id, ""),
+                        meta={"verified": bool(result.get("verified")
+                                               and result.get("checked", 0) > 0)})
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        else:
+            getattr(self, "_verify_ctx", {}).pop(task_id, None)
+        getattr(self, "_task_goals", {}).pop(task_id, None)
         if self._on_task_complete: self._on_task_complete(task_id, status, reason)
         self._paused_tasks.discard(task_id)
         self._approval_bypass_tasks.discard(task_id)

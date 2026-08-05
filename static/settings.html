@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orynn — Control</title>
+<style>
+  /* Minimal control panel in the taskbar-glow aesthetic: dark, calm, one
+     column, violet/cyan accents. Everything else lives at /advanced. */
+  :root {
+    --bg: #0b0d12;
+    --card: rgba(255, 255, 255, 0.045);
+    --card-border: rgba(255, 255, 255, 0.09);
+    --text: #e8ecf4;
+    --dim: #8b93a7;
+    --cyan: #35c8e8;
+    --violet: #8b5cf6;
+    --green: #34d399;
+    --red: #f87171;
+    --accent-grad: linear-gradient(90deg, #35c8e8, #8b5cf6);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    background:
+      radial-gradient(1100px 500px at 70% -10%, rgba(139, 92, 246, 0.10), transparent 60%),
+      radial-gradient(900px 420px at 10% 110%, rgba(53, 200, 232, 0.08), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font: 14px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    overflow-x: hidden;
+  }
+  /* Slow-drifting aurora blobs — the same living light as the taskbar bar. */
+  body::before, body::after {
+    content: ""; position: fixed; z-index: -1; width: 540px; height: 540px;
+    border-radius: 50%; filter: blur(95px); opacity: 0.16; pointer-events: none;
+  }
+  body::before { background: var(--violet); top: -240px; right: -170px;
+                 animation: drift-a 19s ease-in-out infinite alternate; }
+  body::after  { background: var(--cyan); bottom: -260px; left: -190px;
+                 animation: drift-b 24s ease-in-out infinite alternate; }
+  @keyframes drift-a { to { transform: translate(-70px, 50px) scale(1.18); } }
+  @keyframes drift-b { to { transform: translate(80px, -60px) scale(1.12); } }
+  .wrap { max-width: 640px; margin: 0 auto; padding: 28px 22px 48px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+  header h1 {
+    font-size: 19px; font-weight: 600; letter-spacing: 0.2px;
+    background: var(--accent-grad); -webkit-background-clip: text;
+    background-clip: text; color: transparent;
+  }
+  header .sub { color: var(--dim); font-size: 12.5px; }
+  /* The aurora ribbon — a slice of the taskbar wave, flowing under the title. */
+  .aurora {
+    height: 3px; border-radius: 3px; margin: 0 0 22px;
+    background: linear-gradient(90deg, transparent, var(--cyan), var(--violet),
+                                #d946ef, var(--cyan), transparent);
+    background-size: 280% 100%;
+    animation: ribbon 8s linear infinite;
+    filter: drop-shadow(0 0 7px rgba(139, 92, 246, 0.75));
+  }
+  @keyframes ribbon { to { background-position: -280% 0; } }
+  section {
+    --acc: var(--violet);
+    background: var(--card); border: 1px solid var(--card-border);
+    border-radius: 14px; padding: 16px 18px; margin-bottom: 14px;
+    backdrop-filter: blur(8px); position: relative; overflow: hidden;
+    transition: border-color .25s, transform .25s, box-shadow .25s;
+  }
+  /* Accent hairline across each card's top edge, in the section's color. */
+  section::before {
+    content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent 4%, var(--acc), transparent 96%);
+    opacity: 0.6;
+  }
+  section:hover {
+    border-color: rgba(255, 255, 255, 0.16);
+    transform: translateY(-1px);
+    box-shadow: 0 10px 30px -16px var(--acc);
+  }
+  section h2 {
+    font-size: 12px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: 1.1px; color: var(--dim); margin-bottom: 12px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  section h2::before {
+    content: ""; width: 7px; height: 7px; border-radius: 50%; flex: none;
+    background: var(--acc); box-shadow: 0 0 9px var(--acc);
+  }
+  .row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 14px; padding: 7px 0;
+  }
+  .row + .row { border-top: 1px solid rgba(255,255,255,0.04); }
+  .row .label { flex: 1; }
+  .row .label small { display: block; color: var(--dim); font-size: 12px; }
+  /* Toggle */
+  .toggle { position: relative; width: 40px; height: 22px; flex: none; cursor: pointer; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle .knob {
+    position: absolute; inset: 0; border-radius: 22px;
+    background: rgba(255,255,255,0.12); transition: background .18s;
+  }
+  .toggle .knob::after {
+    content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px;
+    border-radius: 50%; background: #cfd6e4; transition: transform .18s, background .18s;
+  }
+  .toggle input:checked + .knob { background: var(--violet); }
+  .toggle input:checked + .knob::after { transform: translateX(18px); background: #fff; }
+  select, input[type=text], input[type=password] {
+    background: rgba(255,255,255,0.06); color: var(--text);
+    border: 1px solid var(--card-border); border-radius: 8px;
+    padding: 7px 10px; font: inherit; outline: none; min-width: 0;
+  }
+  select:focus, input:focus { border-color: var(--violet); }
+  button {
+    background: linear-gradient(135deg, rgba(53,200,232,0.14), rgba(139,92,246,0.24));
+    color: #dfd2ff;
+    border: 1px solid rgba(139,92,246,0.45); border-radius: 8px;
+    padding: 7px 14px; font: inherit; cursor: pointer; flex: none;
+    transition: box-shadow .2s, border-color .2s;
+  }
+  button:hover {
+    border-color: rgba(139,92,246,0.85);
+    box-shadow: 0 0 14px -4px var(--violet);
+  }
+  button.quiet { background: transparent; border-color: var(--card-border); color: var(--dim); }
+  button.quiet:hover { color: var(--text); }
+  /* Glow legend */
+  .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 8px; }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; color: var(--dim); font-size: 12.5px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; box-shadow: 0 0 8px currentColor; }
+  /* Lists (scheduled, connectors) */
+  .item {
+    display: flex; align-items: center; gap: 12px; padding: 9px 0;
+  }
+  .item + .item { border-top: 1px solid rgba(255,255,255,0.04); }
+  .item .meta { flex: 1; min-width: 0; }
+  .item .meta .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .meta small { color: var(--dim); font-size: 12px; display: block;
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip { font-size: 11.5px; padding: 2px 9px; border-radius: 10px; flex: none; }
+  .chip.on { background: rgba(52,211,153,0.14); color: var(--green); }
+  .chip.off { background: rgba(255,255,255,0.07); color: var(--dim); }
+  .empty { color: var(--dim); font-size: 12.5px; padding: 6px 0; }
+  .addrow { display: grid; grid-template-columns: 1fr 1fr auto; gap: 8px; margin-top: 10px; }
+  .addrow input[name=goal] { grid-column: 1 / -1; }
+  .keyrow { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; }
+  .status { font-size: 12px; color: var(--dim); min-height: 16px; margin-top: 6px; }
+  .status.ok { color: var(--green); }
+  .status.err { color: var(--red); }
+  footer { text-align: center; margin-top: 20px; }
+  footer a { color: var(--dim); font-size: 12px; text-decoration: none; }
+  footer a:hover { color: var(--text); }
+  /* Slim titlebar for the frameless desktop shell (hidden in a browser). */
+  #tb { display: none; position: sticky; top: 0; z-index: 10; height: 36px;
+        -webkit-app-region: drag; align-items: center; justify-content: flex-end;
+        gap: 2px; padding: 0 6px; background: rgba(11,13,18,0.75);
+        backdrop-filter: blur(10px); }
+  body.shell #tb { display: flex; }
+  #tb button { -webkit-app-region: no-drag; background: transparent; border: none;
+               color: var(--dim); width: 34px; height: 28px; border-radius: 6px;
+               font-size: 14px; line-height: 1; padding: 0; }
+  #tb button:hover { background: rgba(255,255,255,0.08); color: var(--text); }
+  #tb button.close:hover { background: rgba(248,113,113,0.25); color: #fff; }
+</style>
+</head>
+<body>
+<div id="tb">
+  <button id="tb-min" title="Minimize">–</button>
+  <button id="tb-close" class="close" title="Close">✕</button>
+</div>
+<div class="wrap">
+  <header>
+    <h1>Orynn</h1>
+    <span class="sub">say “hey jarvis” — this panel is just the knobs</span>
+  </header>
+  <div class="aurora"></div>
+
+  <section id="voice-section" style="--acc: var(--cyan)">
+    <h2>Voice</h2>
+    <div class="row">
+      <div class="label">Speak replies out loud<small>Read task answers with TTS</small></div>
+      <label class="toggle"><input type="checkbox" data-pref="speak_replies"><span class="knob"></span></label>
+    </div>
+    <div class="row">
+      <div class="label">Voice input<small>Microphone / push-to-talk in the shell</small></div>
+      <label class="toggle"><input type="checkbox" data-pref="voice_input"><span class="knob"></span></label>
+    </div>
+    <div class="row">
+      <div class="label">Confirm sensitive actions<small>Always ask before send / post / buy / delete</small></div>
+      <label class="toggle"><input type="checkbox" data-pref="confirm_sensitive"><span class="knob"></span></label>
+    </div>
+  </section>
+
+  <section id="glow-section" style="--acc: var(--violet)">
+    <h2>Taskbar light</h2>
+    <div class="row">
+      <div class="label">Action glow<small>Aqua ring around the app being controlled</small></div>
+      <label class="toggle"><input type="checkbox" data-pref="show_action_glow"><span class="knob"></span></label>
+    </div>
+    <div class="legend">
+      <span><i class="dot" style="color:#4cc7e8; background:#4cc7e8"></i>listening / speaking</span>
+      <span><i class="dot" style="color:#8b5cf6; background:#8b5cf6"></i>working in background</span>
+      <span><i class="dot" style="color:#34d399; background:#34d399"></i>reminder / done</span>
+      <span><i class="dot" style="color:#f87171; background:#f87171"></i>something failed</span>
+    </div>
+  </section>
+
+  <section id="sched-section" style="--acc: var(--green)">
+    <h2>Scheduled reminders &amp; tasks</h2>
+    <div id="sched-list"><div class="empty">Loading…</div></div>
+    <form class="addrow" id="sched-add">
+      <input type="text" name="name" placeholder="Name (e.g. 3am message)" required>
+      <input type="text" name="when" placeholder="09:00 · mon 09:00 · every 30m · once 03:00" required>
+      <input type="text" name="goal" placeholder="What to do — start with “remind me to” for a spoken reminder" required>
+      <button type="submit" style="grid-column: 1 / -1">Add schedule</button>
+    </form>
+    <div class="status" id="sched-status"></div>
+  </section>
+
+  <section id="conn-section" style="--acc: #60a5fa">
+    <h2>Connectors</h2>
+    <div id="conn-list"><div class="empty">Loading…</div></div>
+  </section>
+
+  <section id="model-section" style="--acc: #f0b35c">
+    <h2>Model &amp; keys</h2>
+    <div class="row">
+      <div class="label">Effort<small>Speed vs. capability for tasks</small></div>
+      <select data-pref="effort">
+        <option>low</option><option>medium</option><option>high</option><option>max</option>
+      </select>
+    </div>
+    <div class="row">
+      <div class="label">Desktop model<small>Blank = free tier</small></div>
+      <input type="text" data-pref="desktop_model" placeholder="model id (optional)" style="width: 46%">
+    </div>
+    <div class="row" style="display:block">
+      <div class="label" style="margin-bottom:8px">Provider API key<small>Saved to your local .env</small></div>
+      <div class="keyrow">
+        <select id="key-provider">
+          <option value="google">Google (Gemini)</option>
+          <option value="openrouter">OpenRouter</option>
+          <option value="anthropic">Anthropic</option>
+          <option value="openai">OpenAI</option>
+          <option value="groq">Groq</option>
+        </select>
+        <input type="password" id="key-value" placeholder="paste key">
+        <button id="key-save">Save</button>
+      </div>
+      <div class="status" id="key-status"></div>
+    </div>
+  </section>
+
+  <footer><a href="/advanced">advanced dashboard →</a></footer>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  // ── session-cookie auth: bootstrap once, retry once on 401 ────────────────
+  let sessionReady = false;
+  async function ensureSession() {
+    if (sessionReady) return;
+    await fetch("/api/session", { method: "POST" });
+    sessionReady = true;
+  }
+  async function api(path, opts = {}) {
+    await ensureSession();
+    if (opts.body && !(opts.headers || {})["Content-Type"]) {
+      opts.headers = Object.assign({ "Content-Type": "application/json" }, opts.headers);
+    }
+    let res = await fetch(path, opts);
+    if (res.status === 401 || res.status === 403) {
+      sessionReady = false;
+      await ensureSession();
+      res = await fetch(path, opts);
+    }
+    if (!res.ok) throw new Error((await res.text()).slice(0, 160) || res.statusText);
+    return res.json();
+  }
+  const $ = (sel) => document.querySelector(sel);
+  const esc = (s) => { const d = document.createElement("div"); d.textContent = s == null ? "" : String(s); return d.innerHTML; };
+
+  // ── preferences: load values, save on change ──────────────────────────────
+  async function loadPrefs() {
+    const { preferences } = await api("/api/preferences");
+    document.querySelectorAll("[data-pref]").forEach((el) => {
+      const v = preferences[el.dataset.pref];
+      if (el.type === "checkbox") el.checked = !!v;
+      else el.value = v == null ? "" : v;
+    });
+  }
+  document.querySelectorAll("[data-pref]").forEach((el) => {
+    el.addEventListener("change", async () => {
+      const value = el.type === "checkbox" ? el.checked : el.value;
+      try {
+        await api("/api/preferences", {
+          method: "POST",
+          body: JSON.stringify({ preferences: { [el.dataset.pref]: value } }),
+        });
+      } catch (e) { console.error("pref save failed", e); }
+    });
+  });
+
+  // ── scheduled reminders & tasks ───────────────────────────────────────────
+  async function loadSched() {
+    const box = $("#sched-list");
+    try {
+      const { items } = await api("/api/desktop/scheduled");
+      if (!items.length) {
+        box.innerHTML = '<div class="empty">Nothing scheduled. Ask by voice (“at 9 every morning…”) or add one below.</div>';
+        return;
+      }
+      box.innerHTML = items.map((i) => `
+        <div class="item">
+          <div class="meta">
+            <div class="name">${esc(i.name || i.goal)}</div>
+            <small>${esc(i.when)} — ${esc(i.goal)}</small>
+          </div>
+          <button class="quiet" data-del="${esc(i.id)}">Remove</button>
+        </div>`).join("");
+      box.querySelectorAll("[data-del]").forEach((b) =>
+        b.addEventListener("click", async () => {
+          await api(`/api/desktop/scheduled/${encodeURIComponent(b.dataset.del)}`, { method: "DELETE" });
+          loadSched();
+        }));
+    } catch (e) {
+      box.innerHTML = `<div class="empty">Couldn't load schedules (${esc(e.message)})</div>`;
+    }
+  }
+  $("#sched-add").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const f = ev.target;
+    const st = $("#sched-status");
+    st.className = "status";
+    st.textContent = "Saving…";
+    try {
+      await api("/api/desktop/scheduled", {
+        method: "POST",
+        body: JSON.stringify({
+          name: f.name.value.trim(),
+          when: f.when.value.trim(),
+          goal: f.goal.value.trim(),
+        }),
+      });
+      f.reset();
+      st.className = "status ok";
+      st.textContent = "Scheduled.";
+      loadSched();
+    } catch (e) {
+      st.className = "status err";
+      st.textContent = e.message;
+    }
+  });
+
+  // ── connectors ────────────────────────────────────────────────────────────
+  async function loadConnectors() {
+    const box = $("#conn-list");
+    try {
+      const { connectors } = await api("/api/connectors");
+      if (!connectors.length) {
+        box.innerHTML = '<div class="empty">No connectors available.</div>';
+        return;
+      }
+      box.innerHTML = connectors.map((c) => `
+        <div class="item">
+          <div class="meta">
+            <div class="name">${esc(c.name || c.id)}</div>
+            <small>${esc(c.description || "")}</small>
+          </div>
+          <span class="chip ${c.linked ? "on" : "off"}">${c.linked ? "linked" : "not linked"}</span>
+          <button class="${c.linked ? "quiet" : ""}" data-conn="${esc(c.id)}" data-linked="${c.linked ? 1 : 0}">
+            ${c.linked ? "Unlink" : "Link"}
+          </button>
+        </div>`).join("");
+      box.querySelectorAll("[data-conn]").forEach((b) =>
+        b.addEventListener("click", async () => {
+          const action = b.dataset.linked === "1" ? "unlink" : "link";
+          await api(`/api/connectors/${encodeURIComponent(b.dataset.conn)}/${action}`, { method: "POST" });
+          loadConnectors();
+        }));
+    } catch (e) {
+      box.innerHTML = `<div class="empty">Couldn't load connectors (${esc(e.message)})</div>`;
+    }
+  }
+
+  // ── provider key ──────────────────────────────────────────────────────────
+  $("#key-save").addEventListener("click", async () => {
+    const st = $("#key-status");
+    st.className = "status";
+    st.textContent = "Saving…";
+    try {
+      await api("/api/setup/provider-key", {
+        method: "POST",
+        body: JSON.stringify({ provider: $("#key-provider").value, key: $("#key-value").value }),
+      });
+      $("#key-value").value = "";
+      st.className = "status ok";
+      st.textContent = "Key saved.";
+    } catch (e) {
+      st.className = "status err";
+      st.textContent = e.message;
+    }
+  });
+
+  // ── frameless desktop shell: show the slim titlebar, wire its buttons ─────
+  window.addEventListener("pywebviewready", () => {
+    document.body.classList.add("shell");
+    $("#tb-min").addEventListener("click", () => window.pywebview.api.minimize());
+    $("#tb-close").addEventListener("click", () => window.pywebview.api.close());
+  });
+
+  loadPrefs().catch(console.error);
+  loadSched();
+  loadConnectors();
+})();
+</script>
+</body>
+</html>

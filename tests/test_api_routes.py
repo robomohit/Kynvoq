@@ -149,3 +149,22 @@ def test_first_live_run_removed_from_defaults(tmp_path, monkeypatch):
     import app.preferences as P
     importlib.reload(P)
     assert "first_live_run" not in P.DEFAULTS
+
+
+# ── minimal control panel routing ────────────────────────────────────────────
+
+def test_root_serves_control_panel_and_advanced_serves_dashboard(tmp_path, monkeypatch):
+    """The default face of Orynn is the minimal control panel (voice/glow/
+    scheduled/connectors/keys); the full legacy dashboard moved to /advanced."""
+    client, _ = _make_client(tmp_path, monkeypatch)
+
+    root = client.get("/")
+    assert root.status_code == 200
+    assert "Orynn" in root.text and "Control" in root.text
+    assert "Taskbar light" in root.text          # glow legend section
+    assert "Connectors" in root.text
+
+    adv = client.get("/advanced")
+    assert adv.status_code == 200
+    assert 'id="titlebar"' in adv.text           # the old dashboard chrome
+    assert "app.js" in adv.text

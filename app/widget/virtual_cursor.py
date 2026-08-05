@@ -26,7 +26,7 @@ from PySide6.QtCore import (Qt, QPoint, QPointF, QRect, QRectF, QTimer,
                              QPropertyAnimation, QEasingCurve, Property,
                              QObject)
 from PySide6.QtGui import (QColor, QPainter, QPen, QBrush, QPainterPath,
-                           QFont, QGuiApplication, QCursor)
+                           QFont, QGuiApplication, QCursor, QLinearGradient)
 from PySide6.QtWidgets import QWidget
 
 
@@ -943,10 +943,12 @@ class VirtualCursorOverlay(QWidget):
         if orb_a < 0.02:
             return
 
-        p.setFont(QFont("Segoe UI", 10))
+        bubble_font = QFont("Segoe UI Variable Text", 10, QFont.Medium)
+        bubble_font.setLetterSpacing(QFont.AbsoluteSpacing, 0.3)
+        p.setFont(bubble_font)
         fm = p.fontMetrics()
-        pad_x, pad_y = 13, 9
-        dot_gap = 16
+        pad_x, pad_y = 15, 11
+        dot_gap = 18
 
         geo = self.geometry()
         margin = 8
@@ -990,17 +992,46 @@ class VirtualCursorOverlay(QWidget):
         cap_y = (orb_cy - coll / 2) + (box_y - (orb_cy - coll / 2)) * expand
         cap_w = coll + (full_w - coll) * expand
         cap_h = coll + (full_h - coll) * expand
-        radius = 13.0 + (11.0 - 13.0) * expand
+        radius = 13.0 + (16.0 - 13.0) * expand   # softens as it unfolds
         cap_a = orb_a * expand
 
         p.save()
         p.setPen(Qt.NoPen)
         if cap_a > 0.01:
-            bg = QColor(DS_SURFACE); bg.setAlpha(int(245 * cap_a))
-            p.setBrush(QBrush(bg))
+            cap_rect = QRectF(cap_x, cap_y, cap_w, cap_h)
+
+            # 1) Soft drop shadow — a few stacked, offset, fading rounded rects
+            # below the body give the bubble real separation from the desktop
+            # instead of sitting on it like a flat sticker.
+            for off, alpha in ((4.0, 26), (2.5, 38), (1.0, 46)):
+                sh = QColor(0, 0, 0); sh.setAlpha(int(alpha * cap_a))
+                p.setBrush(QBrush(sh))
+                p.drawRoundedRect(
+                    cap_rect.adjusted(1.0, off, 1.0, off), radius, radius)
+
+            # 2) Glass body — vertical tint gradient (lighter at the top) rather
+            # than a single flat fill, so the surface reads as a lit material.
+            body = QLinearGradient(cap_x, cap_y, cap_x, cap_y + cap_h)
+            top = QColor(0x21, 0x24, 0x23); top.setAlpha(int(248 * cap_a))
+            bot = QColor(0x14, 0x16, 0x15); bot.setAlpha(int(248 * cap_a))
+            body.setColorAt(0.0, top)
+            body.setColorAt(1.0, bot)
+            p.setBrush(QBrush(body))
+            p.setPen(Qt.NoPen)
+            p.drawRoundedRect(cap_rect, radius, radius)
+
+            # 3) Hairline border + a brighter inner top highlight (the glass
+            # "lip") for depth.
             border = QColor(DS_BORDER); border.setAlpha(int(220 * cap_a))
+            p.setBrush(Qt.NoBrush)
             p.setPen(QPen(border, 1.0))
-            p.drawRoundedRect(QRectF(cap_x, cap_y, cap_w, cap_h), radius, radius)
+            p.drawRoundedRect(cap_rect.adjusted(0.5, 0.5, -0.5, -0.5),
+                              radius, radius)
+            hi = QColor(255, 255, 255); hi.setAlpha(int(34 * cap_a))
+            p.setPen(QPen(hi, 1.0))
+            p.drawRoundedRect(cap_rect.adjusted(1.5, 1.5, -1.5, -1.5),
+                              radius - 1.0, radius - 1.0)
+            p.setPen(Qt.NoPen)
 
         # Persistent orb / state indicator at the fixed anchor.
         if self._cursor_state == "thinking":

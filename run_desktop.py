@@ -15,6 +15,22 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
+# pythonw.exe (the boot-with-Windows launch path) has NO console: sys.stdout and
+# sys.stderr are None, and any bare print() would raise AttributeError. Route them
+# to a log file next to this script so the always-on agent can't crash on a log line.
+if sys.stdout is None or sys.stderr is None:
+    from pathlib import Path as _LogPath
+    try:
+        _logf = open(_LogPath(__file__).resolve().parent / "orynn.log",
+                     "a", encoding="utf-8", buffering=1)
+    except Exception:
+        import io as _io
+        _logf = _io.StringIO()
+    if sys.stdout is None:
+        sys.stdout = _logf
+    if sys.stderr is None:
+        sys.stderr = _logf
+
 # Frozen .exe: anchor relative paths (.env, workspace/memory) to the INSTALL folder
 # next to Orynn.exe — not PyInstaller's read-only temp bundle. Must run BEFORE
 # importing app.main (which load_dotenv's ".env" at import time).
@@ -137,13 +153,28 @@ def _start_textbox_overlay(port: int) -> subprocess.Popen | None:
             getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
+    # Overlay output used to be discarded (DEVNULL) — any glow/Live traceback
+    # vanished, making field problems undiagnosable. Capture it in a log file,
+    # trimmed when it grows past ~2 MB so it never bloats.
+    log_handle = subprocess.DEVNULL
+    try:
+        log_dir = os.path.join(os.path.dirname(__file__) or ".", "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "overlay.log")
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 2_000_000:
+            os.replace(log_path, log_path + ".1")
+        log_handle = open(log_path, "a", encoding="utf-8", errors="replace")
+        log_handle.write(f"\n=== overlay start {__import__('datetime').datetime.now().isoformat()} ===\n")
+        log_handle.flush()
+    except Exception:
+        log_handle = subprocess.DEVNULL
     try:
         return subprocess.Popen(
             cmd,
             cwd=os.path.dirname(__file__) or None,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
             creationflags=creationflags,
         )
     except Exception as exc:
@@ -214,7 +245,67 @@ def parse_args():
         action="store_true",
         help="Do not start the mouse-following status textbox.",
     )
+    parser.add_argument(
+        "--settings",
+        action="store_true",
+        help="Open ONLY the control-panel window (used by the tray's Settings "
+             "item); reuses the running backend, starts no overlay.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="Backend port to use/reuse (defaults to ORYNN_PORT / 8000).",
+    )
     return parser.parse_args()
+
+def _open_panel_window(port: int) -> int:
+    """Open the native control-panel window (pywebview) on the running backend.
+    The default page is the minimal panel (voice/glow/scheduled/connectors/keys);
+    the full legacy dashboard lives at /advanced for power/debug use."""
+    try:
+        import webview
+    except ImportError:
+        print(
+            "[Desktop] pywebview is not installed. Run setup.bat or "
+            "install requirements-desktop.txt to open the native dashboard.",
+            file=sys.stderr,
+        )
+        return 1
+    from app.desktop_bridge import DesktopBridge
+    bridge = DesktopBridge()
+    root_dir = os.path.dirname(__file__)
+    icon_path = next(
+        (
+            os.path.join(root_dir, name)
+            for name in ("orynn_app_icon.png", "app_icon.ico")
+            if os.path.exists(os.path.join(root_dir, name))
+        ),
+        None,
+    )
+    window = webview.create_window(
+        "Orynn",
+        f"http://127.0.0.1:{port}",
+        js_api=bridge,
+        width=720,
+        height=880,
+        min_size=(600, 620),
+        background_color="#0a0a0a",
+        # Frameless: the panel draws its own slim titlebar (drag region + custom
+        # min/close wired to DesktopBridge), so we drop the OS frame to avoid a
+        # double titlebar. easy_drag=False so only the titlebar moves the window
+        # (its CSS -webkit-app-region: drag), not the whole canvas.
+        frameless=True,
+        easy_drag=False,
+    )
+
+    def bind_bridge(main_window, desktop_bridge):
+        desktop_bridge.bind_window(main_window)
+
+    print("[Desktop] Orynn is launching...")
+    webview.start(bind_bridge, args=(window, bridge), icon=icon_path)
+    return 0
+
 
 if __name__ == "__main__":
     # Frozen re-entry: a bundled .exe has no `python -m`, so it relaunches ITSELF with
@@ -233,32 +324,34 @@ if __name__ == "__main__":
 
     # First run: if the Gemini key (Live's lifeblood) is missing, show a one-time,
     # polished setup window to collect it (+ an optional agent key) before anything
-    # else starts. No-op once a key exists.
-    try:
-        from app.widget.setup_window import ensure_keys_configured
-        if not ensure_keys_configured():
-            print("[Desktop] Setup cancelled — no API key was provided. Exiting.")
-            sys.exit(0)
-    except SystemExit:
-        raise
-    except Exception as exc:
-        print(f"[Desktop] Setup window unavailable ({exc}); continuing.", file=sys.stderr)
+    # else starts. No-op once a key exists. (Skipped for a tray-launched Settings
+    # window — that must open instantly and works without keys.)
+    if not args.settings:
+        try:
+            from app.widget.setup_window import ensure_keys_configured
+            if not ensure_keys_configured():
+                print("[Desktop] Setup cancelled — no API key was provided. Exiting.")
+                sys.exit(0)
+        except SystemExit:
+            raise
+        except Exception as exc:
+            print(f"[Desktop] Setup window unavailable ({exc}); continuing.", file=sys.stderr)
 
-    # 0. Auto-start the local planner proxy (deepseek_proxy.py) if the planner is
-    #    configured to use it and it isn't already running. Shared, self-healing
-    #    logic lives in app.proxy_supervisor (the backend keeps it alive too).
-    try:
-        from app.proxy_supervisor import ensure_proxy_running
+        # 0. Auto-start the local planner proxy (deepseek_proxy.py) if the planner
+        #    is configured to use it and it isn't already running. Shared,
+        #    self-healing logic lives in app.proxy_supervisor.
+        try:
+            from app.proxy_supervisor import ensure_proxy_running
 
-        if not ensure_proxy_running():
-            print("[Desktop] Planner proxy configured but couldn't start; "
-                  "multi-step desktop tasks may use a rate-limited fallback model.")
-    except Exception as _exc:
-        print(f"[Desktop] Proxy supervisor unavailable: {_exc}")
+            if not ensure_proxy_running():
+                print("[Desktop] Planner proxy configured but couldn't start; "
+                      "multi-step desktop tasks may use a rate-limited fallback model.")
+        except Exception as _exc:
+            print(f"[Desktop] Proxy supervisor unavailable: {_exc}")
 
     # 1. Start the backend server in a background thread, unless one is already
-    #    running (e.g. the capsule launched us to open a second native window).
-    port = _start_backend(PORT)
+    #    running (e.g. the tray launched us to open the Settings window).
+    port = _start_backend(args.port or PORT)
 
     if args.capsule:
         # Legacy floating Sidekick capsule. Kept as an explicit fallback while
@@ -271,48 +364,32 @@ if __name__ == "__main__":
         print("[Desktop] Orynn Sidekick (Qt shell) is launching...")
         sys.exit(qt_widget_main(port))
 
+    if args.settings:
+        # Tray-launched control panel: just the window, nothing else.
+        sys.exit(_open_panel_window(port))
+
+    overlay_proc = None
     if not args.no_overlay:
-        _start_textbox_overlay(port)
+        overlay_proc = _start_textbox_overlay(port)
 
-    # Full dashboard (pywebview)
+    if args.dashboard or overlay_proc is None:
+        # Explicit window request (start_dashboard.bat) — or the overlay failed
+        # to start, in which case the window keeps the process (and backend) alive.
+        sys.exit(_open_panel_window(port))
+
+    # Default product shape: taskbar bar + tray only — NO window. Settings opens
+    # on demand from the tray icon (right-click → Settings). The launcher lives
+    # as long as the overlay; Quit from the tray shuts everything down.
+    print("[Desktop] Orynn is running — say the wake word, or right-click the "
+          "tray icon for Settings.")
+    rc = 0
     try:
-        import webview
-    except ImportError:
-        print(
-            "[Desktop] pywebview is not installed. Run setup.bat or "
-            "install requirements-desktop.txt to open the native dashboard.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    from app.desktop_bridge import DesktopBridge
-    bridge = DesktopBridge()
-    root_dir = os.path.dirname(__file__)
-    icon_path = next(
-        (
-            os.path.join(root_dir, name)
-            for name in ("orynn_app_icon.png", "app_icon.ico")
-            if os.path.exists(os.path.join(root_dir, name))
-        ),
-        None,
-    )
-    window = webview.create_window(
-        "Orynn",
-        f"http://127.0.0.1:{port}",
-        js_api=bridge,
-        width=1400,
-        height=900,
-        min_size=(1024, 768),
-        background_color="#0a0a0a",
-        # Frameless: the dashboard draws its own titlebar (drag region + custom
-        # min/max/close wired to DesktopBridge), so we drop the OS frame to
-        # avoid a double titlebar. easy_drag=False so only the titlebar moves
-        # the window (its CSS -webkit-app-region: drag), not the whole canvas.
-        frameless=True,
-        easy_drag=False,
-    )
-
-    def bind_bridge(main_window, desktop_bridge):
-        desktop_bridge.bind_window(main_window)
-
-    print("[Desktop] Orynn is launching...")
-    webview.start(bind_bridge, args=(window, bridge), icon=icon_path)
+        rc = overlay_proc.wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            overlay_proc.terminate()
+        except Exception:
+            pass
+    sys.exit(rc)

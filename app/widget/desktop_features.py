@@ -16,6 +16,7 @@ import ctypes
 import os
 import re
 import sys
+import threading
 import time
 from ctypes import wintypes
 from pathlib import Path
@@ -466,10 +467,42 @@ _UIA_MAX_DEPTH = 40
 
 _uia_configured = False
 
+# COM apartment init is PER THREAD, not per process. UIA (IUIAutomation) wants a
+# single-threaded apartment (STA); if a thread calls UIA without one, comtypes
+# lazily joins the multi-threaded apartment, and any tree walk that races the
+# foreground window's input-sync handling crashes the whole process with a
+# *fatal* (uncatchable) RPC_E_CANTCALLOUT_ININPUTSYNCCALL (0x8001010d). The
+# desktop agent runs every UIA call on asyncio's `to_thread` pool workers, none
+# of which initialize COM â€” so we init STA once per thread here, before the
+# first UIA touch. `threading.local` makes it idempotent without re-entering
+# CoInitializeEx on pool threads that are reused across tasks.
+_uia_thread_com = threading.local()
+
+
+def _ensure_uia_thread_com(uia) -> None:
+    """Initialize COM as STA on the current thread for UIA, exactly once.
+
+    Safe to call from any thread on every UIA entry; a no-op after the first
+    call on a given thread. Failures are swallowed â€” if COM is already inited
+    (e.g. the Qt main thread), CoInitializeEx returns S_FALSE, not an error we
+    need to act on."""
+    if getattr(_uia_thread_com, "inited", False):
+        return
+    try:
+        uia.InitializeUIAutomationInCurrentThread()  # comtypes.CoInitializeEx() -> STA
+    except Exception:
+        # Already initialized on this thread, or comtypes unavailable. Either way
+        # the thread now has *some* apartment; mark done so we don't thrash it.
+        pass
+    _uia_thread_com.inited = True
+
 
 def _ensure_uia_config(uia) -> None:
-    """One-time tuning so UIA calls return fast instead of using the library's
-    default 10 s search timeout / 0.5 s retry interval."""
+    """Per-thread COM init + one-time global tuning so UIA calls return fast
+    instead of using the library's default 10 s search timeout / 0.5 s retry
+    interval."""
+    # COM apartment first â€” every thread, every call (cheap after the first).
+    _ensure_uia_thread_com(uia)
     global _uia_configured
     if _uia_configured:
         return
@@ -654,6 +687,7 @@ def _uia_root_candidates(app_hint: str = "", fallback_foreground: bool = True) -
     (not just the winner) lets find_ui_elements fall through to the runner-up
     when the best-ranked window turns out to be a dud."""
     import uiautomation as uia
+    _ensure_uia_config(uia)  # COM-STA for this thread before any tree walk
     candidates: list[tuple[int, object]] = []
     if app_hint:
         # Foreground window handle â€” when several windows of the same app are
@@ -664,7 +698,14 @@ def _uia_root_candidates(app_hint: str = "", fallback_foreground: bool = True) -
         except Exception:
             pass
         seen_handles: set[int] = set()
-        for top in uia.GetRootControl().GetChildren():
+        # GetRootControl().GetChildren() can raise a COM error mid-enumeration if
+        # the desktop tree shifts under us; degrade to "no candidates" rather
+        # than letting it bubble out of the worker thread.
+        try:
+            top_level = uia.GetRootControl().GetChildren()
+        except Exception:
+            top_level = []
+        for top in top_level:
             try:
                 low = (top.Name or "").strip().lower()
                 try:
@@ -2114,11 +2155,48 @@ def list_scheduled() -> list[dict]:
     return []
 
 
+_SCHED_DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def schedule_when_is_valid(when: str) -> bool:
+    """True if `when` is a format the scheduler daemon understands:
+    "HH:MM" (daily), "mon 09:00" (weekly), "every 30m" (interval),
+    "once 03:00" / "once 2026-07-05 03:00" (one-shot, removed after firing)."""
+    from datetime import datetime
+
+    def _hhmm_ok(s: str) -> bool:
+        hh, mm = s.split(":")
+        return 0 <= int(hh) <= 23 and 0 <= int(mm) <= 59
+
+    try:
+        w = (when or "").strip().lower()
+        if w.startswith("every"):
+            parts = w.split()
+            return (len(parts) == 2 and parts[1].endswith("m")
+                    and int(parts[1][:-1]) > 0)
+        if w.startswith("once"):
+            parts = w[4:].strip().split()
+            if len(parts) == 2:
+                datetime.strptime(parts[0], "%Y-%m-%d")
+                return _hhmm_ok(parts[1])
+            return len(parts) == 1 and _hhmm_ok(parts[0])
+        if " " in w:
+            day, t = w.split()
+            return day in _SCHED_DOW and _hhmm_ok(t)
+        return _hhmm_ok(w)
+    except Exception:
+        return False
+
+
 def add_scheduled(name: str, when: str, goal: str, mode: str = "auto") -> dict:
     """`when` is a simple "HH:MM" (daily) or "weekday HH:MM" (Mon..Sun)
-    or `every Nm` (every N minutes)."""
+    or `every Nm` (every N minutes) or `once [YYYY-MM-DD] HH:MM` (one-shot:
+    fires at the next matching time, then removes itself)."""
+    import uuid
     item = {
-        "id": f"sch-{int(time.time())}",
+        # Second-resolution timestamps collided when two items were added in
+        # the same second — cancelling one then deleted BOTH. uuid is unique.
+        "id": f"sch-{uuid.uuid4().hex[:10]}",
         "name": name, "when": when, "goal": goal, "mode": mode,
         "last_run": 0,
     }
@@ -2137,6 +2215,48 @@ def remove_scheduled(sid: str) -> bool:
 _sched_thread_started = False
 
 
+def schedule_item_due(when: str, now, last: float) -> bool:
+    """Whether a scheduled item with time-spec `when` is due at datetime `now`,
+    given its last-fired unix time `last`. Module-level so it's testable."""
+    try:
+        w = when.strip().lower()
+        # "every Nm"
+        if w.startswith("every"):
+            parts = w.split()
+            if len(parts) >= 2 and parts[1].endswith("m"):
+                n = int(parts[1][:-1])
+                return time.time() - last >= n * 60
+        # "once HH:MM" / "once YYYY-MM-DD HH:MM" — one-shot; the daemon loop
+        # removes the item after it fires.
+        if w.startswith("once"):
+            parts = w[4:].strip().split()
+            if len(parts) == 2:
+                if now.strftime("%Y-%m-%d") != parts[0]:
+                    return False
+                parts = parts[1:]
+            if len(parts) != 1:
+                return False
+            hh, mm = parts[0].split(":")
+            return (now.hour == int(hh) and now.minute == int(mm)
+                    and (time.time() - last) > 90)
+        # "HH:MM" daily
+        if ":" in w and " " not in w:
+            hh, mm = w.split(":"); hh = int(hh); mm = int(mm)
+            if now.hour == hh and now.minute == mm:
+                if (time.time() - last) > 90:
+                    return True
+        # "mon 09:00" weekday
+        if " " in w:
+            day, t = w.split(); hh, mm = t.split(":")
+            if (_SCHED_DOW[now.weekday()] == day.lower()
+                    and now.hour == int(hh) and now.minute == int(mm)):
+                if (time.time() - last) > 90:
+                    return True
+    except Exception:
+        return False
+    return False
+
+
 def start_scheduler_daemon(submit_fn) -> None:
     """`submit_fn(goal, mode)` is called when a scheduled item is due."""
     global _sched_thread_started
@@ -2146,47 +2266,27 @@ def start_scheduler_daemon(submit_fn) -> None:
     import threading
     from datetime import datetime
 
-    DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-
-    def _due(when: str, now: datetime, last: float) -> bool:
-        try:
-            w = when.strip().lower()
-            # "every Nm"
-            if w.startswith("every"):
-                parts = w.split()
-                if len(parts) >= 2 and parts[1].endswith("m"):
-                    n = int(parts[1][:-1])
-                    return time.time() - last >= n * 60
-            # "HH:MM" daily
-            if ":" in w and " " not in w:
-                hh, mm = w.split(":"); hh = int(hh); mm = int(mm)
-                if now.hour == hh and now.minute == mm:
-                    if (time.time() - last) > 90:
-                        return True
-            # "mon 09:00" weekday
-            if " " in w:
-                day, t = w.split(); hh, mm = t.split(":")
-                if (DOW[now.weekday()] == day.lower()
-                        and now.hour == int(hh) and now.minute == int(mm)):
-                    if (time.time() - last) > 90:
-                        return True
-        except Exception:
-            return False
-        return False
-
     def _loop():
         while True:
             try:
                 items = list_scheduled()
                 now = datetime.now()
+                fired = False
+                survivors = []
                 for it in items:
-                    if _due(it["when"], now, it.get("last_run", 0)):
+                    if schedule_item_due(it["when"], now, it.get("last_run", 0)):
                         try:
                             submit_fn(it["goal"], it.get("mode", "auto"))
                         except Exception:
                             pass
                         it["last_run"] = time.time()
-                        write_json(_sched_path(), items)
+                        fired = True
+                        # One-shots ("once …") remove themselves after firing.
+                        if it["when"].strip().lower().startswith("once"):
+                            continue
+                    survivors.append(it)
+                if fired:
+                    write_json(_sched_path(), survivors)
             except Exception:
                 pass
             time.sleep(30)

@@ -636,8 +636,11 @@ def test_live_wake_mode_env(monkeypatch):
     assert gl.live_wake_enabled() is False
     monkeypatch.setenv("ORYNN_LIVE_WAKE", "1")
     assert gl.live_wake_enabled() is True
-    # Idle-sleep window is clamped to a sane minimum.
-    monkeypatch.setenv("ORYNN_LIVE_IDLE", "5")
-    assert gl.live_idle_sleep_seconds() == 10.0
+    # Idle-sleep window is clamped to a sane minimum (4s floor; default 10s so
+    # the taskbar glow fades ~10s after the last speech).
+    monkeypatch.setenv("ORYNN_LIVE_IDLE", "2")
+    assert gl.live_idle_sleep_seconds() == 4.0
     monkeypatch.setenv("ORYNN_LIVE_IDLE", "90")
     assert gl.live_idle_sleep_seconds() == 90.0
+    monkeypatch.delenv("ORYNN_LIVE_IDLE", raising=False)
+    assert gl.live_idle_sleep_seconds() == 10.0

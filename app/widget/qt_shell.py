@@ -4779,6 +4779,42 @@ def main(port: int = 8000) -> int:
     except Exception as e:
         print(f"[Desktop] Watch daemon failed: {e}", flush=True)
 
+    # System watchers (app/watchers.py): the Capsule shell has no taskbar glow
+    # or voice ladder, so every severity lands as a tray toast here — the
+    # overlay path owns the full glow→chime→voice escalation.
+    try:
+        from ..watchers import attach_listener as _wl_attach, get_engine as _wl_engine
+
+        def _watcher_toast(event: dict):
+            try:
+                tray.showMessage(
+                    f"Orynn: {event.get('label') or 'watcher'}",
+                    event.get("message") or "A watcher fired.",
+                    QSystemTrayIcon.Information, 5000)
+            except Exception:
+                pass
+
+        def _watcher_event(event: dict):
+            # Judgment layer (app/proactivity.py) in front of the toast:
+            # critical passes straight through; the rest get a bounded LLM
+            # triage with the plain toast as the fallback.
+            try:
+                from ..proactivity import decide
+                decide(event, _watcher_toast)
+            except Exception:
+                _watcher_toast(event)
+        _wl_attach(_watcher_event)
+        _wl_engine().ensure_defaults()
+        _wl_engine().start()
+        print("[Desktop] System-watcher engine started.", flush=True)
+        # Pattern-mined suggestions (app/proactivity.py) land as toasts here
+        # too — already judged and rate-limited inside the module.
+        from ..proactivity import start_suggestion_daemon
+        start_suggestion_daemon(_watcher_toast)
+        print("[Desktop] Proactivity daemon started.", flush=True)
+    except Exception as e:
+        print(f"[Desktop] Watcher engine failed: {e}", flush=True)
+
     # ── System tray icon — table-stakes hygiene so the app feels native.
     # Shows in the Windows taskbar tray, right-click for Show/Hide/Quit.
     # Single-click also toggles the capsule.

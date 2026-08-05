@@ -23,7 +23,9 @@ class SpecialistSpec:
 
 # Mutual-exclusion groups: at most one tool per group per model turn.
 EXCLUSION_GROUPS: dict[str, frozenset[str]] = {
-    "desktop": frozenset({"desktop_control", "start_desktop_task", "launch_app"}),
+    "desktop": frozenset({
+        "desktop_control", "start_desktop_task", "launch_app", "dictate_text",
+    }),
     "vision_peek": frozenset({"look_at_screen", "capture_window"}),
 }
 

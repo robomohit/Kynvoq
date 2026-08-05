@@ -68,9 +68,19 @@ def test_function_declarations_cover_desktop_tools():
         "save_workflow",
         "forget_workflow",
         "set_timer",
+        "schedule_task",
+        "list_scheduled_tasks",
+        "cancel_scheduled_task",
         "get_clipboard",
         "set_clipboard",
         "list_workflows",
+        "dictate_text",
+        "media_control",
+        "watch_screen",
+        "get_notifications",
+        "add_watcher",
+        "list_watchers",
+        "remove_watcher",
     }
 
     start = next(d for d in decls if d.name == "start_desktop_task")

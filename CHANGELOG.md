@@ -2,6 +2,82 @@
 
 ## Unreleased
 
+### Reasoned proactivity (app/proactivity.py)
+- **Watcher events are now judged, not just templated.** A new judgment layer
+  sits between fired sensors and the escalation ladder: an LLM (cheap,
+  low-effort tier, bounded to 12 s) sees the event plus context — local time,
+  recent activity, recent proactive decisions, Orynn's knowledge memory — and
+  decides whether it's worth surfacing right now, at which rung, phrased how,
+  and what Orynn could offer to do about it. Deterministic leash the model
+  cannot loosen: `critical` never waits on or is silenced by the LLM,
+  suppression requires confidence ≥ 0.6, nothing can be escalated to the
+  voice rung, and every failure mode (no key, timeout, garbage JSON) falls
+  back to the exact pre-existing deterministic behavior. Kill switch:
+  `ORYNN_PROACTIVE_LLM=0`.
+- **Proactive triggers are now mined from the user's own history** instead of
+  hand-authored thresholds. Completed task goals and watcher fires land in a
+  capped observation journal; deterministic miners derive habits ("around
+  this time you usually X", ≥3 distinct days inside a ±45 min window),
+  sequences ("you usually X after Y", ≥3 repeats within 45 min), and
+  staleness ("it's been N days since X", ≥1.5× the usual cadence overdue).
+  Mining is pure math; the LLM only judges worth and phrasing before an offer
+  surfaces.
+- **Offers, never acts — and never spam.** Suggestions surface exclusively on
+  the silent info rung (amber glow + toast, never chime, never voice), always
+  phrased as a question; acting requires the user's yes. Deterministic
+  anti-fatigue gauntlet: per-suggestion 24 h cooldown, max 5/day, ignored
+  twice → a week of silence, declined → a week of silence, an explicit
+  mute list, and a `proactive_suggestions` preference (default on) that turns
+  the whole pipeline off. Every decision (surfaced / suppressed / fallback,
+  by whom, why, at what confidence) is journaled for inspection.
+- Wired into both shells (overlay `_route_watcher_event`, Capsule tray toast)
+  and the agent's completion path (`_finalize` → observation journal).
+  Pinned by `tests/test_proactivity.py` (26 tests).
+
+### Voice presence: sound-reactive taskbar glow (replaces the floating textbox)
+- **The taskbar itself is now Orynn's voice indicator.** Instead of a floating
+  status textbox that moved around and obscured the screen, a flowing multicolor
+  light washes across the Windows taskbar — like Alexa's light ring, but it IS
+  the taskbar. `app/widget/taskbar_glow.py`.
+- **Real taskbar, not an overlay.** A Win32 layered child window parented into
+  `Shell_TrayWnd` (sunk below the icons each frame) paints onto the bar's own
+  surface; the gradient renders behind the still-clickable icons. A plain
+  always-on-top window renders *behind* the shell taskbar, so that approach was
+  rejected.
+- **Four voice states**, color-coded so you can read Orynn at a glance: idle
+  (dim multicolor breathing), listening (cool blue→cyan→violet), thinking (a
+  traveling shimmer), speaking (warm teal→green→amber). Driven by the existing
+  `cursorStateRequested` / `audioLevelRequested` signals plus a new
+  `glowStateRequested("speaking")` emitted while Gemini Live streams a reply.
+- **Genuinely voice-sensitive, both directions.** While *listening*, the glow
+  reacts to your live mic level; while *speaking*, it pulses to Orynn's OWN
+  voice (RMS of the Live playback audio, emitted from the playback worker).
+- **The colors flow faster with your voice.** Loudness drives the sideways hue
+  flow: quiet drifts slowly (~5%/s across the bar), loud sends the colors
+  flowing (~54%/s) — a ~10× swing. Volume also lights the bar HIGHER (a rising
+  level-meter feel) and brightens the bottom edge, with a snappier-attack /
+  slow-release envelope so speech tracks naturally. **Fixed:** the phase/hue
+  flow speed was actually hard-coded (never wired to the mic/output level), so
+  the bar just flowed at a constant ambient pace regardless of who was talking
+  or how loud — it now genuinely speeds up and grows taller/brighter with
+  loudness (your voice while listening, Orynn's own voice while speaking),
+  and the waveform's own drift speed reacts too, not just its height.
+- **Robust:** survives resolution changes, taskbar moves, and explorer.exe
+  restarts (re-finds Shell_TrayWnd and recreates the child). No GDI/handle/
+  memory leak (verified flat over sustained 30fps painting).
+- **Fast:** numpy-vectorized per-pixel paint (~5 ms/frame at 30 fps).
+- Floating textbox is off by default (set `ORYNN_FLOATING_TEXTBOX=1` to restore);
+  disable the glow with `ORYNN_TASKBAR_GLOW=0`. Watch all states without a mic:
+  `python scripts/glow_demo.py`. Pinned by `tests/test_taskbar_glow.py`.
+
+### Reliability
+- **Fixed a fatal UIA crash** (`RPC_E_CANTCALLOUT_ININPUTSYNCCALL`, 0x8001010d):
+  desktop-agent worker threads (`asyncio.to_thread`) never initialized COM, so a
+  UIA tree walk racing the foreground window's input-sync handling could crash
+  the whole process. COM is now initialized as STA once per thread in
+  `_ensure_uia_config` (`app/widget/desktop_features.py`); pinned by
+  `tests/test_uia_com_init.py`.
+
 ### Background agent (input politeness)
 - **Keystroke-safety check** — the Calculator keyboard fallback now verifies
   the target window is REALLY foreground (and not minimized) before sending

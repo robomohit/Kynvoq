@@ -62,6 +62,10 @@ Thumbs.db
 connectors.json
 preferences.json
 memory/knowledge.json
+memory/observations.json
+memory/proactivity.json
+watchers.json
+promotion_tally.json
 clipboard_history.json
 form_profiles.json
 scheduled_recipes.json

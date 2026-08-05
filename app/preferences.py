@@ -23,6 +23,8 @@ DEFAULTS: dict[str, Any] = {
                                 # bigger model (free models have no reasoning knob)
     "onboarded": False,         # has the user finished first-run setup?
     "active_skills": [],        # list of skill-ids toggled on by the user
+    "proactive_suggestions": True,  # pattern-mined offers ("you usually X
+                                # around now") via app/proactivity.py
 }
 
 _ALLOWED = {

@@ -1007,7 +1007,14 @@ def test_clicky_textbox_overlay_is_click_through_and_event_driven():
     assert "if self._companion_text_locked:" in overlay
 
     assert "VirtualCursorOverlay()" in textbox
-    assert "set_companion_enabled(True, \"Orynn ready\")" in textbox
+    # Voice presence now lives in the taskbar glow, not a floating textbox. The
+    # cursor overlay's always-on companion bubble is disabled by default (the
+    # bubble is gated behind the ORYNN_FLOATING_TEXTBOX fallback), and the
+    # sound-reactive TaskbarGlow is created and wired to the live state signals.
+    assert "set_companion_enabled(floating_textbox" in textbox
+    assert "ORYNN_FLOATING_TEXTBOX" in textbox
+    assert "TaskbarGlow" in textbox
+    assert "attach_glow(glow)" in textbox
     assert "/api/overlay/events" in textbox
     assert "/api/active-tasks" in textbox
     assert "keyboard.add_hotkey(\"ctrl+shift+m\"" in textbox

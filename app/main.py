@@ -168,6 +168,10 @@ def _resource_dir() -> str:
 
 STATIC_DIR = os.path.join(_resource_dir(), "static")
 INDEX_HTML = os.path.join(STATIC_DIR, "index.html")
+# The minimal control panel (voice/glow/scheduled/connectors/keys) — the
+# default face of Orynn now that the product is voice + taskbar glow. The
+# full legacy dashboard stays reachable at /advanced as the service hatch.
+SETTINGS_HTML = os.path.join(STATIC_DIR, "settings.html")
 if os.path.isdir(STATIC_DIR):
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -930,12 +934,22 @@ class PermissionIn(BaseModel):
     grant: bool
     scope: Optional[str] = None
 
+_NO_CACHE = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
+
+
 @app.get("/")
 async def root():
-    return FileResponse(
-        INDEX_HTML,
-        headers={"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
-    )
+    # Minimal control panel by default; fall back to the full dashboard if the
+    # settings page isn't bundled (older frozen builds).
+    if os.path.exists(SETTINGS_HTML):
+        return FileResponse(SETTINGS_HTML, headers=_NO_CACHE)
+    return FileResponse(INDEX_HTML, headers=_NO_CACHE)
+
+
+@app.get("/advanced")
+async def advanced_dashboard():
+    """The full legacy dashboard — power/debug surface, off the main path."""
+    return FileResponse(INDEX_HTML, headers=_NO_CACHE)
 
 
 @app.get("/v2")

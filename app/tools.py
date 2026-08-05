@@ -1451,6 +1451,22 @@ class ToolExecutor:
             pass
         return ""
 
+    def note_evidence(self, kind: str, target: str) -> None:
+        """Record a post-task verification target (see app/verifier.py): after
+        the task 'finishes', this window should exist / this file should be on
+        disk. Called only from SUCCESS paths, so verification audits what the
+        agent claims it accomplished."""
+        try:
+            ev = getattr(self, "verify_evidence", None)
+            if ev is None:
+                ev = []
+                self.verify_evidence = ev
+            target = str(target or "").strip()
+            if target:
+                ev.append((kind, target))
+        except Exception:
+            pass
+
     def focus_window(self, title: str) -> ToolResult:
         """Bring the first visible window matching a title/app/exe hint to the foreground."""
         try:
@@ -1463,6 +1479,7 @@ class ToolExecutor:
             hwnd = int(match["hwnd"])
             foregrounded, actual_title = self._activate_hwnd(hwnd)
             actual_title = actual_title or match.get("title") or title
+            self.note_evidence("window", title or actual_title)
             # SetForegroundWindow may report a foreground-lock
             # failure — the window is usually activated anyway, and our UIA tools
             self.set_isolated_hwnd(hwnd, actual_title)
@@ -1490,6 +1507,7 @@ class ToolExecutor:
                 foregrounded, activated_title = self._activate_hwnd(hwnd)
                 actual_title = activated_title or match["title"] or needle
                 pid = match.get("pid")
+                self.note_evidence("window", needle)
                 self.set_isolated_hwnd(hwnd, actual_title)
                 self._remember_started_pid(pid)
                 time.sleep(max(0.0, float(paint_seconds)))
@@ -1860,12 +1878,14 @@ class ToolExecutor:
         p = self._safe_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
+        self.note_evidence("file", str(p))
         return ToolResult(ok=True, output=f"Wrote to {path}")
 
     def move_file(self, source: str, destination: str):
         src = self._safe_path(source)
         dst = self._safe_path(destination)
         shutil.move(str(src), str(dst))
+        self.note_evidence("file", str(dst))
         return ToolResult(ok=True, output=f"Moved {source} to {destination}")
 
     def system_info(self):

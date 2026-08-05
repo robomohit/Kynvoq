@@ -10,9 +10,11 @@ and offline-capable, in keeping with the free-models-only product.
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
+from pathlib import Path
 
 # Speech-to-text backend. Groq Whisper (cloud, very fast + accurate) is used when
 # GROQ_API_KEY is set and a mic is available; otherwise we fall back to the
@@ -485,44 +487,123 @@ class Recorder:
 # Soft, musical cue tones (Hz, ms). Played as smooth sine chimes — NOT the harsh
 # square-wave winsound.Beep, which sounded like an old PC speaker. ORYNN_CUES=0
 # disables them entirely.
+# Notes are (freq_hz, decay_ms) or (freq_hz, decay_ms, start_ms) — with start
+# offsets the notes OVERLAP and ring into each other like a soft bell/marimba
+# (the Alexa earcon family), instead of beeping strictly in sequence.
 _CUE_NOTES = {
-    "start": [(587, 110)],                       # gentle single "ready" note
-    "stop": [],                                  # silent — the waveform already shows it
-    "cancel": [(440, 130), (330, 150)],          # soft falling
-    "done": [(659, 110), (988, 160)],            # pleasant rising two-note
-    "error": [(392, 200)],                       # soft low
-    "fail": [(392, 160), (294, 200)],            # soft falling
+    # Wake — "hey jarvis" heard, the bar rises: a warm rising major sixth that
+    # blooms and rings out, "I'm listening". Long decays overlap into a chord.
+    "wake": [(523.25, 700, 0), (880.0, 1100, 160)],           # C5 → A5
+    # Sleep — the session fades away: soft falling third dissolving into a low
+    # root, final but gentle.
+    "sleep": [(659.25, 650, 0), (523.25, 700, 170), (392.0, 1200, 340)],  # E5→C5→G4
+    # Reminder — Orynn woke ITSELF: a distinct rising major-triad arpeggio that
+    # rings into one chord (doorbell-ish), never confused with wake/sleep.
+    "reminder": [(523.25, 900, 0), (659.25, 900, 150), (783.99, 1300, 300)],
+    "start": [(659.25, 500, 0)],                          # gentle single "ready"
+    "stop": [],                                           # silent — waveform shows it
+    "cancel": [(587.33, 450, 0), (440.0, 700, 140)],      # soft falling fourth
+    "done": [(659.25, 500, 0), (1046.5, 950, 130)],       # bright rising octave-ish
+    "error": [(415.3, 750, 0)],                           # single soft low tone
+    "fail": [(466.16, 550, 0), (349.23, 900, 160)],       # soft falling, minor feel
 }
 _CUE_CACHE: dict[str, bytes] = {}
+_CUE_SR = 44100                       # must match _chime_wav's sample rate
+_CUE_FRAME_MS = 30                    # envelope frame ≈ glow tick (30fps)
+_CUE_ENV_CACHE: dict[str, list[float]] = {}
+_cue_listener = None                  # fn(kind, level 0..1) per frame; fn(kind, None) at end
 
 
-def _chime_wav(notes, volume: float = 0.16, sr: int = 22050) -> bytes:
-    """Render notes to a smooth WAV with short fade in/out (no clicks)."""
+def set_cue_listener(fn) -> None:
+    """Register a callback that receives each chime's amplitude envelope while
+    it plays — fn(kind, level) every ~30ms, then fn(kind, None) when the sound
+    ends. Lets the taskbar glow pulse in sync with the cue tones, so the chime
+    looks like it comes FROM the bar."""
+    global _cue_listener
+    _cue_listener = fn
+
+
+def _cue_envelope(wav: bytes, sr: int = _CUE_SR,
+                  frame_ms: int = _CUE_FRAME_MS) -> list[float]:
+    """Per-frame RMS envelope of a 16-bit mono WAV, normalized to 0..1 with a
+    gentle power curve so quiet ring-out tails still read visually."""
     import numpy as np
 
-    chunks = []
-    for freq, ms in notes:
+    pcm = np.frombuffer(wav[44:], dtype="<i2").astype(np.float64)
+    if pcm.size == 0:
+        return []
+    n = max(1, int(sr * frame_ms / 1000))
+    pad = (-pcm.size) % n
+    if pad:
+        pcm = np.concatenate([pcm, np.zeros(pad)])
+    rms = np.sqrt(np.mean(pcm.reshape(-1, n) ** 2, axis=1))
+    peak = float(rms.max()) or 1.0
+    return [float(min(1.0, (r / peak) ** 0.7)) for r in rms]
+
+
+def _chime_wav(notes, volume: float = 0.16, sr: int = 44100) -> bytes:
+    """Render notes into one WAV as a soft, glassy bell (marimba/celesta family).
+
+    Per note: a slightly detuned pair of fundamentals (natural chorus 'shimmer'),
+    a quiet octave partial that decays FASTER than the fundamental (real struck
+    bells lose their brightness first), and a whisper of a 12th for glass. The
+    attack is a smooth 18 ms half-cosine bloom — no click — and the tail is a
+    long exponential ring-down eased to true silence. Notes with start offsets
+    are MIXED (overlapping); legacy 2-tuples play in sequence."""
+    import numpy as np
+
+    if not notes:
+        return _pcm_to_wav(b"\x00\x00", sr)
+    norm = []
+    cursor = 0
+    for note in notes:
+        if len(note) == 3:
+            freq, ms, start = note
+        else:
+            freq, ms = note
+            start = cursor
+            cursor += ms
+        norm.append((float(freq), int(ms), int(start)))
+    total_ms = max(start + ms for _f, ms, start in norm) + 120
+    out = np.zeros(int(sr * total_ms / 1000) + 1, dtype=np.float64)
+    for freq, ms, start in norm:
         n = max(1, int(sr * ms / 1000))
         t = np.arange(n) / sr
-        sig = np.sin(2 * np.pi * freq * t)
-        env = np.ones(n)
-        a, d = int(sr * 0.010), int(sr * 0.045)
-        if a > 0:
-            env[:a] = np.linspace(0.0, 1.0, a)
-        if d > 0:
-            env[-d:] = np.linspace(1.0, 0.0, d)
-        chunks.append(sig * env * volume)
-    sig = np.concatenate(chunks) if chunks else np.zeros(1, dtype=float)
-    pcm = (np.clip(sig, -1, 1) * 32767).astype("<i2").tobytes()
+        dur = max(0.08, ms / 1000.0)
+        # Ring-downs: octave partial fades ~2.4x faster than the fundamental,
+        # so each note starts bright and melts into a pure warm tone.
+        env_f = np.exp(-t * (5.0 / dur))
+        env_o = np.exp(-t * (12.0 / dur))
+        # Detuned fundamental pair → gentle chorus beat instead of a static sine.
+        sig = (0.55 * np.sin(2 * np.pi * freq * 0.9990 * t)
+               + 0.55 * np.sin(2 * np.pi * freq * 1.0012 * t)) * env_f
+        sig += 0.22 * np.sin(2 * np.pi * freq * 2.0 * t) * env_o        # octave
+        sig += 0.07 * np.sin(2 * np.pi * freq * 3.0 * t) * env_o        # 12th
+        # Smooth half-cosine bloom (no click), and ease the very end to zero.
+        attack = max(1, int(sr * 0.018))
+        ramp = 0.5 - 0.5 * np.cos(np.linspace(0.0, np.pi, min(attack, n)))
+        sig[: ramp.size] *= ramp
+        tail = max(1, int(sr * 0.030))
+        if n > tail:
+            sig[-tail:] *= np.linspace(1.0, 0.0, tail)
+        i0 = int(sr * start / 1000)
+        seg = sig[: max(0, out.size - i0)]
+        out[i0:i0 + seg.size] += seg
+    # Soft-knee saturation rounds any overlap peaks, then normalize.
+    out = np.tanh(out * 1.2) / 1.2
+    peak = float(np.max(np.abs(out))) or 1.0
+    out *= volume / max(1.0, peak / 0.98)
+    pcm = (np.clip(out, -1, 1) * 32767).astype("<i2").tobytes()
     return _pcm_to_wav(pcm, sr)
 
 
 def cue(kind: str) -> None:
     """Play a soft, non-blocking audio chime for voice feedback. Unknown kinds and
     ORYNN_CUES=0 are no-ops."""
-    if (os.environ.get("ORYNN_CUES") or "1").strip().lower() in ("0", "false", "no"):
-        return
+    cues_env = (os.environ.get("ORYNN_CUES") or "1").strip().lower()
     notes = _CUE_NOTES.get(kind)
+    if cues_env in ("0", "false", "no"):
+        return
     if not notes:
         return
 
@@ -534,7 +615,34 @@ def cue(kind: str) -> None:
             if data is None:
                 data = _chime_wav(notes)
                 _CUE_CACHE[kind] = data
-            winsound.PlaySound(data, winsound.SND_MEMORY | winsound.SND_ASYNC)
+            listener = _cue_listener
+            if listener is not None:
+                env = _CUE_ENV_CACHE.get(kind)
+                if env is None:
+                    env = _cue_envelope(data)
+                    _CUE_ENV_CACHE[kind] = env
+
+                def _pulse(env=env) -> None:
+                    try:
+                        t0 = time.monotonic()
+                        for i, lvl in enumerate(env):
+                            listener(kind, lvl)
+                            # Pace against the wall clock so the glow stays in
+                            # sync with playback instead of drifting.
+                            time.sleep(max(
+                                0.0,
+                                t0 + (i + 1) * (_CUE_FRAME_MS / 1000.0)
+                                - time.monotonic(),
+                            ))
+                        listener(kind, None)
+                    except Exception:
+                        pass
+
+                threading.Thread(target=_pulse, daemon=True).start()
+            # SND_ASYNC is invalid with SND_MEMORY (winsound raises "Cannot play
+            # asynchronously from memory"); we're on a worker thread anyway, so
+            # blocking playback here keeps the app non-blocking.
+            winsound.PlaySound(data, winsound.SND_MEMORY)
         except Exception:
             pass
 
@@ -560,9 +668,19 @@ def _listen_groq(timeout: float) -> str | None:
     return transcribe_wav(wav)
 
 
+_WINRT_DEAD = False   # latched when WinRT fails with a permanent error
+
+
 def _listen_winrt(timeout: float) -> str | None:
     """One dictation utterance via the modern Windows recognizer. Returns the
-    transcript, '' on no-speech, or None if the engine is unavailable."""
+    transcript, '' on no-speech, or None if the engine is unavailable.
+
+    Permanent failures are LATCHED: 0x80045509 means the Windows 'Online speech
+    recognition' privacy toggle is off — retrying every wake cycle just burned
+    time before each fallback and spammed the log."""
+    global _WINRT_DEAD
+    if _WINRT_DEAD:
+        return None
     import asyncio
 
     async def _run() -> str:
@@ -586,7 +704,17 @@ def _listen_winrt(timeout: float) -> str | None:
     try:
         return asyncio.run(_run())
     except Exception as exc:
-        print(f"[voice] WinRT STT failed: {exc}", flush=True)
+        msg = str(exc)
+        if "-2147199735" in msg or "80045509" in msg.lower():
+            # Privacy toggle off — permanent for this session. Say WHY, once,
+            # with the actual fix, then stop retrying.
+            _WINRT_DEAD = True
+            print("[voice] WinRT speech is blocked by Windows privacy settings "
+                  "(Settings > Privacy & security > Speech > enable 'Online "
+                  "speech recognition'). Using SAPI/Groq fallback for the wake "
+                  "word instead.", flush=True)
+        else:
+            print(f"[voice] WinRT STT failed: {exc}", flush=True)
         return None
 
 
@@ -665,11 +793,75 @@ def matches_wake_word(transcript: str, wake: str = "") -> bool:
     return False
 
 
+_OWW_MODEL = None   # cached openwakeword model (loads once)
+_OWW_DEAD = False   # latched when openwakeword can't load — don't retry every cycle
+
+
+def _listen_openwakeword(timeout: float) -> str | None:
+    """Dedicated keyword-spotting wake engine (opt-in: ORYNN_WAKE_ENGINE=openwakeword).
+    Streams the mic through a local openWakeWord model — sub-second, fully offline,
+    far more reliable than general STT for a fixed phrase. Default model is the
+    pretrained 'hey_jarvis' (override ORYNN_OWW_MODELS with comma-separated names or
+    paths, e.g. a custom-trained 'orynn' model). Returns the configured wake word on
+    detection (so matches_wake_word passes), '' on timeout, None if unavailable."""
+    global _OWW_MODEL, _OWW_DEAD
+    if _OWW_DEAD:
+        return None
+    try:
+        import sounddevice as sd
+        if _OWW_MODEL is None:
+            from openwakeword.model import Model
+            names = [n.strip() for n in
+                     (os.environ.get("ORYNN_OWW_MODELS") or "hey_jarvis").split(",")
+                     if n.strip()]
+            # onnx by default: tflite-runtime has no Windows wheels, so the
+            # openwakeword default framework would fail here.
+            framework = (os.environ.get("ORYNN_OWW_FRAMEWORK") or "onnx").strip()
+            _OWW_MODEL = Model(wakeword_models=names, inference_framework=framework)
+    except Exception:
+        _OWW_DEAD = True
+        return None
+    try:
+        threshold = float(os.environ.get("ORYNN_OWW_THRESHOLD") or "0.5")
+    except Exception:
+        threshold = 0.5
+    deadline = time.time() + max(1.0, timeout)
+    hit = False
+    try:
+        with sd.InputStream(samplerate=16000, channels=1, dtype="int16",
+                            blocksize=1280) as stream:
+            while time.time() < deadline:
+                data, _overflow = stream.read(1280)
+                frame = data[:, 0] if getattr(data, "ndim", 1) > 1 else data
+                scores = _OWW_MODEL.predict(frame)
+                if any(float(v) >= threshold for v in scores.values()):
+                    hit = True
+                    break
+    except Exception:
+        return None
+    finally:
+        try:
+            _OWW_MODEL.reset()
+        except Exception:
+            pass
+    if hit:
+        return (os.environ.get("ORYNN_WAKE_WORD") or "orynn").strip().lower()
+    return ""
+
+
 def listen_for_wake(timeout: float = 5.0) -> str:
     """One utterance for wake-word listening. Prefers OFFLINE recognizers (WinRT,
     then SAPI) so ambient listening costs no Groq quota and stays local; only falls
     back to Groq if no offline engine works. Returns a lowercase transcript ('' if
-    nothing was said or no engine is available)."""
+    nothing was said or no engine is available).
+
+    ORYNN_WAKE_ENGINE=openwakeword switches to a dedicated local keyword-spotting
+    model instead — much lower latency and fewer misses than STT-in-windows."""
+    engine = (os.environ.get("ORYNN_WAKE_ENGINE") or "").strip().lower()
+    if engine in ("oww", "openwakeword"):
+        out = _listen_openwakeword(timeout)
+        if out is not None:
+            return out
     try:
         out = _listen_winrt(timeout)
         if out is not None:
